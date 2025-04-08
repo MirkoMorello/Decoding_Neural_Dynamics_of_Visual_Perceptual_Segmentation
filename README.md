@@ -1,0 +1,2 @@
+# Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation
+This is my MSc Thesis basecode
