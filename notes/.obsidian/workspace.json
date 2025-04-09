@@ -1,0 +1,193 @@
+{
+  "main": {
+    "id": "fbba74bb6f5c1631",
+    "type": "split",
+    "children": [
+      {
+        "id": "1a3e0a0a7f80bc55",
+        "type": "tabs",
+        "dimension": 74.4336569579288,
+        "children": [
+          {
+            "id": "f6a4852d0b8fbece",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Initial concepts.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Initial concepts"
+            }
+          }
+        ]
+      },
+      {
+        "id": "e43008c9c7003ce9",
+        "type": "tabs",
+        "dimension": 25.5663430420712,
+        "children": [
+          {
+            "id": "4b827bdae8f06793",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "f57c1c35d30d9502",
+    "type": "split",
+    "children": [
+      {
+        "id": "16f2fe78177bb0c9",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "cc97744d1b5567e4",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "6df8d397e6c760cc",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "037f7e04978cfede",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "835a959c6ce9f9cf",
+    "type": "split",
+    "children": [
+      {
+        "id": "09e0c2a187e3251a",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "3303b9b928c1e7c4",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Initial concepts.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for Initial concepts"
+            }
+          },
+          {
+            "id": "d1c3a8c718171848",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Initial concepts.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from Initial concepts"
+            }
+          },
+          {
+            "id": "3505951a5fed852a",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "6ec8227e094aac05",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Initial concepts.md"
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Initial concepts"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false
+    }
+  },
+  "active": "f6a4852d0b8fbece",
+  "lastOpenFiles": [
+    "Pasted image 20250409160824.png",
+    "Pasted image 20250409145503.png",
+    "Pasted image 20250409145546.png",
+    "Pasted image 20250409151207.png",
+    "Welcome.md",
+    "Initial concepts.md",
+    "create a link.md"
+  ]
+}
