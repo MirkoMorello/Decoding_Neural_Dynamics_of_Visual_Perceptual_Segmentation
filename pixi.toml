@@ -7,3 +7,20 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
+python = ">=3.9,<3.14"
+jupyterlab = ">=4.4.0,<5"
+ipykernel = ">=6.29.5,<7"
+imageio = ">=2.37.0,<3"
+scikit-learn = ">=1.6.1,<2"
+matplotlib = ">=3.10.1,<4"
+pandas = ">=2.2.3,<3"
+tensorboard = ">=2.19.0,<3"
+gdown = ">=5.2.0,<6"
+h5py = ">=3.13.0,<4"
+numpy = "<2.0"
+
+[pypi-dependencies]
+pysaliency = ">=0.2.22, <0.3"
+torch = ">=2.6.0, <3"
+torchvision = ">=0.21.0, <0.22"
+lmdb = ">=1.6.2, <2"
