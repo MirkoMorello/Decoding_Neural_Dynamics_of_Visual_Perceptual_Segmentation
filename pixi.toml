@@ -1,10 +1,22 @@
 [workspace]
 channels = ["conda-forge"]
 name = "Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
+# Task to register the Jupyter kernel after installation
+# It runs 'python -m ipykernel install ...' inside the pixi environment
+register-kernel = "python -m ipykernel install --user --name=pixi-decode-dynamics --display-name=\"Pixi (Decode Dynamics)\""
+
+# A more comprehensive setup task (can chain commands)
+# This first ensures install, then registers the kernel.
+# Note: 'pixi run' implicitly runs 'pixi install' if needed, but being explicit can be clearer.
+setup = "pixi install && pixi run register-kernel"
+
+serve = "jupyter lab"
+
+# now please run 'pixi run setup'
 
 [dependencies]
 python = ">=3.9,<3.14"
