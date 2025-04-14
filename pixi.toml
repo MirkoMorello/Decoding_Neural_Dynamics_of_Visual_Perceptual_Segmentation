@@ -33,6 +33,6 @@ numpy = "<2.0"
 
 [pypi-dependencies]
 pysaliency = ">=0.2.22, <0.3"
-torch = ">=2.6.0, <3"
 torchvision = ">=0.21.0, <0.22"
 lmdb = ">=1.6.2, <2"
+torchmetrics = ">=1.7.1, <2"

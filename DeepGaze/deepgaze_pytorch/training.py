@@ -29,6 +29,7 @@ from .data import ImageDataset, FixationDataset, ImageDatasetSampler, FixationMa
 #from .loading import import_class, build_model, DeepGazeCheckpointModel, SharedPyTorchModel, _get_from_config
 from .metrics import log_likelihood, nss, auc
 from .modules import DeepGazeII
+import torchmetrics
 
 
 
@@ -41,50 +42,140 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None):
     if metrics is None:
         metrics = ['LL', 'IG', 'NSS', 'AUC']
 
-    metric_scores = {}
+    # --- Initialize Accumulators and Metrics on GPU ---
+    # Use float64 for sums to avoid precision loss over many batches
+    total_metric_sums = {
+        metric_name: torch.tensor(0.0, device=device, dtype=torch.float64)
+        for metric_name in metrics if metric_name in ['LL', 'NSS'] # Only those we sum manually
+    }
+    total_weight = torch.tensor(0.0, device=device, dtype=torch.float64)
+
+    # Initialize torchmetrics AUROC if AUC is requested
+    auroc_metric = None
+    if 'AUC' in metrics:
+        # Assuming binary classification: each pixel is either fixation (1) or not (0)
+        # Adjust task if your setup is different (e.g., multiclass)
+        auroc_metric = torchmetrics.AUROC(task="binary", thresholds=200).to(device)
+
+    # --- Metric Functions Dictionary (excluding the slow custom AUC) ---
     metric_functions = {
         'LL': log_likelihood,
         'NSS': nss,
-        'AUC': auc,
+        # 'AUC': auc, # Don't use the old one
     }
-    batch_weights = []
 
     with torch.no_grad():
-        pbar = tqdm(dataset)
+        pbar = tqdm(dataset, desc="Validating")
         for batch in pbar:
+            # --- Move batch to GPU ---
             image = batch.pop('image').to(device)
             centerbias = batch.pop('centerbias').to(device)
-            fixation_mask = batch.pop('fixation_mask').to(device)
+            fixation_mask = batch.pop('fixation_mask').to(device) # Keep on GPU
             x_hist = batch.pop('x_hist', torch.tensor([])).to(device)
             y_hist = batch.pop('y_hist', torch.tensor([])).to(device)
-            weights = batch.pop('weight').to(device)
+            weights = batch.pop('weight').to(device) # Keep weights on GPU
             durations = batch.pop('durations', torch.tensor([])).to(device)
 
             kwargs = {}
             for key, value in dict(batch).items():
                 kwargs[key] = value.to(device)
 
+            # --- Model Forward Pass ---
             if isinstance(model, DeepGazeII):
                 log_density = model(image, centerbias, **kwargs)
             else:
                 log_density = model(image, centerbias, x_hist=x_hist, y_hist=y_hist, durations=durations, **kwargs)
 
-            for metric_name, metric_fn in metric_functions.items():
-                if metric_name not in metrics:
-                    continue
-                metric_scores.setdefault(metric_name, []).append(metric_fn(log_density, fixation_mask, weights=weights).detach().cpu().numpy())
-            batch_weights.append(weights.detach().cpu().numpy().sum())
+            # --- Ensure fixation_mask is dense for calculations ---
+            # This conversion might add some overhead if masks are large and sparse,
+            # but necessary for torchmetrics and easier for standard metrics too.
+            if isinstance(fixation_mask, torch.sparse.IntTensor):
+                # Ensure it's float for some operations and int/long for torchmetrics target
+                target_mask_int = fixation_mask.to_dense().long() # Target for AUROC
+            else:
+                target_mask_int = fixation_mask.long() # Target for AUROC
 
-            for display_metric in ['LL', 'NSS', 'AUC']:
-                if display_metric in metrics:
-                    pbar.set_description('{} {:.05f}'.format(display_metric, np.average(metric_scores[display_metric], weights=batch_weights)))
-                    break
 
-    data = {metric_name: np.average(scores, weights=batch_weights) for metric_name, scores in metric_scores.items()}
+            # --- Calculate Batch Weight ---
+            # Use the original weights sum for proper averaging
+            # Note: Your original weighting scheme in LL/NSS was different,
+            # this uses the standard approach. Adjust if needed.
+            batch_weight_sum = weights.sum()
+
+            # --- Accumulate Metrics ---
+            if batch_weight_sum > 0:
+                total_weight += batch_weight_sum
+
+                # LL and NSS (using your functions returning batch averages)
+                for metric_name, metric_fn in metric_functions.items():
+                    if metric_name in total_metric_sums:
+                        # Assumes metric_fn returns the batch average score (scalar tensor)
+                        # Multiply by batch_weight_sum to get the batch SUM for correct overall average
+                        metric_value_batch_avg = metric_fn(log_density, target_mask_int.float(), weights=weights) # Pass dense float mask
+
+                        if not isinstance(metric_value_batch_avg, torch.Tensor) or metric_value_batch_avg.ndim != 0:
+                             raise ValueError(f"Metric function {metric_name} did not return a scalar tensor!")
+
+                        total_metric_sums[metric_name] += metric_value_batch_avg * batch_weight_sum
+
+
+                # AUC (using torchmetrics)
+                if auroc_metric is not None:
+                    # Predictions: Use log_density or density. Using density might be more standard for AUC.
+                    preds = torch.exp(log_density) # Convert log-density to density
+                    # Flatten preds and targets for AUROC
+                    # Target mask needs to be integer type (e.g., long)
+                    auroc_metric.update(preds.flatten(), target_mask_int.flatten())
+
+            # --- Optional: Update progress bar (requires some CPU transfer) ---
+            desc = "Validating"
+            if 'LL' in total_metric_sums and total_weight > 0:
+                current_avg_ll = (total_metric_sums['LL'] / total_weight).item()
+                desc += f' LL {current_avg_ll:.5f}'
+            if auroc_metric is not None:
+                 # .compute() is more expensive, maybe show intermediate sum/count or skip for pbar
+                 pass # Avoid computing AUC every batch for speed
+            pbar.set_description(desc)
+            # ---
+
+    # --- Final Calculation (after loop) ---
+    final_metrics = {}
+    total_weight_cpu = total_weight.item() # Single CPU transfer
+
+    if total_weight_cpu > 0:
+        # Calculate final averages for LL, NSS
+        for metric_name, metric_sum in total_metric_sums.items():
+            final_metrics[metric_name] = (metric_sum / total_weight).item() # Single CPU transfer per metric
+
+        # Compute final AUC
+        if auroc_metric is not None:
+            try:
+                final_metrics['AUC'] = auroc_metric.compute().item() # Compute epoch AUC, transfer result
+            except Exception as e:
+                print(f"WARNING: Failed to compute AUC: {e}")
+                final_metrics['AUC'] = float('nan')
+            finally:
+                 auroc_metric.reset() # Reset metric state for potential next use
+        else:
+            if 'AUC' in metrics: final_metrics['AUC'] = float('nan') # Mark as NaN if requested but not computed
+
+
+    else: # Handle case with zero total weight
+        for metric_name in metrics:
+             if metric_name != 'IG': # IG is derived
+                 final_metrics[metric_name] = float('nan')
+
+    # Calculate Information Gain (IG)
     if 'IG' in metrics:
-        data['IG'] = data['LL'] - baseline_information_gain
+        if 'LL' in final_metrics and not np.isnan(final_metrics['LL']):
+             # baseline_information_gain is already a CPU float
+            final_metrics['IG'] = final_metrics['LL'] - baseline_information_gain
+        else:
+            final_metrics['IG'] = float('nan')
+    # ---
 
-    return data
+    return final_metrics
+
 
 def train_epoch(model, dataset, optimizer, device):
     model.train()
