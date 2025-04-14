@@ -55,7 +55,8 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None):
     if 'AUC' in metrics:
         # Assuming binary classification: each pixel is either fixation (1) or not (0)
         # Adjust task if your setup is different (e.g., multiclass)
-        auroc_metric = torchmetrics.AUROC(task="binary", thresholds=200).to(device)
+        auroc_metric = torchmetrics.AUROC(task="binary",
+                                          thresholds=500).to(device) # remember that threshold results in an oversimplified AUC
 
     # --- Metric Functions Dictionary (excluding the slow custom AUC) ---
     metric_functions = {
