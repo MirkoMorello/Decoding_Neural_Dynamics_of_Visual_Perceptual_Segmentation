@@ -36,56 +36,62 @@ import torchmetrics
 baseline_performance = cached(LRU(max_size=3))(lambda model, *args, **kwargs: model.information_gain(*args, **kwargs))
 
 
+import torch
+import numpy as np
+from tqdm import tqdm
+import torchmetrics
+import warnings # Import warnings
+
+# Your existing metric functions (log_likelihood, nss) are assumed to be defined above
+
+import torch
+import numpy as np
+from tqdm import tqdm
+import torchmetrics # For GPU AUC
+import warnings
+# Import your ORIGINAL CPU-based AUC function along with others
+from .metrics import log_likelihood, nss, auc as auc_cpu_fn # Rename import to avoid conflict
+
 def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None):
     model.eval()
-
+    default_metrics = ['LL', 'IG', 'NSS', 'AUC_CPU'] # Default to CPU AUC
     if metrics is None:
-        metrics = ['LL', 'IG', 'NSS', 'AUC']
+        metrics = default_metrics
+    else:
+        # Ensure IG is handled correctly if requested but LL isn't
+        if 'IG' in metrics and 'LL' not in metrics:
+            metrics.append('LL') # Need LL to calculate IG
+    print(f"DEBUG: Evaluating metrics: {metrics}")
 
-    # --- Initialize Accumulators and Metrics on GPU ---
+    # --- Initialize Accumulators & Metrics ---
     total_metric_sums = {
+        # Accumulators for metrics calculated via batch averaging
         metric_name: torch.tensor(0.0, device=device, dtype=torch.float64)
-        for metric_name in metrics if metric_name in ['LL', 'NSS']
+        for metric_name in metrics if metric_name in ['LL', 'NSS', 'AUC_CPU']
     }
     total_weight = torch.tensor(0.0, device=device, dtype=torch.float64)
 
-    # Initialize torchmetrics AUROC - REMOVE thresholds argument
-    auroc_metric = None
-    if 'AUC' in metrics:
-        # <<< DEFINE THRESHOLDS BASED ON OBSERVED log_density RANGE >>>
-        # Get range from debug prints, maybe slightly wider.
-        # These values might need tuning if the range changes significantly across epochs/datasets.
-        min_log_density_observed = -26.0  # Lower bound (a bit below observed min -24.6)
-        max_log_density_observed = -8.0   # Upper bound (a bit above observed max -9.6)
-        num_thresholds_to_use = 500       # Keep the number reasonable
+    # Initialize GPU AUROC only if requested
+    auroc_metric_gpu = None
+    if 'AUC_GPU' in metrics:
+        print("DEBUG: Initializing GPU AUROC (Exact Calculation - May OOM if batch size too large)")
+        # Calculate EXACT AUC - NO thresholds argument
+        auroc_metric_gpu = torchmetrics.AUROC(task="binary").to(device)
 
-        # Create a tensor of thresholds linearly spaced within the observed range
-        threshold_tensor = torch.linspace(
-            min_log_density_observed,
-            max_log_density_observed,
-            steps=num_thresholds_to_use, # Use 'steps' argument
-            device=device
-        )
+    # Dictionary for metrics computed via batch averaging (LL, NSS, CPU AUC)
+    metric_functions_avg = {}
+    if 'LL' in metrics: metric_functions_avg['LL'] = log_likelihood
+    if 'NSS' in metrics: metric_functions_avg['NSS'] = nss
+    if 'AUC_CPU' in metrics:
+        print("DEBUG: Will calculate CPU AUC using original function.")
+        metric_functions_avg['AUC_CPU'] = auc_cpu_fn # Use the imported original function
 
-        print(f"Using {num_thresholds_to_use} AUROC thresholds between {min_log_density_observed:.2f} and {max_log_density_observed:.2f}") # Add print statement
-
-        auroc_metric = torchmetrics.AUROC(
-            task="binary",
-            thresholds=threshold_tensor  # <<< PASS THE CUSTOM THRESHOLD TENSOR
-        ).to(device)
-
-    metric_functions = { 'LL': log_likelihood, 'NSS': nss }
-
-    # <<< DEBUG FLAG >>>
-    printed_debug_info = False
-
-    # torch.cuda.empty_cache() # Optional: uncomment if you suspect fragmentation OOMs
-
+    # --- Validation Loop ---
+    oom_error_gpu_auc = False # Flag to track if GPU AUC failed
     with torch.no_grad():
         pbar = tqdm(dataset, desc="Validating")
-        for batch_idx, batch in enumerate(pbar): # Use enumerate for index
+        for batch in pbar:
             # --- Move batch to GPU ---
-            # (Same as before)
             image = batch.pop('image').to(device)
             centerbias = batch.pop('centerbias').to(device)
             fixation_mask = batch.pop('fixation_mask').to(device)
@@ -96,124 +102,128 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None):
             kwargs = {k: v.to(device) for k, v in batch.items()}
 
             # --- Model Forward Pass ---
-            # (Same as before)
-            if isinstance(model, DeepGazeII):
-                log_density = model(image, centerbias, **kwargs)
-            else:
-                log_density = model(image, centerbias, x_hist=x_hist, y_hist=y_hist, durations=durations, **kwargs)
+            try:
+                if isinstance(model, DeepGazeII):
+                    log_density = model(image, centerbias, **kwargs)
+                else:
+                    log_density = model(image, centerbias, x_hist=x_hist, y_hist=y_hist, durations=durations, **kwargs)
+            except torch.cuda.OutOfMemoryError as e:
+                print("\n\n!!! OOM ERROR during Model Forward Pass !!!")
+                print(f"Batch Shape Image: {image.shape}")
+                print(f"Error: {e}")
+                print("Try reducing validation batch size significantly.")
+                # Re-raise or handle as needed, maybe return NaNs for all metrics
+                raise e # Or return {m: float('nan') for m in metrics}
 
-            # --- Ensure fixation_mask is dense ---
-            # (Same as before)
+            # --- Prep Targets (Dense & Binary) ---
             if isinstance(fixation_mask, torch.sparse.IntTensor):
                 target_mask_int = fixation_mask.to_dense().long()
             else:
                 target_mask_int = fixation_mask.long()
+            target_mask_binary = (target_mask_int > 0).long()
 
             # --- Calculate Batch Weight ---
-            # (Same as before)
             batch_weight_sum = weights.sum()
 
-            # --- Accumulate Metrics ---
+            # --- Accumulate Batch-Averaged Metrics (LL, NSS, AUC_CPU) ---
             if batch_weight_sum > 0:
                 total_weight += batch_weight_sum
-
-                # LL and NSS
-                # (Same as before)
-                for metric_name, metric_fn in metric_functions.items():
+                for metric_name, metric_fn in metric_functions_avg.items():
                     if metric_name in total_metric_sums:
-                        metric_value_batch_avg = metric_fn(log_density, target_mask_int.float(), weights=weights)
-                        if not isinstance(metric_value_batch_avg, torch.Tensor) or metric_value_batch_avg.ndim != 0:
-                             raise ValueError(f"Metric function {metric_name} did not return a scalar tensor!")
-                        total_metric_sums[metric_name] += metric_value_batch_avg * batch_weight_sum
+                        try:
+                            # Pass appropriate mask: binary float for LL/NSS (as before), original mask for CPU AUC
+                            # The CPU AUC function expects the original format and handles its own conversions
+                            mask_for_metric = target_mask_binary.float() if metric_name != 'AUC_CPU' else fixation_mask
+                            metric_value_batch_avg = metric_fn(log_density, mask_for_metric, weights=weights)
 
-                # AUC (using torchmetrics)
-                if auroc_metric is not None:
+                            if not isinstance(metric_value_batch_avg, torch.Tensor) or metric_value_batch_avg.ndim != 0:
+                                 warnings.warn(f"Metric function {metric_name} did not return scalar tensor! Got: {metric_value_batch_avg}", RuntimeWarning)
+                                 # Attempt to convert if possible, otherwise skip accumulation
+                                 if isinstance(metric_value_batch_avg, (int, float)):
+                                     metric_value_batch_avg = torch.tensor(metric_value_batch_avg, device=device)
+                                 else: continue # Skip accumulation if conversion fails
+
+                            total_metric_sums[metric_name] += metric_value_batch_avg * batch_weight_sum
+                        except Exception as e:
+                             warnings.warn(f"Error calculating metric {metric_name}: {e}. Skipping accumulation for this batch.", RuntimeWarning)
+
+
+            # --- Update GPU AUC (if active and no previous OOM) ---
+            if auroc_metric_gpu is not None and not oom_error_gpu_auc:
+                try:
                     preds_for_auc = log_density
-                    targets_flat = target_mask_int.flatten()
+                    targets_flat = target_mask_binary.flatten()
                     preds_flat = preds_for_auc.flatten()
-
-                    # <<< ----- DEBUG PRINTS (Runs only for first batch) ----- >>>
-                    if not printed_debug_info:
-                        print("\n--- AUC DEBUG INFO (First Batch) ---")
-                        print(f"Targets shape: {targets_flat.shape}")
-                        print(f"Targets unique values: {torch.unique(targets_flat)}")
-                        print(f"Targets sum: {targets_flat.sum().item()}")
-                        num_positives = (targets_flat > 0).sum().item()
-                        print(f"Number of positive targets (>0): {num_positives}")
-
-                        print(f"\nPredictions shape: {preds_flat.shape}")
-                        print(f"Predictions contain NaN: {torch.isnan(preds_flat).any().item()}")
-                        print(f"Predictions contain Inf: {torch.isinf(preds_flat).any().item()}")
-                        if not torch.isnan(preds_flat).any() and not torch.isinf(preds_flat).any():
-                            print(f"Predictions min: {preds_flat.min().item():.4f}")
-                            print(f"Predictions max: {preds_flat.max().item():.4f}")
-                            print(f"Predictions mean: {preds_flat.mean().item():.4f}")
-                            # Check predictions at positive locations
-                            if num_positives > 0:
-                                preds_at_positives = preds_flat[targets_flat > 0]
-                                print(f"Predictions @ Positives min: {preds_at_positives.min().item():.4f}")
-                                print(f"Predictions @ Positives max: {preds_at_positives.max().item():.4f}")
-                                print(f"Predictions @ Positives mean: {preds_at_positives.mean().item():.4f}")
-                        print("-------------------------------------\n")
-                        printed_debug_info = True
-                    # <<< ----- END DEBUG PRINTS ----- >>>
-
-                    # Check if there are both positive and negative samples before updating
                     if torch.unique(targets_flat).numel() > 1:
-                         auroc_metric.update(preds_flat, targets_flat)
-                    else:
-                         # If only one class present in the batch, AUC is not well-defined for this batch alone
-                         # torchmetrics handles accumulation correctly, but we can print a warning
-                         if not printed_debug_info: # Avoid repeating for every batch
-                             print(f"WARNING: Skipping AUROC update for batch {batch_idx} because only one class is present.")
+                        auroc_metric_gpu.update(preds_flat, targets_flat)
+                except torch.cuda.OutOfMemoryError as e:
+                    warnings.warn("\n!!! OOM ERROR during GPU AUROC update !!!\nGPU AUC will be NaN. Reduce validation batch size if GPU AUC is desired.", RuntimeWarning)
+                    oom_error_gpu_auc = True # Set flag to stop trying GPU AUC
+                    # Release metric memory if possible
+                    del auroc_metric_gpu
+                    auroc_metric_gpu = None
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                     warnings.warn(f"Error updating GPU AUROC: {e}. GPU AUC may be incorrect.", RuntimeWarning)
 
 
-            # --- Optional: Update progress bar ---
-            # (Same as before)
+            # --- Update progress bar ---
             desc = "Validating"
-            if 'LL' in total_metric_sums and total_weight > 0:
-                current_avg_ll = (total_metric_sums['LL'] / total_weight).item()
-                desc += f' LL {current_avg_ll:.5f}'
+            if 'LL' in metrics and 'LL' in total_metric_sums and total_weight > 0:
+                 current_avg_ll = (total_metric_sums['LL'] / total_weight).item()
+                 desc += f' LL {current_avg_ll:.5f}'
+            # Add CPU AUC to progress bar if desired (more stable)
+            if 'AUC_CPU' in metrics and 'AUC_CPU' in total_metric_sums and total_weight > 0:
+                 current_avg_auc_cpu = (total_metric_sums['AUC_CPU'] / total_weight).item()
+                 desc += f' AUC_CPU {current_avg_auc_cpu:.5f}'
             pbar.set_description(desc)
+            # ---
 
-    # --- Final Calculation (after loop) ---
-    # (Same as before - computes final metrics from accumulators)
+    # --- Final Calculation ---
     final_metrics = {}
     total_weight_cpu = total_weight.item()
 
     if total_weight_cpu > 0:
+        # Calculate final averages for LL, NSS, AUC_CPU
         for metric_name, metric_sum in total_metric_sums.items():
-            final_metrics[metric_name] = (metric_sum / total_weight).item()
+             if metric_name in metrics: # Only compute if requested
+                final_metrics[metric_name] = (metric_sum / total_weight).item()
 
-        if auroc_metric is not None:
-            try:
-                # Compute final AUC - ensure state has been updated at least once
-                if auroc_metric.update_count > 0: # Check internal counter or similar state
-                    final_metrics['AUC'] = auroc_metric.compute().item()
-                else:
-                    print("WARNING: AUROC metric was never updated (no valid batches found?). Setting AUC to NaN.")
-                    final_metrics['AUC'] = float('nan')
+        # Compute final GPU AUC (if requested and didn't fail)
+        if 'AUC_GPU' in metrics:
+            if auroc_metric_gpu is not None and not oom_error_gpu_auc:
+                try:
+                    if hasattr(auroc_metric_gpu, 'update_count') and auroc_metric_gpu.update_count > 0:
+                         final_metrics['AUC_GPU'] = auroc_metric_gpu.compute().item()
+                    elif hasattr(auroc_metric_gpu, 'preds') and len(auroc_metric_gpu.preds) > 0: # Fallback check
+                         final_metrics['AUC_GPU'] = auroc_metric_gpu.compute().item()
+                    else:
+                         warnings.warn("GPU AUROC metric may not have been updated. Setting AUC_GPU to NaN.", RuntimeWarning)
+                         final_metrics['AUC_GPU'] = float('nan')
+                except Exception as e:
+                    warnings.warn(f"Failed to compute final GPU AUC: {e}. Setting AUC_GPU to NaN.", RuntimeWarning)
+                    final_metrics['AUC_GPU'] = float('nan')
+                finally:
+                    if auroc_metric_gpu: auroc_metric_gpu.reset()
+            else:
+                # OOM happened or wasn't requested
+                final_metrics['AUC_GPU'] = float('nan')
 
-            except Exception as e:
-                # Catch potential errors during compute, e.g., if state is invalid
-                print(f"WARNING: Failed to compute AUC: {e}")
-                print("AUROC Metric State:", auroc_metric) # Print state for debugging
-                final_metrics['AUC'] = float('nan')
-            finally:
-                 auroc_metric.reset()
-        else:
-            if 'AUC' in metrics: final_metrics['AUC'] = float('nan')
-
-    else:
+    else: # Handle zero weight case
         for metric_name in metrics:
-             if metric_name != 'IG':
-                 final_metrics[metric_name] = float('nan')
+             if metric_name != 'IG': final_metrics[metric_name] = float('nan')
 
-    # Calculate Information Gain (IG)
-    # (Same as before)
+    # Ensure all requested metrics have a value (even if NaN)
+    for metric_name in metrics:
+        if metric_name != 'IG' and metric_name not in final_metrics:
+             final_metrics[metric_name] = float('nan')
+
+
+    # Calculate IG
     if 'IG' in metrics:
-        if 'LL' in final_metrics and not np.isnan(final_metrics['LL']):
-            final_metrics['IG'] = final_metrics['LL'] - baseline_information_gain
+        ll_value = final_metrics.get('LL', float('nan'))
+        if not np.isnan(ll_value):
+            final_metrics['IG'] = ll_value - baseline_information_gain
         else:
             final_metrics['IG'] = float('nan')
 
