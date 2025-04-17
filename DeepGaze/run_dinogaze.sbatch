@@ -3,7 +3,7 @@
 #SBATCH --job-name=PixiGaze-G14-Pre     # Job name (adjust for stage/fold)
 #SBATCH --output=slurm_logs/pixigaze_%A_%a.out  # Standard output log (%A=job id, %a=task id)
 #SBATCH --error=slurm_logs/pixigaze_%A_%a.err   # Standard error log
-#SBATCH --partition=YOUR_A100_PARTITION # !!! IMPORTANT: Specify your A100 partition name !!!
+#SBATCH --partition=gpu # !!! IMPORTANT: Specify your A100 partition name !!!
 #SBATCH --gres=gpu:a100:1             # Request 1 A100 GPU
 #SBATCH --nodes=1                     # Run on a single node
 #SBATCH --ntasks=1                    # Run a single task (the python script)
@@ -40,7 +40,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 # Helps prevent fragmentati
 
 # Navigate to the directory containing pixi.toml and train_dinogaze.py
 # !!! IMPORTANT: Adjust path if needed !!!
-cd /path/to/your/project/directory # Where pixi.toml and train_dinogaze.py are
+cd ~/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation # Where pixi.toml and train_dinogaze.py are
 
 # --- Set parameters based on the desired stage ---
 STAGE="salicon_pretrain" # Options: salicon_pretrain, mit_spatial, mit_scanpath_frozen, mit_scanpath_full
