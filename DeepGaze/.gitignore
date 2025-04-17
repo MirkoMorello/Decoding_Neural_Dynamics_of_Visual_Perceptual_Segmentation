@@ -2,3 +2,4 @@
 __pycache__
 pysaliency_datasets/*
 train_deepgaze3/*
+train_dinogaze/*
