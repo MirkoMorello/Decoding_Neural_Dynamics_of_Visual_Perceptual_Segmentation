@@ -46,7 +46,7 @@ cd ~/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation # Where pixi.tom
 STAGE="salicon_pretrain" # Options: salicon_pretrain, mit_spatial, mit_scanpath_frozen, mit_scanpath_full
 MODEL_NAME="dinov2_vitg14"
 LAYERS="-3 -2 -1" # As a string, argparse will handle it
-BATCH_SIZE=4      # Start low for ViT-G!
+BATCH_SIZE=16      # Start low for ViT-G!
 LR=0.0005
 MIN_LR=1e-7
 NUM_WORKERS=16 # Match --cpus-per-task if possible
