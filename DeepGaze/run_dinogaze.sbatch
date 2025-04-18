@@ -40,7 +40,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 # Helps prevent fragmentati
 
 # Navigate to the directory containing pixi.toml and train_dinogaze.py
 # !!! IMPORTANT: Adjust path if needed !!!
-cd ~/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation # Where pixi.toml and train_dinogaze.py are
+cd ~/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation/DeepGaze # Where pixi.toml and train_dinogaze.py are
 
 # --- Set parameters based on the desired stage ---
 STAGE="salicon_pretrain" # Options: salicon_pretrain, mit_spatial, mit_scanpath_frozen, mit_scanpath_full
