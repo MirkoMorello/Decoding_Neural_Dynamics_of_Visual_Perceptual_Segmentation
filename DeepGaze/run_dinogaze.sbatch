@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --job-name=PixiGaze-G14-Pre     # Job name (adjust for stage/fold)
-#SBATCH --output=slurm_logs/pixigaze_%A_%a.out  # Standard output log (%A=job id, %a=task id)
-#SBATCH --error=slurm_logs/pixigaze_%A_%a.err   # Standard error log
+#SBATCH --output=slurm_logs/pixigaze_%A_%a.log  # Standard output log (%A=job id, %a=task id)
+#SBATCH --error=slurm_logs/pixigaze_%A_%a.log   # Standard error log
 #SBATCH --partition=gpu # !!! IMPORTANT: Specify your A100 partition name !!!
 #SBATCH --gres=gpu:a100:1             # Request 1 A100 GPU
 #SBATCH --nodes=1                     # Run on a single node
@@ -91,7 +91,7 @@ PYTHON_ARGS="train_dinogaze.py \
 
 # --- Run the Python script using Pixi ---
 echo "Running command via Pixi:"
-echo "pixi run python $PYTHON_ARGS"
+echo "pixi run python -u $PYTHON_ARGS"
 echo "--------------------------------------------------------"
 
 # Execute the command within the pixi environment
