@@ -1,3 +1,5 @@
+# metrics.py
+
 import numpy as np
 from pysaliency.roc import general_roc
 from pysaliency.numba_utils import auc_for_one_positive
