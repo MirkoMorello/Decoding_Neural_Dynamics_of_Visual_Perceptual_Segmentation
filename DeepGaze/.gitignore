@@ -6,3 +6,6 @@ train_dinogaze/*
 lmdb_cache_dinogaze_vitg/*
 train_dinogaze_vitg/*
 train_dinogaze_vitg_salicon_pretrain/*
+._.DS_Store
+.DS_Store
+slurm_logs/*
