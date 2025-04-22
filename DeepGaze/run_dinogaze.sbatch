@@ -37,6 +37,7 @@ module purge # Clear existing modules (recommended)
 # Optional: Set environment variables
 # export WANDB_MODE=offline # If using Weights & Biases, run offline initially
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 # Helps prevent fragmentation
+export OMP_NUM_THREADS=32 # Set OpenMP threads
 
 # Navigate to the directory containing pixi.toml and train_dinogaze.py
 # !!! IMPORTANT: Adjust path if needed !!!
