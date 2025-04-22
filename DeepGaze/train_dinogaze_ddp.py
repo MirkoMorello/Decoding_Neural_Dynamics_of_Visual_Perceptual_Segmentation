@@ -590,6 +590,7 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None, 
 
             batch_weight_sum = weights.sum()
 
+            # --- Accumulate Batch-Averaged Metrics (LL, NSS, AUC_CPU) ---
             if batch_weight_sum > 0:
                 current_batch_weight = batch_weight_sum
                 total_weight += current_batch_weight
@@ -597,12 +598,14 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None, 
                 for metric_name, metric_fn in metric_functions_avg.items():
                     if metric_name in total_metric_sums:
                         try:
-                            # <<< CHANGE: Use target_mask_binary for CPU AUC as well >>>
-                            # Pass appropriate mask: binary float for LL/NSS/CPU_AUC
-                            # mask_for_metric = target_mask_binary.float() if metric_name != 'AUC_CPU' else fixation_mask
-                            mask_for_metric = target_mask_binary.float() # Pass binary mask for consistency
+                            # <<< FIX: Pass the ORIGINAL fixation_mask >>>
+                            # LL, NSS, and the original AUC function expect the mask
+                            # potentially containing fixation counts, not just binary values.
+                            mask_for_metric = fixation_mask
                             value = metric_fn(log_density, mask_for_metric, weights=weights)
-                            # <<< END CHANGE >>>
+                            # <<< END FIX >>>
+
+                            # Accumulate results (rest of the logic is the same)
                             if isinstance(value, torch.Tensor) and value.ndim == 0:
                                 total_metric_sums[metric_name] += value * current_batch_weight
                             elif isinstance(value, (int, float)):
