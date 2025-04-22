@@ -1,11 +1,8 @@
 *.pyc
 __pycache__
 pysaliency_datasets/*
-train_deepgaze3/*
-train_dinogaze/*
-lmdb_cache_dinogaze_vitg/*
-train_dinogaze_vitg/*
-train_dinogaze_vitg_salicon_pretrain/*
+train_*/*
+lmdb_cache*/*
 ._.DS_Store
 .DS_Store
 slurm_logs/*
