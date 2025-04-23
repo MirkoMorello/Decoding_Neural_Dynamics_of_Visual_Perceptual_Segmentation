@@ -38,8 +38,7 @@ torchvision   = ">=0.21.0,<0.22"
 pip           = ">=25.0.1,<26"
 
 [pypi-dependencies]
-# Pure‑Python packages via pip
-pysaliency    = ">=0.2.22,<0.3"
+pysaliency = ">=0.2.22, <0.3"
 lmdb          = ">=1.6.2,<2"
 xformers      = "*"
 
