@@ -392,7 +392,10 @@ def _export_dataset_to_lmdb(stimuli: pysaliency.FileStimuli, centerbias_model: p
         print(f"Removing existing path: {lmdb_path_str}")
         try:
             if os.path.isdir(lmdb_path_str) and not os.path.islink(lmdb_path_str):
-                 shutil.rmtree(lmdb_path_str)
+                shutil.rmtree(lmdb_path_str)
+                # recreate the directory so LMDB can open it
+                os.makedirs(lmdb_path_str, exist_ok=True)
+
             else: # It's a file or a symlink
                  os.remove(lmdb_path_str)
         except OSError as e:
@@ -401,11 +404,12 @@ def _export_dataset_to_lmdb(stimuli: pysaliency.FileStimuli, centerbias_model: p
             # raise e
 
     # --- Generate the database ---
+    os.makedirs(lmdb_path_str, exist_ok=True)
     db_write = None
     try:
         # Open for writing. subdir=True creates the directory if needed.
         db_write = lmdb.open(lmdb_path_str, subdir=True,
-                           map_size=1099511627776 * 2, readonly=False, # Adjust map_size if needed
+                           map_size = 8 * 1024**3, readonly=False, # Adjust map_size if needed
                            meminit=False, map_async=True)
 
         actual_written_count = 0

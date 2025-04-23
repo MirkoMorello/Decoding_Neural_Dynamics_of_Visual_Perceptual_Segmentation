@@ -21,6 +21,8 @@ import warnings        # Import warnings module
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Sequence
+
 import contextlib # Needed for gradient accumulation
 
 import numpy as np
@@ -31,6 +33,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torchmetrics    # For GPU AUC etc.
+from torchmetrics.metric import Metric
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter # Needed for copied _train
 from imageio.v3 import imread, imwrite
@@ -43,6 +46,20 @@ from boltons.fileutils import atomic_save, mkdir_p # Needed for copied _train
 
 # Needed for AMP
 from torch import amp
+
+# ── MONKEY-PATCH torchmetrics.Metric.reset to not call .clear() on plain Tensors ──
+
+_original_reset = Metric.reset
+def _safe_reset(self):
+    for attr in self._defaults:                         # each registered state name
+        state = getattr(self, attr)
+        if hasattr(state, "clear"):                     # list-like states
+            state.clear()
+        elif isinstance(state, torch.Tensor):            # tensor states
+            state.zero_()
+        # otherwise leave it alone
+# Override globally before you instantiate/use any metrics
+Metric.reset = _safe_reset
 
 # -----------------------------------------------------------------------------
 # UTILS – DISTRIBUTED SETUP ----------------------------------------------------
@@ -330,11 +347,13 @@ def prepare_scanpath_dataset(
 # MIT Data Conversion Functions (Copied from original with DDP modifications)
 # -----------------------------------------------------------------------------
 def convert_stimulus(input_image):
-    """ Resizes a single stimulus image to one of two standard sizes. """
-    size = input_image.shape[:2] # (height, width)
-    new_size = (768, 1024) if size[0] < size[1] else (1024, 768)
-    new_size_pil = tuple(list(new_size)[::-1])
-    return np.array(Image.fromarray(input_image).resize(new_size_pil, Image.Resampling.BILINEAR))
+    target = (768, 1024)
+    # pillow wants (W,H):
+    new_img = np.array(
+        Image.fromarray(input_image)
+             .resize((target[1], target[0]), Image.BILINEAR)
+    )
+    return new_img
 
 def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed: bool, device: torch.device):
     """ Converts all stimuli in a FileStimuli object to standard sizes and saves them. """
@@ -390,95 +409,185 @@ def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed
         # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
         dist.barrier() # Removed device_ids
 
-    try:
-        # Add `attributes={'original_shapes': stimuli.shapes}` if needed for inverse scaling
-        return pysaliency.FileStimuli(new_filenames, store_json=is_master)
-    except Exception as e:
-         _logger.critical(f"Failed to create FileStimuli object after conversion: {e}")
-         return None
+    return pysaliency.FileStimuli(new_filenames)
+
+
 
 def convert_fixation_trains(stimuli, fixations, is_master: bool):
-    """ Converts fixation coordinates to match resized stimuli. """
-    if stimuli is None:
-        _logger.error("Stimuli conversion failed previously, cannot convert fixations.")
+    """
+    Converts fixation coordinates and filters attributes for FixationTrains,
+    incorporating vectorized scaling and stricter attribute checks.
+    """
+    # --- Initial Checks ---
+    if stimuli is None or not hasattr(stimuli, 'shapes'):
+        _logger.error("Stimuli object is None or missing 'shapes'. Cannot convert fixations.")
         return None
+    core_attrs = ['train_xs', 'train_ys', 'train_ts', 'train_ns', 'train_subjects']
+    if not all(hasattr(fixations, attr) for attr in core_attrs):
+        _logger.error("Input fixations object is missing one or more core train_* attributes.")
+        return None
+
     if is_master: _logger.info("Converting fixation coordinates...")
-    train_xs = fixations.train_xs.copy()
-    train_ys = fixations.train_ys.copy()
+
     try:
-        # Cache shapes and compute factors once per stimulus index
+        # --- Pull out the original 2D scanpath matrices ---
+        train_xs       = np.asarray(fixations.train_xs,      dtype=float)   # shape (T, L)
+        train_ys       = np.asarray(fixations.train_ys,      dtype=float)   # shape (T, L)
+        train_ts       = np.asarray(fixations.train_ts,      dtype=float)   # shape (T, L)
+        train_ns       = np.asarray(fixations.train_ns,      dtype=int)     # shape (T, L)
+        train_subjects = np.asarray(fixations.train_subjects,dtype=int)     # shape (T, L)
+
+        original_fixation_count = len(train_xs)
+        if original_fixation_count == 0:
+            _logger.warning("Input fixations has zero fixations after potential collapsing.")
+            return pysaliency.FixationTrains( # Return empty but valid object
+                train_xs=np.array([]), train_ys=np.array([]), train_ts=np.array([]),
+                train_ns=np.array([], dtype=int), train_subjects=np.array([]), attributes={}
+            )
+    except Exception as e:
+         _logger.exception(f"Error during initial coordinate processing/collapsing: {e}")
+         return None
+
+    
+    
+    try:
+        # --- Compute Scaling Factors (once per stimulus) ---
         shapes_cache = stimuli.shapes
-        scale_factors = {}
+        scale_factors_map = {}
         for n, shape in enumerate(shapes_cache):
-            size = shape[:2]
-            if size[0] <= 0 or size[1] <= 0:
-                if is_master: _logger.warning(f"Invalid original image size {size} for stimulus index {n}. Fixations will be invalid.")
-                scale_factors[n] = (np.nan, np.nan)
-                continue
-            new_size = (768, 1024) if size[0] < size[1] else (1024, 768)
-            x_factor = new_size[1] / size[1]
-            y_factor = new_size[0] / size[0]
-            scale_factors[n] = (x_factor, y_factor)
+            size = shape[:2] # Original (height, width)
+            if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
+                scale_factors_map[n] = (np.nan, np.nan) # Mark as invalid
+                if is_master: _logger.warning(f"Invalid original size {size} for stimulus index {n}.")
+            else:
+                new_size = (768, 1024) if size[0] < size[1] else (1024, 768) # (h, w)
+                scale_factors_map[n] = (new_size[1] / size[1], new_size[0] / size[0]) # (x_factor, y_factor)
+    except Exception as e:
+        _logger.exception(f"Failed to compute scaling factors from stimuli shapes: {e}")
+        return None
+
+    # --- Vectorized Coordinate Scaling ---
+    try:
+        N_stim = len(shapes_cache)
+        lut_x  = np.full(N_stim, np.nan, dtype=float)
+        lut_y  = np.full(N_stim, np.nan, dtype=float)
+        for n, (xf, yf) in scale_factors_map.items():
+            lut_x[n] = xf
+            lut_y[n] = yf
+
+        # look‑ups are 1‑D (N,) here
+        x_factors_1d = lut_x[train_ns]          # (N,)
+        y_factors_1d = lut_y[train_ns]
+
+        # match the second dimension of the coordinate matrices
+        L = train_xs.shape[1]                   # 16
+        x_factors = np.repeat(x_factors_1d[:, None], L, axis=1)   # (N,16)
+        y_factors = np.repeat(y_factors_1d[:, None], L, axis=1)
+
+        # apply element‑wise
+        train_xs = train_xs.astype(float) * x_factors
+        train_ys = train_ys.astype(float) * y_factors
+        
+                # --- clip to image bounds (avoid "positions out of bound") -------------
+        # build LUTs with the *max legal index* for each stimulus
+        width_new  = np.array([nf[0]            # w
+                               for nf in ( (1024,768) if s[0] < s[1] else (768,1024)
+                                           for s in shapes_cache )], dtype=float) - 1.0
+        height_new = np.array([nf[1]            # h
+                               for nf in ( (1024,768) if s[0] < s[1] else (768,1024)
+                                           for s in shapes_cache )], dtype=float) - 1.0
+
+        max_x = width_new[train_ns][:, None]    # (N,16)
+        max_y = height_new[train_ns][:, None]
+
+        # clip; keep a small epsilon below the edge
+        train_xs = np.clip(train_xs, 0.0, max_x)
+        train_ys = np.clip(train_ys, 0.0, max_y)
+
+
+        # --- Identify Valid Fixations (Post‐Scaling) ---
+        valid_mask = ~np.isnan(x_factors) & ~np.isnan(y_factors) \
+                     & ~np.isnan(train_xs) & ~np.isnan(train_ys)
+        final_valid_indices = np.where(valid_mask)[0]
+
+        num_filtered = original_fixation_count - len(final_valid_indices)
+        if is_master and num_filtered > 0:
+            _logger.warning(f"Filtered out {num_filtered} fixations due to invalid coordinates or scaling issues.")
 
     except Exception as e:
-        _logger.error(f"Failed to get shapes or precompute factors from converted stimuli: {e}")
+        _logger.exception(f"Error during vectorized coordinate scaling or validation: {e}")
         return None
 
-    range_iterable = tqdm(range(len(train_xs)), desc="Converting Fixations", disable=not is_master)
-    valid_indices_mask = np.ones(len(train_xs), dtype=bool)
-    conversion_errors = 0
 
-    for i in range_iterable:
-        n = fixations.train_ns[i]
-        try:
-            x_factor, y_factor = scale_factors.get(n, (np.nan, np.nan))
-            if np.isnan(x_factor) or np.isnan(y_factor):
-                raise ValueError(f"Invalid scale factor for stimulus index {n}")
-            train_xs[i] *= x_factor
-            train_ys[i] *= y_factor
-            if np.isnan(train_xs[i]) or np.isnan(train_ys[i]):
-                raise ValueError(f"NaN result after scaling fixation {i} for stimulus index {n}")
-        except (IndexError, ValueError, ZeroDivisionError, TypeError, KeyError) as e:
-             if is_master: _logger.warning(f"Error converting fixation {i} for stimulus index {n}: {e}. Marking as invalid.")
-             train_xs[i] = np.nan
-             train_ys[i] = np.nan
-             valid_indices_mask[i] = False
-             conversion_errors += 1
-
-    if is_master and conversion_errors > 0:
-        _logger.warning(f"Encountered {conversion_errors} errors during fixation conversion.")
-
-    final_valid_indices = np.where(valid_indices_mask & ~np.isnan(train_xs) & ~np.isnan(train_ys))[0]
-    num_filtered = len(train_xs) - len(final_valid_indices)
-    if is_master and num_filtered > 0:
-        _logger.warning(f"Filtered out {num_filtered} fixations due to conversion errors or invalid original data.")
+    # --- Safe Attribute Transfer ("Bullet-Proof Fix" Refined) ---
+    # Only explicitly skip the core attributes passed as positional args
+    skip_keys = set(core_attrs)
+    # Add others sometimes present/problematic, though filtering handles most cases
+    skip_keys.update(['subjects', 'scanpath_index', 'lengths', 'average_duration'])
 
     attributes_dict = {}
-    try:
-        for k in fixations.__attributes__:
-            if k in ['subjects', 'scanpath_index']: continue
-            attr_val = getattr(fixations, k)
-            if hasattr(attr_val, '__len__') and hasattr(attr_val, 'copy') and len(attr_val) == len(fixations.train_xs):
-                try:
-                     attributes_dict[k] = attr_val.copy()[final_valid_indices]
-                except IndexError:
-                     if is_master: _logger.warning(f"Could not index attribute '{k}' during fixation filtering.")
-            elif not (hasattr(attr_val, '__len__') and hasattr(attr_val, 'copy')):
-                 try:
-                     attributes_dict[k] = attr_val.copy() if hasattr(attr_val, 'copy') else attr_val
-                 except Exception as copy_e:
-                     if is_master: _logger.warning(f"Could not copy attribute '{k}': {copy_e}")
+    if hasattr(fixations, '__attributes__'):
+        attributes_iterable = tqdm(fixations.__attributes__, desc="Filtering Attributes", disable=not is_master) if is_master else fixations.__attributes__
+        for k in attributes_iterable:
+            if k in skip_keys:
+                continue # Skip core/explicitly excluded
 
-        return pysaliency.FixationTrains(
-            train_xs=train_xs[final_valid_indices], train_ys=train_ys[final_valid_indices],
-            train_ts=fixations.train_ts.copy()[final_valid_indices],
-            train_ns=fixations.train_ns.copy()[final_valid_indices],
-            train_subjects=fixations.train_subjects.copy()[final_valid_indices],
+            try:
+                attr_val = getattr(fixations, k)
+
+                # Keep scalars/0D arrays
+                is_scalar_like = not isinstance(attr_val, (Sequence, np.ndarray)) or \
+                                 (isinstance(attr_val, np.ndarray) and attr_val.ndim == 0)
+                is_string_like = isinstance(attr_val, (str, bytes))
+
+                if is_scalar_like and not is_string_like: # Keep non-sequence, non-string data
+                    attributes_dict[k] = attr_val
+                    if is_master: _logger.debug(f"Kept scalar/0D attribute '{k}'")
+                    continue
+
+                # Process valid sequences (excluding strings/bytes)
+                if isinstance(attr_val, Sequence) and not is_string_like:
+                    try:
+                        arr = np.asarray(attr_val) # Convert to numpy array
+                    except Exception as np_err:
+                        if is_master: _logger.warning(f"Could not convert sequence attribute '{k}' to NumPy array: {np_err}. Skipping.")
+                        continue
+
+                    # Check: Must be exactly 1D AND match original fixation count
+                    if arr.ndim == 1 and arr.shape[0] == original_fixation_count:
+                        attributes_dict[k] = arr.copy()[final_valid_indices] # Filter valid ones
+                        if is_master: _logger.debug(f"Kept and filtered 1D attribute '{k}' (Shape: {arr.shape})")
+                    else:
+                         if is_master: # Log skip reason
+                            shape_info = arr.shape if hasattr(arr, 'shape') else 'N/A'
+                            reason = f"ndim={arr.ndim}!=1" if arr.ndim != 1 else f"shape[0]={arr.shape[0]}!={original_fixation_count}"
+                            _logger.debug(f"Skipped attribute '{k}' – Shape {shape_info}, Reason: {reason}")
+                # else: implicitly skip non-sequence, non-scalar, or string types
+
+            except AttributeError:
+                 if is_master: _logger.warning(f"Attribute '{k}' in __attributes__ but not found. Skipping.")
+            except Exception as attr_err:
+                if is_master: _logger.exception(f"Unexpected error processing attribute '{k}'. Skipping.")
+
+    else:
+         if is_master: _logger.warning("fixations object lacks __attributes__. Cannot transfer extra attributes.")
+
+    # --- Construct Final Object ---
+    try:
+        new_fixations = pysaliency.FixationTrains(
+            train_xs=train_xs[final_valid_indices],
+            train_ys=train_ys[final_valid_indices],
+            train_ts=train_ts[final_valid_indices],
+            train_ns=train_ns[final_valid_indices],
+            train_subjects=train_subjects[final_valid_indices],
             attributes=attributes_dict
         )
+        if is_master: _logger.info(f"Created new FixationTrains with {len(final_valid_indices)} valid fixations.")
+        return new_fixations
     except Exception as e:
-         _logger.error(f"Error filtering attributes or creating final FixationTrains object: {e}")
+         _logger.exception(f"Error creating final FixationTrains object: {e}")
          return None
+
 
 # -----------------------------------------------------------------------------
 # TRAINING FUNCTIONS (Copied and Modified for DDP)
@@ -822,126 +931,113 @@ def restore_from_checkpoint(model, optimizer, scheduler, scaler, path, device, i
     """ Restores training state from a checkpoint file, handling DDP 'module.' prefix and GradScaler. """
     if not os.path.exists(path):
         _logger.error(f"Checkpoint path not found: {path}. Cannot restore.")
-        return 0, np.nan, False # Added scheduler_restored flag
+        return 0, np.nan, False  # No checkpoint, start from scratch
 
     _logger.info(f"Restoring checkpoint from: {path} (Distributed: {is_distributed})")
     try:
-        # Load checkpoint to the specified device directly
+        # Load either a full checkpoint dict or a bare state_dict
         data = torch.load(path, map_location=device)
+        if not isinstance(data, dict) or 'model' not in data:
+            state_dict = data
+        else:
+            state_dict = data['model']
     except Exception as e:
         _logger.exception(f"Failed to load checkpoint file {path}")
         return 0, np.nan, False
 
     # --- Restore Model State ---
-    if 'model' not in data:
-        _logger.error(f"Checkpoint {path} does not contain 'model' key.")
-        return 0, np.nan, False
-    model_state_dict = data['model']
+    model_state_dict = state_dict
     adjusted_state_dict = OrderedDict()
     is_ddp_checkpoint = any(k.startswith('module.') for k in model_state_dict.keys())
     current_model_is_ddp = isinstance(model, DDP)
 
     if current_model_is_ddp:
+        # Model is wrapped in DDP, ensure keys start with 'module.'
         if not is_ddp_checkpoint:
             _logger.warning("Current model is DDP, but checkpoint is not. Adding 'module.' prefix.")
             for k, v in model_state_dict.items():
                 adjusted_state_dict[f'module.{k}'] = v
         else:
-            _logger.debug("Current model and checkpoint are DDP. Ensuring 'module.' prefix.")
+            _logger.debug("Current model and checkpoint are both DDP. Checking prefixes.")
             for k, v in model_state_dict.items():
                 if not k.startswith('module.'):
-                    _logger.warning(f"Found key '{k}' without 'module.' prefix in DDP checkpoint. Adding prefix.")
+                    _logger.warning(f"Adding missing 'module.' prefix to key '{k}'.")
                     adjusted_state_dict[f'module.{k}'] = v
                 else:
                     adjusted_state_dict[k] = v
-    else: # Current model is not DDP
+    else:
+        # Model is not DDP, strip 'module.' if present
         if is_ddp_checkpoint:
             _logger.warning("Current model is not DDP, but checkpoint is. Removing 'module.' prefix.")
             for k, v in model_state_dict.items():
                 if k.startswith('module.'):
-                    adjusted_state_dict[k.removeprefix('module.')] = v
+                    adjusted_state_dict[k[len('module.'):]] = v
                 else:
-                     _logger.warning(f"Found key '{k}' without 'module.' prefix in DDP checkpoint when loading to non-DDP model.")
-                     adjusted_state_dict[k] = v
+                    adjusted_state_dict[k] = v
         else:
             adjusted_state_dict = model_state_dict
 
     try:
         missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
-        if missing_keys: _logger.warning(f"Missing keys when loading model state: {missing_keys}")
-        if unexpected_keys: _logger.warning(f"Unexpected keys when loading model state: {unexpected_keys}")
+        if missing_keys:
+            _logger.warning(f"Missing keys when loading model state: {missing_keys}")
+        if unexpected_keys:
+            _logger.warning(f"Unexpected keys when loading model state: {unexpected_keys}")
     except Exception as load_err:
-         _logger.exception(f"Error loading model state_dict")
-         return 0, np.nan, False
+        _logger.exception("Error loading model state_dict")
+        return 0, np.nan, False
 
     # --- Restore Optimizer State ---
-    if 'optimizer' in data and optimizer is not None:
+    if isinstance(data, dict) and 'optimizer' in data and optimizer is not None:
         try:
             optimizer.load_state_dict(data['optimizer'])
             _logger.info("Optimizer state restored.")
-            # Ensure optimizer state tensors are on the correct device
+            # Move optimizer tensors to correct device
             for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
-            _logger.info(f"Moved optimizer state tensors to device {device}")
+                for key, val in state.items():
+                    if isinstance(val, torch.Tensor):
+                        state[key] = val.to(device)
         except Exception as e:
-            _logger.warning(f"Could not restore optimizer state: {e}. Optimizer will start fresh.")
+            _logger.warning(f"Could not restore optimizer state: {e}. Starting with fresh optimizer.")
     elif optimizer is not None:
-         _logger.warning("Optimizer state not found in checkpoint. Optimizer will start fresh.")
+        _logger.warning("Optimizer state not found in checkpoint. Starting with fresh optimizer.")
 
     # --- Restore Scheduler State ---
     scheduler_restored = False
-    if 'scheduler' in data and scheduler is not None:
+    if isinstance(data, dict) and 'scheduler' in data and scheduler is not None:
         try:
             scheduler.load_state_dict(data['scheduler'])
             _logger.info("Scheduler state restored.")
             scheduler_restored = True
         except Exception as e:
-            _logger.warning(f"Could not restore scheduler state: {e}. Scheduler will start fresh.")
+            _logger.warning(f"Could not restore scheduler state: {e}. Starting with fresh scheduler.")
     elif scheduler is not None:
-        _logger.warning("Scheduler state not found in checkpoint. Scheduler will start fresh.")
+        _logger.warning("Scheduler state not found in checkpoint. Starting with fresh scheduler.")
 
     # --- Restore GradScaler State (for AMP) ---
-    if 'grad_scaler' in data and scaler is not None:
+    if isinstance(data, dict) and 'grad_scaler' in data and scaler is not None:
         try:
             scaler.load_state_dict(data['grad_scaler'])
             _logger.info("GradScaler state restored.")
         except Exception as e:
-             _logger.warning(f"Could not restore GradScaler state: {e}. GradScaler starts fresh.")
+            _logger.warning(f"Could not restore GradScaler state: {e}. Starting with fresh GradScaler.")
     elif scaler is not None:
-        _logger.warning("GradScaler state not found in checkpoint. GradScaler starts fresh.")
+        _logger.warning("GradScaler state not found in checkpoint. Starting with fresh GradScaler.")
 
+    # --- Warn about RNG state if present ---
+    if isinstance(data, dict) and ('rng_state' in data or 'cuda_rng_state' in data):
+        _logger.warning("Checkpoint contains RNG state, but it is not being restored by default.")
 
-    # --- Restore RNG State ---
-    # Loading RNG state correctly is tricky in DDP. Generally, it's better to rely on
-    # setting the seed consistently at the start and letting DistributedSampler handle shuffling.
-    # If you need exact reproducibility, more complex handling is required.
-    # Here, we only log a warning if RNG state is found, but don't load it by default.
-    if 'rng_state' in data or 'cuda_rng_state' in data:
-        _logger.warning("Checkpoint contains RNG state, but it's not being restored by default "
-                        "to avoid DDP complications. Ensure consistent seeding if needed.")
-    # try:
-    #     torch.set_rng_state(data['rng_state'].cpu())
-    #     if torch.cuda.is_available() and 'cuda_rng_state' in data and data['cuda_rng_state']:
-    #             cuda_rng_list = data['cuda_rng_state']
-    #             if isinstance(cuda_rng_list, list) and len(cuda_rng_list) == dist.get_world_size():
-    #                 torch.cuda.set_rng_state(cuda_rng_list[dist.get_rank()], device=device.index)
-    #             else:
-    #                 _logger.warning(f"CUDA RNG state in checkpoint has unexpected format/size. Skipping restore.")
-    #     _logger.info("Global CPU RNG state restored.")
-    # except Exception as e:
-    #     _logger.warning(f"Could not restore RNG state: {e}")
-
-
-    step = data.get('step', 0)
-    loss = data.get('loss', np.nan)
+    # --- Final bookkeeping ---
+    step = data.get('step', 0) if isinstance(data, dict) else 0
+    loss = data.get('loss', np.nan) if isinstance(data, dict) else np.nan
     if step > 0:
-        _logger.info(f"Restored training state to step {step} with loss {loss:.5f}")
+        _logger.info(f"Restored to step {step} with loss {loss:.5f}")
     else:
-         _logger.info("Checkpoint loaded, but no previous step/loss found. Starting training from step 0.")
+        _logger.info("No previous step/loss found. Starting from step 0.")
 
     return step, loss, scheduler_restored
+
 
 
 def save_training_state(model, optimizer, scheduler, scaler, step, loss, path, is_distributed=False, is_master=True):
@@ -1400,8 +1496,7 @@ def main(args):
 
     # Determine readout factor based on model size
     if args.model_name in ['dinov2_vitl14', 'dinov2_vitg14']:
-         #readout_factor = features.patch_size # Should be 14 for L/G models
-         readout_factor = 7
+         readout_factor = features.patch_size # Should be 14 for L/G models
          if is_master: _logger.info(f"Using readout_factor={readout_factor} for {args.model_name}")
     else: # Assume vitb14
          readout_factor = 14 # Default from original notebook/script
@@ -1648,6 +1743,8 @@ def main(args):
         output_dir_base = train_directory / args.stage / f'crossval-10-{fold}'
         start_checkpoint_path = None
         model = None # Define model inside stage block
+        start_state_dict_path = None
+
 
         if args.stage == 'mit_spatial':
             model = DeepGazeIII(
@@ -1655,7 +1752,7 @@ def main(args):
                 saliency_network=build_saliency_network(C_in, add_sa_head=args.add_sa_head),
                 scanpath_network=None,
                 fixation_selection_network=build_fixation_selection_network(scanpath_features=0),
-                downsample=2, # Downsample by 2 for MIT
+                downsample=1, # Downsample by 2 for MIT
                 readout_factor=readout_factor, # Use determined factor
                 saliency_map_factor=4,
                 included_fixations=[]
@@ -1684,7 +1781,7 @@ def main(args):
                 saliency_network=build_saliency_network(C_in, add_sa_head=args.add_sa_head),
                 scanpath_network=build_scanpath_network(),
                 fixation_selection_network=build_fixation_selection_network(scanpath_features=16),
-                downsample=2, # Downsample by 2 for MIT
+                downsample=1, # Downsample by 2 for MIT
                 readout_factor=readout_factor, # Use determined factor
                 saliency_map_factor=4,
                 included_fixations=[-1, -2, -3, -4]
@@ -1749,7 +1846,7 @@ def main(args):
                 saliency_network=build_saliency_network(C_in, add_sa_head=args.add_sa_head),
                 scanpath_network=build_scanpath_network(),
                 fixation_selection_network=build_fixation_selection_network(scanpath_features=16),
-                downsample=2, # Downsample by 2 for MIT
+                downsample=1, # Downsample by 2 for MIT
                 readout_factor=readout_factor, # Use determined factor
                 saliency_map_factor=4,
                 included_fixations=[-1, -2, -3, -4]
@@ -1862,7 +1959,7 @@ def main(args):
             minimum_learning_rate=args.min_lr,
             device=device,
             startwith=str(start_checkpoint_path) if start_checkpoint_path else None, # Pass full checkpoint only if needed (pretrain)
-            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU', 'AUC_GPU'],
+            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'],
             is_distributed=is_distributed, is_master=is_master
         )
         if is_master: _logger.info(f"--- Stage {args.stage} Finished (Fold {fold}) ---")
