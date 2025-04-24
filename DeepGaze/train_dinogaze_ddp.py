@@ -41,6 +41,10 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None # Disable PIL decompression bomb check for large images
 from pysaliency.baseline_utils import (BaselineModel,
                                        CrossvalidatedBaselineModel)
+#import pysaliency.external_datasets.mit as mit_module
+# Monkey-patch out the broken Octave step
+#mit_module.get_mit1003_with_initial_fixation = mit_module.get_mit1003
+
 from tqdm import tqdm
 from boltons.fileutils import atomic_save, mkdir_p # Needed for copied _train
 
@@ -347,13 +351,17 @@ def prepare_scanpath_dataset(
 # MIT Data Conversion Functions (Copied from original with DDP modifications)
 # -----------------------------------------------------------------------------
 def convert_stimulus(input_image):
-    target = (768, 1024)
-    # pillow wants (W,H):
-    new_img = np.array(
+    h, w = input_image.shape[:2]
+    # Pillow wants (width, height)
+    if h < w:         # landscape
+        new_size = (1024, 768)
+    else:             # portrait
+        new_size = (768, 1024)
+    return np.array(
         Image.fromarray(input_image)
-             .resize((target[1], target[0]), Image.BILINEAR)
+             .resize(new_size, Image.BILINEAR)
     )
-    return new_img
+
 
 def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed: bool, device: torch.device):
     """ Converts all stimuli in a FileStimuli object to standard sizes and saves them. """
@@ -1496,7 +1504,7 @@ def main(args):
 
     # Determine readout factor based on model size
     if args.model_name in ['dinov2_vitl14', 'dinov2_vitg14']:
-         readout_factor = features.patch_size # Should be 14 for L/G models
+         readout_factor = 14 # features.patch_size # Should be 14 for L/G models
          if is_master: _logger.info(f"Using readout_factor={readout_factor} for {args.model_name}")
     else: # Assume vitb14
          readout_factor = 14 # Default from original notebook/script
@@ -1753,10 +1761,11 @@ def main(args):
                 scanpath_network=None,
                 fixation_selection_network=build_fixation_selection_network(scanpath_features=0),
                 downsample=1, # Downsample by 2 for MIT
-                readout_factor=readout_factor, # Use determined factor
+                readout_factor= readout_factor, #readout_factor, # Use determined factor
                 saliency_map_factor=4,
                 included_fixations=[]
             ).to(device)
+            
 
             head_params = [p for n, p in model.named_parameters() if not n.startswith('features.backbone') and p.requires_grad]
             param_groups = [{'params': head_params, 'lr': args.lr}]
