@@ -36,6 +36,11 @@ torchmetrics  = ">=1.7.1,<2"
 torchaudio    = ">=2.2,<3"
 torchvision   = ">=0.21.0,<0.22"
 pip           = ">=25.0.1,<26"
+octave = ">=9.4.0,<10"
+gcc_linux-64 = ">=14.2.0,<15"
+gxx_linux-64 = ">=14.2.0,<15"
+gfortran_linux-64 = ">=14.2.0,<15"
+make = ">=4.4.1,<5"
 
 [pypi-dependencies]
 pysaliency = ">=0.2.22, <0.3"
