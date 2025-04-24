@@ -1932,31 +1932,43 @@ def main(args):
 
         # Load state dict if necessary (before DDP wrap if possible, but done here for simplicity)
         if start_state_dict_path:
-            _logger.info(f"Loading state_dict from {start_state_dict_path}")
+            _logger.info(f"Loading state_dict from {start_state_dict_path} (via CPU)")
             try:
-                 state_dict = torch.load(start_state_dict_path, map_location=device)
-                 # Adjust state dict keys if necessary (DDP vs non-DDP)
-                 adjusted_state_dict = OrderedDict()
-                 is_ddp_state_dict = any(k.startswith('module.') for k in state_dict.keys())
-                 current_model_is_ddp = isinstance(model, DDP)
+                # 1) Load entire checkpoint into CPU RAM
+                cpu_state = torch.load(start_state_dict_path, map_location="cpu")
 
-                 if current_model_is_ddp:
-                     if not is_ddp_state_dict:
-                         for k, v in state_dict.items(): adjusted_state_dict[f'module.{k}'] = v
-                     else: adjusted_state_dict = state_dict
-                 else: # Current model is not DDP
-                     if is_ddp_state_dict:
-                         for k, v in state_dict.items():
-                              if k.startswith('module.'): adjusted_state_dict[k.removeprefix('module.')] = v
-                              else: adjusted_state_dict[k] = v # Keep non-module keys
-                     else: adjusted_state_dict = state_dict
+                # 2) Fix key prefixes for DDP vs non-DDP
+                adjusted_state_dict = OrderedDict()
+                is_ddp_state_dict = any(k.startswith("module.") for k in cpu_state.keys())
+                current_model_is_ddp = isinstance(model, DDP)
 
-                 missing, unexpected = model.load_state_dict(adjusted_state_dict, strict=False)
-                 if missing: _logger.warning(f"Missing keys when loading state_dict: {missing}")
-                 if unexpected: _logger.warning(f"Unexpected keys when loading state_dict: {unexpected}")
-                 _logger.info("Successfully loaded model state_dict.")
+                if current_model_is_ddp:
+                    if not is_ddp_state_dict:
+                        # add 'module.' prefix to every key
+                        for k, v in cpu_state.items():
+                            adjusted_state_dict[f"module.{k}"] = v
+                    else:
+                        adjusted_state_dict = cpu_state
+                else:
+                    if is_ddp_state_dict:
+                        # strip off 'module.' prefix
+                        for k, v in cpu_state.items():
+                            if k.startswith("module."):
+                                adjusted_state_dict[k[len("module."):]] = v
+                            else:
+                                adjusted_state_dict[k] = v
+                    else:
+                        adjusted_state_dict = cpu_state
+
+                # 3) Load into model (this will copy each tensor into the correct GPU)
+                missing, unexpected = model.load_state_dict(adjusted_state_dict, strict=False)
+                if missing:
+                    _logger.warning(f"Missing keys when loading state_dict: {missing}")
+                if unexpected:
+                    _logger.warning(f"Unexpected keys when loading state_dict: {unexpected}")
+                _logger.info("Successfully loaded model state_dict.")
             except Exception as e:
-                 _logger.error(f"Failed to load state_dict from {start_state_dict_path}: {e}. Starting with initial weights.")
+                _logger.error(f"Failed to load state_dict from {start_state_dict_path}: {e}. Starting with initial weights.")
 
         if is_master: _logger.info(f"Starting training {args.stage} (Fold {fold}), output: {output_dir}")
         _train(
