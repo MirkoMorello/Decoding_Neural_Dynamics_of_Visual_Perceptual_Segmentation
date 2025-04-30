@@ -457,19 +457,29 @@ def convert_fixation_trains(
         _logger.info(f"Original fixations: {original_fixation_count:,}")
 
     # ------------------------------------------------------------------
-    # ❸ Per-stimulus scale factors (Keep as is)
+    # ❸ Per-stimulus scale factors  **FIXED (x-scale used width, y-scale height)**
     # ------------------------------------------------------------------
-    shapes = stimuli.shapes
+    shapes = stimuli.shapes                 # [(h,w, …), …]
     width_new, height_new, x_scale, y_scale = [], [], [], []
+
     for h, w, *_ in shapes:
-        is_landscape = h < w
-        wn, hn = (1024, 768) if is_landscape else (768, 1024)
-        width_new.append(wn)
-        height_new.append(hn)
-        x_scale.append(wn / w if w > 0 else 1.0)
-        y_scale.append(hn / h if h > 0 else 1.0)
-    width_new, height_new = np.array(width_new), np.array(height_new)
-    x_scale, y_scale = np.array(x_scale), np.array(y_scale)
+        if h < w:                           # landscape  → 1024×768  (w′,h′)
+            new_w, new_h = 1024, 768
+        else:                               # portrait   →  768×1024
+            new_w, new_h =  768,1024
+
+        width_new.append(new_w)
+        height_new.append(new_h)
+
+        # --- THIS is the one-line bug-fix ---------------------------------
+        x_scale.append(new_w / w)           # scale *x* with new **width**
+        y_scale.append(new_h / h)           # scale *y* with new **height**
+        # ------------------------------------------------------------------
+
+    width_new  = np.asarray(width_new)
+    height_new = np.asarray(height_new)
+    x_scale    = np.asarray(x_scale)
+    y_scale    = np.asarray(y_scale)
 
     # ------------------------------------------------------------------
     # ❹ Scale, clamp, and prepare data lists for Scanpaths constructor
