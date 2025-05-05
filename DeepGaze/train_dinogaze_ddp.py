@@ -22,6 +22,7 @@ from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
 from collections.abc import Sequence
+import json
 
 import contextlib # Needed for gradient accumulation
 
@@ -353,16 +354,20 @@ def prepare_scanpath_dataset(
 # -----------------------------------------------------------------------------
 # MIT Data Conversion Functions (Copied from original with DDP modifications)
 # -----------------------------------------------------------------------------
+# ── shared size helper ─────────────────────────────────────────────
+def target_size(h_orig, w_orig):          # returns (width, height)
+    if h_orig < w_orig:                   # landscape
+        return 1024, 768
+    else:                                 # portrait or square
+        return 768, 1024
+
+
+
 def convert_stimulus(input_image):
     h, w = input_image.shape[:2]
-    # Pillow wants (width, height)
-    if h < w:         # landscape
-        new_size = (1024, 768)
-    else:             # portrait
-        new_size = (768, 1024)
+    new_w, new_h = target_size(h, w)      # <- use helper
     return np.array(
-        Image.fromarray(input_image)
-            .resize(new_size, Image.BILINEAR)
+        Image.fromarray(input_image).resize((new_w, new_h), Image.BILINEAR)
     )
 
 
@@ -407,7 +412,7 @@ def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed
                 elif not new_filename.exists():
                     try: shutil.copy(filename, new_filename)
                     except Exception as e: _logger.error(f"Failed to copy {filename} to {new_filename}: {e}"); conversion_errors += 1; continue
-            new_filenames.append(new_filename)
+            new_filenames.append(str(new_filename.resolve()))   # <- absolute
         except Exception as read_err:
             if is_master: _logger.exception(f"Failed to read or process stimulus {filename}")
             conversion_errors += 1
@@ -416,25 +421,39 @@ def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed
     if is_master and conversion_errors > 0:
         _logger.warning(f"Encountered {conversion_errors} errors during stimuli conversion.")
 
+    # synchronize if distributed
     if is_distributed:
-        # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
-        dist.barrier() # Removed device_ids
+        dist.barrier()
 
+    # persist cache and metadata
+    if is_master:
+        with open(new_location / "stimuli.pkl", "wb") as f:
+            cpickle.dump(pysaliency.FileStimuli(new_filenames), f, protocol=pickle.HIGHEST_PROTOCOL)
+        meta = {
+            "filenames": new_filenames,
+            "shapes":    [list(s) for s in pysaliency.FileStimuli(new_filenames).shapes],
+        }
+        with open(new_location / "stimuli.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+    # return a FileStimuli made from the *string* paths
     return pysaliency.FileStimuli(new_filenames)
 
 
 
+
 def convert_fixation_trains(
+        # This 'stimuli' argument now holds the ORIGINAL stimuli object
         stimuli: pysaliency.FileStimuli,
-        fixations: pysaliency.FixationTrains, # Keep original type hint for input
+        fixations: pysaliency.FixationTrains,
         is_master: bool
-    ) -> pysaliency.ScanpathFixations: # Return the correct type
+    ) -> pysaliency.ScanpathFixations:
     """
-    MIT-1003 helper. Converts old FixationTrains format to ScanpathFixations
-    by creating an intermediate Scanpaths object.
+    MIT-1003 helper. Converts old FixationTrains format to ScanpathFixations.
+    Uses original stimuli shapes for scaling, clamps to target resized dimensions.
     """
     # ------------------------------------------------------------------
-    # ❶ Sanity-checks (Keep as is)
+    # ❶ Sanity-checks
     # ------------------------------------------------------------------
     if stimuli is None or not hasattr(stimuli, "shapes"):
         raise ValueError("stimuli must be a FileStimuli with .shapes populated")
@@ -444,131 +463,149 @@ def convert_fixation_trains(
         raise ValueError(f"Input 'fixations' object is missing attributes: {missing}")
 
     # ------------------------------------------------------------------
-    # ❷ Original data (Keep as is, extracting from input FixationTrains)
+    # ❷ Original fixation data
     # ------------------------------------------------------------------
-    orig_train_xs       = [np.asarray(a, dtype=float, copy=True) for a in fixations.train_xs]
-    orig_train_ys       = [np.asarray(a, dtype=float, copy=True) for a in fixations.train_ys]
-    orig_train_ts       = fixations.train_ts # Keep as list of arrays/None
-    orig_train_ns       = np.asarray(fixations.train_ns, dtype=int)
-    orig_train_subjects = np.asarray(fixations.train_subjects, dtype=int)
+    # Ensure these are lists of numpy arrays for modification later if needed,
+    # but pysaliency usually handles this. Copying ensures we don't modify input.
+    orig_train_xs       = [np.asarray(a, dtype=float).copy() for a in fixations.train_xs]
+    orig_train_ys       = [np.asarray(a, dtype=float).copy() for a in fixations.train_ys]
+    orig_train_ts       = fixations.train_ts # Can be None or list of arrays/None
+    orig_train_ns       = np.asarray(fixations.train_ns, dtype=int).copy()
+    orig_train_subjects = np.asarray(fixations.train_subjects, dtype=int).copy()
 
     if is_master:
         original_fixation_count = sum(len(a) for a in orig_train_xs)
         _logger.info(f"Original fixations: {original_fixation_count:,}")
 
     # ------------------------------------------------------------------
-    # ❸ Per-stimulus scale factors  **FIXED (x-scale used width, y-scale height)**
+    # ❸ Per-stimulus scale factors AND Target Dimensions
+    #    Calculation based on ORIGINAL shapes from input 'stimuli'
     # ------------------------------------------------------------------
-    shapes = stimuli.shapes                 # [(h,w, …), …]
-    orig_heights = np.array([s[0] for s in shapes]) # Extract original heights
-    orig_widths  = np.array([s[1] for s in shapes]) # Extract original widths
-    width_new, height_new, x_scale, y_scale = [], [], [], []
+    original_shapes = stimuli.shapes # Get ORIGINAL shapes
+    if not original_shapes:
+         _logger.error("Original stimuli object has no shapes!")
+         raise ValueError("Original stimuli object missing shapes.")
 
-    for h_orig, w_orig in zip(orig_heights, orig_widths): # Use extracted dimensions
-        if h_orig < w_orig:                 # landscape  → 1024×768  (w′,h′)
-            new_w, new_h = 1024, 768
-        else:                               # portrait   →  768×1024
-            new_w, new_h =  768, 1024
+    orig_heights = np.array([s[0] for s in original_shapes])
+    orig_widths  = np.array([s[1] for s in original_shapes])
 
-        width_new.append(new_w)
-        height_new.append(new_h)
-        x_scale.append(new_w / w_orig)      # Use original width from shape tuple
-        y_scale.append(new_h / h_orig)      # Use original height from shape tuple
+    target_widths, target_heights = [], []
+    x_scale_factors, y_scale_factors = [], []
+
+    for h_orig, w_orig in zip(orig_heights, orig_widths):
+        if h_orig == 0 or w_orig == 0: # Safety check for invalid original dimensions
+             _logger.warning(f"Skipping stimulus with invalid original shape H={h_orig}, W={w_orig}")
+             target_widths.append(0) # Append placeholder
+             target_heights.append(0)
+             x_scale_factors.append(1.0)
+             y_scale_factors.append(1.0)
+             continue
+
+        # portrait / landscape target
+        target_w, target_h = target_size(h_orig, w_orig)
 
 
-        # --- THIS is the one-line bug-fix ---------------------------------
-        x_scale.append(new_w / w)           # scale *x* with new **width**
-        y_scale.append(new_h / h)           # scale *y* with new **height**
-        # ------------------------------------------------------------------
+        target_widths.append(target_w)
+        target_heights.append(target_h)
 
-    width_new  = np.asarray(width_new)
-    height_new = np.asarray(height_new)
-    x_scale    = np.asarray(x_scale)
-    y_scale    = np.asarray(y_scale)
+        x_scale_factors.append(target_w / w_orig)
+        y_scale_factors.append(target_h / h_orig)
+
+    target_widths_arr  = np.asarray(target_widths)
+    target_heights_arr = np.asarray(target_heights)
+    x_scale_arr    = np.asarray(x_scale_factors)
+    y_scale_arr    = np.asarray(y_scale_factors)
 
     # ------------------------------------------------------------------
-    # ❹ Scale, clamp, and prepare data lists for Scanpaths constructor
+    # ❹ Scale, clamp (to TARGET dimensions), and prepare lists
     # ------------------------------------------------------------------
     final_xs = []
     final_ys = []
     final_ts = []
 
+    skipped_scanpaths_indices = [] # Keep track of scanpaths skipped due to invalid target dims
+
     for i in range(len(orig_train_xs)):
-        xs, ys = orig_train_xs[i], orig_train_ys[i]
         n = orig_train_ns[i] # Stimulus index
 
-        if is_master and i == 0 and n == 0 and len(xs) > 0:
+        # Check if this stimulus had valid dimensions processed in step 3
+        if target_widths_arr[n] == 0 or target_heights_arr[n] == 0:
+             skipped_scanpaths_indices.append(i)
+             continue # Skip scanpaths for stimuli with invalid original shapes
+
+        xs, ys = orig_train_xs[i], orig_train_ys[i]
+
+        # --- Optional: Enhanced Debug Print ---
+        if is_master and i == 0 and n < 5: # Print for first scanpath of first 5 stimuli
              _logger.info(f"Debug Scanpath {i}, Stim {n}:")
              _logger.info(f"  Orig H, W: ({orig_heights[n]}, {orig_widths[n]})")
-             _logger.info(f"  New H, W: ({height_new[n]}, {width_new[n]})")
-             _logger.info(f"  Scale x, y: ({x_scale[n]:.4f}, {y_scale[n]:.4f})")
-             _logger.info(f"  Orig Fix 0 (x,y): ({xs[0]:.2f}, {ys[0]:.2f})")
-             scaled_x0 = xs[0] * x_scale[n]
-             scaled_y0 = ys[0] * y_scale[n]
-             _logger.info(f"  Scaled Fix 0 (x,y): ({scaled_x0:.2f}, {scaled_y0:.2f})")
-             clipped_x0 = np.clip(scaled_x0, 0, width_new[n] - 1e-6)
-             clipped_y0 = np.clip(scaled_y0, 0, height_new[n] - 1e-6)
-             _logger.info(f"  Clipped Fix 0 (x,y): ({clipped_x0:.2f}, {clipped_y0:.2f})")
+             _logger.info(f"  Target H, W: ({target_heights_arr[n]}, {target_widths_arr[n]})")
+             _logger.info(f"  Scale x, y: ({x_scale_arr[n]:.4f}, {y_scale_arr[n]:.4f})")
+             if len(xs) > 0:
+                 _logger.info(f"  Orig Fix 0 (x,y): ({xs[0]:.2f}, {ys[0]:.2f})")
+                 scaled_x0 = xs[0] * x_scale_arr[n]
+                 scaled_y0 = ys[0] * y_scale_arr[n]
+                 _logger.info(f"  Scaled Fix 0 (x,y): ({scaled_x0:.2f}, {scaled_y0:.2f})")
+                 clipped_x0 = np.clip(scaled_x0, 0, target_widths_arr[n] - 1e-6)
+                 clipped_y0 = np.clip(scaled_y0, 0, target_heights_arr[n] - 1e-6)
+                 _logger.info(f"  Clipped Fix 0 (x,y): ({clipped_x0:.2f}, {clipped_y0:.2f})")
+        # --- End Debug Print ---
 
+        current_scaled_xs = xs * x_scale_arr[n]
+        current_scaled_ys = ys * y_scale_arr[n]
 
-        # Scale and clamp
-        current_scaled_xs = np.clip(xs * x_scale[n], 0, width_new[n]  - 1e-6)
-        current_scaled_ys = np.clip(ys * y_scale[n], 0, height_new[n] - 1e-6)
-        # Scale and clamp
-        current_scaled_xs = np.clip(xs * x_scale[n], 0, width_new[n]  - 1e-6)
-        current_scaled_ys = np.clip(ys * y_scale[n], 0, height_new[n] - 1e-6)
+        current_clipped_xs = np.clip(current_scaled_xs, 0, target_widths_arr[n]  - 1e-6)
+        current_clipped_ys = np.clip(current_scaled_ys, 0, target_heights_arr[n] - 1e-6)
 
-        # Handle timestamps (ensure they are float arrays and match length)
+        # Handle timestamps
         current_ts_raw = orig_train_ts[i] if orig_train_ts is not None and i < len(orig_train_ts) else None
-        current_ts = np.full_like(current_scaled_xs, np.nan) # Default to NaNs
+        current_ts = np.full_like(current_clipped_xs, np.nan)
         if current_ts_raw is not None:
             try:
                 ts_arr = np.asarray(current_ts_raw, dtype=float)
                 copy_len = min(len(ts_arr), len(current_ts))
                 current_ts[:copy_len] = ts_arr[:copy_len]
-                if len(ts_arr) != len(current_scaled_xs) and is_master:
-                     _logger.warning(f"Scanpath {i}: Coords len ({len(current_scaled_xs)}) != TS len ({len(ts_arr)}). Padded/truncated.")
-            except ValueError:
-                if is_master: _logger.warning(f"Scanpath {i}: Could not convert timestamps. Using NaNs.")
+            except ValueError: pass
 
-        final_xs.append(current_scaled_xs)
-        final_ys.append(current_scaled_ys)
+        final_xs.append(current_clipped_xs)
+        final_ys.append(current_clipped_ys)
         final_ts.append(current_ts)
 
-    # ------------------------------------------------------------------
-    # ❺ Prepare Scanpath Attributes
-    # ------------------------------------------------------------------
-    scanpath_attributes = {'subject': orig_train_subjects} # Start with subject
+    # Filter out attributes corresponding to skipped scanpaths
+    valid_scanpath_indices = [i for i in range(len(orig_train_ns)) if i not in skipped_scanpaths_indices]
+    filtered_train_ns = orig_train_ns[valid_scanpath_indices]
+    filtered_subjects = orig_train_subjects[valid_scanpath_indices]
 
-    # Copy other valid attributes from the original FixationTrains
+
+    # ------------------------------------------------------------------
+    # ❺ Prepare Scanpath Attributes (Filter these too)
+    # ------------------------------------------------------------------
+    scanpath_attributes = {'subject': filtered_subjects}
     if hasattr(fixations, "__attributes__"):
         core_args_in_attrs = ['train_xs', 'train_ys', 'train_ts', 'train_ns', 'train_subjects', 'scanpath_index']
         for k in fixations.__attributes__:
-            if k in core_args_in_attrs or k == 'subjects': # Skip core & subject alias
-                continue
+            if k in core_args_in_attrs or k == 'subjects': continue
             try:
                 v = getattr(fixations, k)
                 arr = np.asarray(v)
-                # Check if attribute length matches the number of scanpaths
                 if arr.ndim == 1 and arr.shape[0] == len(orig_train_ns):
-                    scanpath_attributes[k] = arr.copy()
-            except Exception:
-                pass # Ignore attributes that cannot be processed
+                    scanpath_attributes[k] = arr[valid_scanpath_indices].copy() # Filter attribute array
+            except Exception: pass
 
     # ------------------------------------------------------------------
-    # ❻ Build the intermediate Scanpaths object
+    # ❻ Build the intermediate Scanpaths object (using filtered data)
     # ------------------------------------------------------------------
     try:
         scanpaths_obj = pysaliency.Scanpaths(
-            xs=final_xs,
+            xs=final_xs, # final_xs/ys/ts already only contain valid scanpaths
             ys=final_ys,
             ts=final_ts,
-            n=orig_train_ns,
-            scanpath_attributes=scanpath_attributes
+            n=filtered_train_ns, # Use filtered stimulus indices
+            scanpath_attributes=scanpath_attributes # Use filtered attributes
         )
     except Exception as e:
          _logger.error(f"Failed to create pysaliency.Scanpaths object: {e}")
-         raise # Re-raise the exception after logging
+         raise
 
     # ------------------------------------------------------------------
     # ❼ Build the final ScanpathFixations object
@@ -577,14 +614,13 @@ def convert_fixation_trains(
         new_fix = pysaliency.ScanpathFixations(scanpaths=scanpaths_obj)
     except Exception as e:
          _logger.error(f"Failed to create pysaliency.ScanpathFixations object from Scanpaths: {e}")
-         raise # Re-raise the exception after logging
-
+         raise
 
     if is_master:
-        # For Fixations objects (and subclasses like ScanpathFixations),
-        # self.x is a flat array of all x-coordinates. Its length IS the total fixation count.
-        new_count = len(new_fix.x)
+        new_count = len(new_fix.x) # Total fixations in the final object
         _logger.info(f"Finished conversion. Valid fixations: {new_count:,}")
+        if skipped_scanpaths_indices:
+             _logger.warning(f"Skipped {len(skipped_scanpaths_indices)} scanpaths due to invalid original stimuli shapes.")
 
     return new_fix
 
@@ -1738,7 +1774,7 @@ def main(args):
             except Exception as e: _logger.critical(f"Failed to load original MIT1003 meta: {e}"); dist.barrier(); sys.exit(1)
 
             mit_stimuli_twosize = convert_stimuli(mit_stimuli_orig, mit_converted_stimuli_path, is_master, is_distributed, device)
-            mit_scanpaths_twosize = convert_fixation_trains(mit_stimuli_twosize, mit_scanpaths_orig, is_master)
+            mit_scanpaths_twosize = convert_fixation_trains(mit_stimuli_orig, mit_scanpaths_orig, is_master)
             if mit_stimuli_twosize is None or mit_scanpaths_twosize is None: _logger.critical("MIT1003 conversion failed."); dist.barrier(); sys.exit(1)
             if is_master:
                 try:
@@ -1749,7 +1785,10 @@ def main(args):
                 dist.barrier()
         else:
             if is_master: _logger.info(f"Loading pre-converted MIT1003 from {mit_converted_stimuli_path}...")
-            try: mit_stimuli_twosize = pysaliency.read_json(mit_converted_stimuli_file)
+            try: 
+                stimuli_pkl = mit_converted_stimuli_path / "stimuli.pkl"
+                with open(stimuli_pkl, "rb") as f:
+                    mit_stimuli_twosize = pickle.load(f)      # ← this is a FileStimuli object
             except Exception as e: _logger.critical(f"Failed load stimuli JSON: {e}"); dist.barrier(); sys.exit(1)
             try:
                 with open(scanpath_cache_file, 'rb') as f: mit_scanpaths_twosize = cpickle.load(f)
