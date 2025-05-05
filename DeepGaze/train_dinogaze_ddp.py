@@ -43,6 +43,7 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None # Disable PIL decompression bomb check for large images
 from pysaliency.baseline_utils import (BaselineModel,
                                     CrossvalidatedBaselineModel)
+from deepgaze_pytorch.data import AspectRatioBatchSampler
 import cloudpickle as cpickle
 import pysaliency
 #import pysaliency.external_datasets.mit as mit_module
@@ -237,56 +238,68 @@ def prepare_spatial_dataset(
     num_workers,
     is_distributed: bool,
     is_master: bool,
-    device: torch.device, # Added device for barrier call
+    device: torch.device,
     path: Path | None = None,
 ):
-    """ Prepares the DataLoader for spatial (image-based) saliency prediction. """
+    # ----------  LMDB bookkeeping (unchanged) ----------
     lmdb_path = str(path) if path else None
-    if lmdb_path:
-        # Only master creates dir, others wait via barrier
-        if is_master:
-            try:
-                path.mkdir(parents=True, exist_ok=True)
-                _logger.info(f"Using LMDB cache for spatial dataset at: {lmdb_path}")
-            except OSError as e:
-                _logger.error(f"Failed to create LMDB directory {path}: {e}")
-                lmdb_path = None # Fallback
-        if is_distributed:
-            # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
-            dist.barrier() # Removed device_ids
+    if lmdb_path and is_master:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            _logger.info(f"Using LMDB cache for spatial dataset at: {lmdb_path}")
+        except OSError as e:
+            _logger.error(f"Failed to create LMDB directory {path}: {e}")
+            lmdb_path = None
+    if lmdb_path and is_distributed:
+        dist.barrier()
 
+    # ----------  build Dataset ----------
     dataset = ImageDataset(
         stimuli=stimuli,
         fixations=fixations,
         centerbias_model=centerbias,
-        transform=FixationMaskTransform(sparse=False), # Use dense masks
-        average="image", # Average fixations per image
+        transform=FixationMaskTransform(sparse=False),
+        average="image",
         lmdb_path=lmdb_path,
     )
 
+    # ----------  choose samplers ----------
     if is_distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            sampler=sampler,
+        base_sampler  = torch.utils.data.DistributedSampler(
+            dataset, shuffle=True, drop_last=True
+        )
+        shape_sampler = ImageDatasetSampler(
+            data_source=dataset,
             batch_size=batch_size,
-            pin_memory=True,
-            num_workers=num_workers,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=2 if num_workers > 0 else None,
-            drop_last=True
+            shuffle=False           # DistributedSampler already shuffles
         )
-    else:
-        # Set seed for reproducibility if not distributed
-        # torch.manual_seed(42) # Example seed setting
+
+        # keep only batches that belong to *this* rank
+        dist_set = set(base_sampler)          # local indices
+        shape_sampler.batches = [
+            b for b in shape_sampler.batches if all(i in dist_set for i in b)
+        ]
+
+        batch_sampler = shape_sampler
         loader = torch.utils.data.DataLoader(
             dataset,
-            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size), # This sampler shuffles each epoch
-            pin_memory=True,
+            batch_sampler=batch_sampler,
             num_workers=num_workers,
+            pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
         )
+
+    else:  # single‑GPU / CPU
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size),
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
     return loader
 
 
@@ -325,30 +338,42 @@ def prepare_scanpath_dataset(
         average="image",
         lmdb_path=lmdb_path,
     )
-
     if is_distributed:
-        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            sampler=sampler,
+        # 1. give each process its own slice & shuffle every epoch
+        base_sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True, drop_last=True)
+
+        # 2. wrap it in a shape‑aware batch sampler
+        batch_sampler = ImageDatasetSampler(
+            data_source=dataset,
             batch_size=batch_size,
-            pin_memory=True,
-            num_workers=num_workers,
-            persistent_workers=num_workers > 0,
-            prefetch_factor=2 if num_workers > 0 else None,
-            drop_last=True
+            shuffle=False          # base_sampler already shuffles
         )
-    else:
-        # Set seed for reproducibility if not distributed
-        # torch.manual_seed(42) # Example seed setting
+
+        # Important: route base_sampler’s indices into batch_sampler
+        batch_sampler.batches = [
+            batch for batch in batch_sampler.batches
+            if all(idx in base_sampler for idx in batch)
+        ]
+
         loader = torch.utils.data.DataLoader(
             dataset,
-            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size), # This sampler shuffles each epoch
-            pin_memory=True,
+            batch_sampler=batch_sampler,
             num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+    )
+    else:
+        # single‑GPU: just reuse ImageDatasetSampler exactly like spatial path
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size),
+            num_workers=num_workers,
+            pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
         )
+
     return loader
 
 # -----------------------------------------------------------------------------
@@ -442,187 +467,80 @@ def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed
 
 
 
-def convert_fixation_trains(
-        # This 'stimuli' argument now holds the ORIGINAL stimuli object
-        stimuli: pysaliency.FileStimuli,
-        fixations: pysaliency.FixationTrains,
-        is_master: bool
-    ) -> pysaliency.ScanpathFixations:
+def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
+                            fixations: pysaliency.FixationTrains,
+                            is_master: bool) -> pysaliency.ScanpathFixations:
     """
-    MIT-1003 helper. Converts old FixationTrains format to ScanpathFixations.
-    Uses original stimuli shapes for scaling, clamps to target resized dimensions.
+    Rescale MIT‑1003 FixationTrains to 1024×768 / 768×1024 and return
+    a pysaliency.ScanpathFixations object **with correct history & time‑stamps**.
     """
-    # ------------------------------------------------------------------
-    # ❶ Sanity-checks
-    # ------------------------------------------------------------------
-    if stimuli is None or not hasattr(stimuli, "shapes"):
-        raise ValueError("stimuli must be a FileStimuli with .shapes populated")
-    core_attrs = ["train_xs", "train_ys", "train_ts", "train_ns", "train_subjects"]
-    missing = [a for a in core_attrs if not hasattr(fixations, a)]
-    if missing:
-        raise ValueError(f"Input 'fixations' object is missing attributes: {missing}")
 
-    # ------------------------------------------------------------------
-    # ❷ Original fixation data
-    # ------------------------------------------------------------------
-    # Ensure these are lists of numpy arrays for modification later if needed,
-    # but pysaliency usually handles this. Copying ensures we don't modify input.
-    orig_train_xs       = [np.asarray(a, dtype=float).copy() for a in fixations.train_xs]
-    orig_train_ys       = [np.asarray(a, dtype=float).copy() for a in fixations.train_ys]
-    orig_train_ts       = fixations.train_ts # Can be None or list of arrays/None
-    orig_train_ns       = np.asarray(fixations.train_ns, dtype=int).copy()
-    orig_train_subjects = np.asarray(fixations.train_subjects, dtype=int).copy()
+    # -------------- 1. pre‑compute per‑stimulus scale factors --------------
+    orig_h = np.array([h for h, w, _ in stimuli.shapes])
+    orig_w = np.array([w for h, w, _ in stimuli.shapes])
+    tgt_w  = np.where(orig_h < orig_w, 1024, 768)
+    tgt_h  = np.where(orig_h < orig_w,  768,1024)
+    sx     = tgt_w / orig_w
+    sy     = tgt_h / orig_h
+
+    # -------------- 2. walk every scan‑path -------------------------------
+    new_xs, new_ys, new_ts  = [], [], []
+    new_x_hist, new_y_hist, new_dur = [], [], []
+
+    skipped = 0
+    for xs, ys, ts, ns in zip(fixations.train_xs,
+                              fixations.train_ys,
+                              fixations.train_ts,
+                              fixations.train_ns):
+
+        f_sx, f_sy = sx[ns], sy[ns]                       # scalar
+        xs_ = np.clip(xs * f_sx, 0, tgt_w[ns]-1e-6)
+        ys_ = np.clip(ys * f_sy, 0, tgt_h[ns]-1e-6)
+
+        new_xs.append(xs_)
+        new_ys.append(ys_)
+
+        # ---------- timestamps ----------
+        if ts is None or len(ts)==0:
+            new_ts.append(np.full_like(xs_, np.nan))
+        else:
+            new_ts.append(np.asarray(ts, dtype=float))
+
+        # ---------- scan‑path history ----------
+        # history arrays are (n_fixations, 4, 2) in MIT1003; scale both coordinates
+        if hasattr(fixations, "x_hist"):
+            hist_x = np.clip(fixations.x_hist[skipped] * f_sx, 0, tgt_w[ns]-1e-6)
+            hist_y = np.clip(fixations.y_hist[skipped] * f_sy, 0, tgt_h[ns]-1e-6)
+            new_x_hist.append(hist_x)
+            new_y_hist.append(hist_y)
+
+        if hasattr(fixations, "durations"):
+            new_dur.append(fixations.durations[skipped].copy())
+
+        skipped += 1
+
+    # -------------- 3. assemble pysaliency.Scanpaths -----------------------
+    scanpaths = pysaliency.Scanpaths(xs=new_xs, ys=new_ys, ts=new_ts,
+                                     n=fixations.train_ns,
+                                     scanpath_attributes={"subject": fixations.train_subjects})
+
+    # add optional arrays if we have them
+    if new_x_hist:  scanpaths.x_hist = new_x_hist
+    if new_y_hist:  scanpaths.y_hist = new_y_hist
+    if new_dur:     scanpaths.durations = new_dur
+
+    # -------------- 4. sanity‑check & return ------------------------------
+    xx = np.concatenate(new_xs)
+    yy = np.concatenate(new_ys)
+    assert (xx >= 0).all() and (yy >= 0).all(), "negative coords after scaling!"
+    assert (xx < tgt_w.max()).all() and (yy < tgt_h.max()).all(), "coords out of bounds!"
 
     if is_master:
-        original_fixation_count = sum(len(a) for a in orig_train_xs)
-        _logger.info(f"Original fixations: {original_fixation_count:,}")
+        _logger.info(f"✅ converted {len(scanpaths)} scan‑paths "
+                     f"({xx.size:,} fixations total)")
 
-    # ------------------------------------------------------------------
-    # ❸ Per-stimulus scale factors AND Target Dimensions
-    #    Calculation based on ORIGINAL shapes from input 'stimuli'
-    # ------------------------------------------------------------------
-    original_shapes = stimuli.shapes # Get ORIGINAL shapes
-    if not original_shapes:
-         _logger.error("Original stimuli object has no shapes!")
-         raise ValueError("Original stimuli object missing shapes.")
+    return pysaliency.ScanpathFixations(scanpaths=scanpaths)
 
-    orig_heights = np.array([s[0] for s in original_shapes])
-    orig_widths  = np.array([s[1] for s in original_shapes])
-
-    target_widths, target_heights = [], []
-    x_scale_factors, y_scale_factors = [], []
-
-    for h_orig, w_orig in zip(orig_heights, orig_widths):
-        if h_orig == 0 or w_orig == 0: # Safety check for invalid original dimensions
-             _logger.warning(f"Skipping stimulus with invalid original shape H={h_orig}, W={w_orig}")
-             target_widths.append(0) # Append placeholder
-             target_heights.append(0)
-             x_scale_factors.append(1.0)
-             y_scale_factors.append(1.0)
-             continue
-
-        # portrait / landscape target
-        target_w, target_h = target_size(h_orig, w_orig)
-
-
-        target_widths.append(target_w)
-        target_heights.append(target_h)
-
-        x_scale_factors.append(target_w / w_orig)
-        y_scale_factors.append(target_h / h_orig)
-
-    target_widths_arr  = np.asarray(target_widths)
-    target_heights_arr = np.asarray(target_heights)
-    x_scale_arr    = np.asarray(x_scale_factors)
-    y_scale_arr    = np.asarray(y_scale_factors)
-
-    # ------------------------------------------------------------------
-    # ❹ Scale, clamp (to TARGET dimensions), and prepare lists
-    # ------------------------------------------------------------------
-    final_xs = []
-    final_ys = []
-    final_ts = []
-
-    skipped_scanpaths_indices = [] # Keep track of scanpaths skipped due to invalid target dims
-
-    for i in range(len(orig_train_xs)):
-        n = orig_train_ns[i] # Stimulus index
-
-        # Check if this stimulus had valid dimensions processed in step 3
-        if target_widths_arr[n] == 0 or target_heights_arr[n] == 0:
-             skipped_scanpaths_indices.append(i)
-             continue # Skip scanpaths for stimuli with invalid original shapes
-
-        xs, ys = orig_train_xs[i], orig_train_ys[i]
-
-        # --- Optional: Enhanced Debug Print ---
-        if is_master and i == 0 and n < 5: # Print for first scanpath of first 5 stimuli
-             _logger.info(f"Debug Scanpath {i}, Stim {n}:")
-             _logger.info(f"  Orig H, W: ({orig_heights[n]}, {orig_widths[n]})")
-             _logger.info(f"  Target H, W: ({target_heights_arr[n]}, {target_widths_arr[n]})")
-             _logger.info(f"  Scale x, y: ({x_scale_arr[n]:.4f}, {y_scale_arr[n]:.4f})")
-             if len(xs) > 0:
-                 _logger.info(f"  Orig Fix 0 (x,y): ({xs[0]:.2f}, {ys[0]:.2f})")
-                 scaled_x0 = xs[0] * x_scale_arr[n]
-                 scaled_y0 = ys[0] * y_scale_arr[n]
-                 _logger.info(f"  Scaled Fix 0 (x,y): ({scaled_x0:.2f}, {scaled_y0:.2f})")
-                 clipped_x0 = np.clip(scaled_x0, 0, target_widths_arr[n] - 1e-6)
-                 clipped_y0 = np.clip(scaled_y0, 0, target_heights_arr[n] - 1e-6)
-                 _logger.info(f"  Clipped Fix 0 (x,y): ({clipped_x0:.2f}, {clipped_y0:.2f})")
-        # --- End Debug Print ---
-
-        current_scaled_xs = xs * x_scale_arr[n]
-        current_scaled_ys = ys * y_scale_arr[n]
-
-        current_clipped_xs = np.clip(current_scaled_xs, 0, target_widths_arr[n]  - 1e-6)
-        current_clipped_ys = np.clip(current_scaled_ys, 0, target_heights_arr[n] - 1e-6)
-
-        # Handle timestamps
-        current_ts_raw = orig_train_ts[i] if orig_train_ts is not None and i < len(orig_train_ts) else None
-        current_ts = np.full_like(current_clipped_xs, np.nan)
-        if current_ts_raw is not None:
-            try:
-                ts_arr = np.asarray(current_ts_raw, dtype=float)
-                copy_len = min(len(ts_arr), len(current_ts))
-                current_ts[:copy_len] = ts_arr[:copy_len]
-            except ValueError: pass
-
-        final_xs.append(current_clipped_xs)
-        final_ys.append(current_clipped_ys)
-        final_ts.append(current_ts)
-
-    # Filter out attributes corresponding to skipped scanpaths
-    valid_scanpath_indices = [i for i in range(len(orig_train_ns)) if i not in skipped_scanpaths_indices]
-    filtered_train_ns = orig_train_ns[valid_scanpath_indices]
-    filtered_subjects = orig_train_subjects[valid_scanpath_indices]
-
-
-    # ------------------------------------------------------------------
-    # ❺ Prepare Scanpath Attributes (Filter these too)
-    # ------------------------------------------------------------------
-    scanpath_attributes = {'subject': filtered_subjects}
-    if hasattr(fixations, "__attributes__"):
-        core_args_in_attrs = ['train_xs', 'train_ys', 'train_ts', 'train_ns', 'train_subjects', 'scanpath_index']
-        for k in fixations.__attributes__:
-            if k in core_args_in_attrs or k == 'subjects': continue
-            try:
-                v = getattr(fixations, k)
-                arr = np.asarray(v)
-                if arr.ndim == 1 and arr.shape[0] == len(orig_train_ns):
-                    scanpath_attributes[k] = arr[valid_scanpath_indices].copy() # Filter attribute array
-            except Exception: pass
-
-    # ------------------------------------------------------------------
-    # ❻ Build the intermediate Scanpaths object (using filtered data)
-    # ------------------------------------------------------------------
-    try:
-        scanpaths_obj = pysaliency.Scanpaths(
-            xs=final_xs, # final_xs/ys/ts already only contain valid scanpaths
-            ys=final_ys,
-            ts=final_ts,
-            n=filtered_train_ns, # Use filtered stimulus indices
-            scanpath_attributes=scanpath_attributes # Use filtered attributes
-        )
-    except Exception as e:
-         _logger.error(f"Failed to create pysaliency.Scanpaths object: {e}")
-         raise
-
-    # ------------------------------------------------------------------
-    # ❼ Build the final ScanpathFixations object
-    # ------------------------------------------------------------------
-    try:
-        new_fix = pysaliency.ScanpathFixations(scanpaths=scanpaths_obj)
-    except Exception as e:
-         _logger.error(f"Failed to create pysaliency.ScanpathFixations object from Scanpaths: {e}")
-         raise
-
-    if is_master:
-        new_count = len(new_fix.x) # Total fixations in the final object
-        _logger.info(f"Finished conversion. Valid fixations: {new_count:,}")
-        if skipped_scanpaths_indices:
-             _logger.warning(f"Skipped {len(skipped_scanpaths_indices)} scanpaths due to invalid original stimuli shapes.")
-
-    return new_fix
 
 
 
