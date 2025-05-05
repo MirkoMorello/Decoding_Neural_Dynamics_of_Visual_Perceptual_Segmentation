@@ -460,16 +460,21 @@ def convert_fixation_trains(
     # ❸ Per-stimulus scale factors  **FIXED (x-scale used width, y-scale height)**
     # ------------------------------------------------------------------
     shapes = stimuli.shapes                 # [(h,w, …), …]
+    orig_heights = np.array([s[0] for s in shapes]) # Extract original heights
+    orig_widths  = np.array([s[1] for s in shapes]) # Extract original widths
     width_new, height_new, x_scale, y_scale = [], [], [], []
 
-    for h, w, *_ in shapes:
-        if h < w:                           # landscape  → 1024×768  (w′,h′)
+    for h_orig, w_orig in zip(orig_heights, orig_widths): # Use extracted dimensions
+        if h_orig < w_orig:                 # landscape  → 1024×768  (w′,h′)
             new_w, new_h = 1024, 768
         else:                               # portrait   →  768×1024
-            new_w, new_h =  768,1024
+            new_w, new_h =  768, 1024
 
         width_new.append(new_w)
         height_new.append(new_h)
+        x_scale.append(new_w / w_orig)      # Use original width from shape tuple
+        y_scale.append(new_h / h_orig)      # Use original height from shape tuple
+
 
         # --- THIS is the one-line bug-fix ---------------------------------
         x_scale.append(new_w / w)           # scale *x* with new **width**
@@ -492,6 +497,23 @@ def convert_fixation_trains(
         xs, ys = orig_train_xs[i], orig_train_ys[i]
         n = orig_train_ns[i] # Stimulus index
 
+        if is_master and i == 0 and n == 0 and len(xs) > 0:
+             _logger.info(f"Debug Scanpath {i}, Stim {n}:")
+             _logger.info(f"  Orig H, W: ({orig_heights[n]}, {orig_widths[n]})")
+             _logger.info(f"  New H, W: ({height_new[n]}, {width_new[n]})")
+             _logger.info(f"  Scale x, y: ({x_scale[n]:.4f}, {y_scale[n]:.4f})")
+             _logger.info(f"  Orig Fix 0 (x,y): ({xs[0]:.2f}, {ys[0]:.2f})")
+             scaled_x0 = xs[0] * x_scale[n]
+             scaled_y0 = ys[0] * y_scale[n]
+             _logger.info(f"  Scaled Fix 0 (x,y): ({scaled_x0:.2f}, {scaled_y0:.2f})")
+             clipped_x0 = np.clip(scaled_x0, 0, width_new[n] - 1e-6)
+             clipped_y0 = np.clip(scaled_y0, 0, height_new[n] - 1e-6)
+             _logger.info(f"  Clipped Fix 0 (x,y): ({clipped_x0:.2f}, {clipped_y0:.2f})")
+
+
+        # Scale and clamp
+        current_scaled_xs = np.clip(xs * x_scale[n], 0, width_new[n]  - 1e-6)
+        current_scaled_ys = np.clip(ys * y_scale[n], 0, height_new[n] - 1e-6)
         # Scale and clamp
         current_scaled_xs = np.clip(xs * x_scale[n], 0, width_new[n]  - 1e-6)
         current_scaled_ys = np.clip(ys * y_scale[n], 0, height_new[n] - 1e-6)
