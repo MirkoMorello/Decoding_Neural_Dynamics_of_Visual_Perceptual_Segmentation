@@ -43,7 +43,7 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None # Disable PIL decompression bomb check for large images
 from pysaliency.baseline_utils import (BaselineModel,
                                     CrossvalidatedBaselineModel)
-from deepgaze_pytorch.data import AspectRatioBatchSampler
+#from deepgaze_pytorch.data import AspectRatioBatchSampler
 import cloudpickle as cpickle
 import pysaliency
 #import pysaliency.external_datasets.mit as mit_module

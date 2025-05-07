@@ -16,6 +16,12 @@ from pysaliency.utils import remove_trailing_nans
 import torch
 from tqdm import tqdm
 
+from torch.utils.data import Sampler, RandomSampler, BatchSampler
+import numpy as np
+import math
+import itertools
+import torch
+
 
 def ensure_color_image(image):
     if len(image.shape) == 2:
