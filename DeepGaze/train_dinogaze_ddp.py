@@ -234,66 +234,94 @@ def prepare_spatial_dataset(
     stimuli,
     fixations,
     centerbias,
-    batch_size,
-    num_workers,
+    batch_size: int,        # This is the PER-GPU batch size
+    num_workers: int,
     is_distributed: bool,
     is_master: bool,
     device: torch.device,
     path: Path | None = None,
+    current_epoch: int = 0, # Added: current epoch for DistributedSampler
 ):
-    # ----------  LMDB bookkeeping (unchanged) ----------
-    lmdb_path = str(path) if path else None
-    if lmdb_path and is_master:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            _logger.info(f"Using LMDB cache for spatial dataset at: {lmdb_path}")
-        except OSError as e:
-            _logger.error(f"Failed to create LMDB directory {path}: {e}")
-            lmdb_path = None
-    if lmdb_path and is_distributed:
-        dist.barrier()
+    """
+    Prepares the DataLoader for spatial (image-based) saliency prediction,
+    handling DDP with shape-aware batching correctly.
+    """
+    # ----------  LMDB bookkeeping  ----------
+    lmdb_path_str = str(path) if path else None
+    if lmdb_path_str:
+        if is_master:
+            try:
+                if path: path.mkdir(parents=True, exist_ok=True)
+                _logger.info(f"Using LMDB cache for spatial dataset at: {lmdb_path_str}")
+            except OSError as e:
+                _logger.error(f"Failed to create LMDB directory {path}: {e}")
+                lmdb_path_str = None # Fallback
+        if is_distributed:
+            # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
+            dist.barrier() # Simplified barrier call
 
-    # ----------  build Dataset ----------
-    dataset = ImageDataset(
+    # ----------  build Full Dataset ----------
+    full_dataset = ImageDataset(
         stimuli=stimuli,
         fixations=fixations,
         centerbias_model=centerbias,
-        transform=FixationMaskTransform(sparse=False),
-        average="image",
-        lmdb_path=lmdb_path,
+        transform=FixationMaskTransform(sparse=False), # Use dense masks
+        average="image", # Average fixations per image
+        lmdb_path=lmdb_path_str,
     )
 
-    # ----------  choose samplers ----------
+    loader: torch.utils.data.DataLoader # Type hint
+
+    # ----------  choose samplers and build DataLoader ----------
     if is_distributed:
-        base_sampler  = torch.utils.data.DistributedSampler(
-            dataset, shuffle=True, drop_last=True
+        # DDP Path:
+        # 1. Create a DistributedSampler for the full dataset.
+        distributed_sampler = torch.utils.data.DistributedSampler(
+            full_dataset,
+            shuffle=True,
+            drop_last=True
         )
-        shape_sampler = ImageDatasetSampler(
-            data_source=dataset,
-            batch_size=batch_size,
-            shuffle=False           # DistributedSampler already shuffles
+        # CRITICAL: Set the epoch for the DistributedSampler
+        distributed_sampler.set_epoch(current_epoch)
+
+        # 2. Create a Subset of the full_dataset for the current rank.
+        rank_subset_indices = list(iter(distributed_sampler))
+        rank_dataset_subset = torch.utils.data.Subset(full_dataset, rank_subset_indices)
+
+        # 3. Use ImageDatasetSampler on this rank-specific subset.
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            data_source=rank_dataset_subset, # Operates on the subset for this rank
+            batch_size=batch_size,           # Per-GPU batch size
+            shuffle=True                     # Shuffle items within the subset before batching by shape
         )
+        # Optional: if ImageDatasetSampler has its own epoch setting
+        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
+        #     shape_aware_batch_sampler.set_epoch(current_epoch)
 
-        # keep only batches that belong to *this* rank
-        dist_set = set(base_sampler)          # local indices
-        shape_sampler.batches = [
-            b for b in shape_sampler.batches if all(i in dist_set for i in b)
-        ]
-
-        batch_sampler = shape_sampler
+        # 4. Create the DataLoader for DDP
         loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
+            rank_dataset_subset,
+            batch_sampler=shape_aware_batch_sampler,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
         )
+    else:
+        # Non-Distributed Path (Single GPU or CPU):
+        # Use ImageDatasetSampler on the full dataset directly.
+        batch_sampler_single_gpu = ImageDatasetSampler(
+            full_dataset,
+            batch_size=batch_size,
+            shuffle=True # Assuming this enables shuffling within ImageDatasetSampler
+        )
+        # Optional: if ImageDatasetSampler has its own epoch setting
+        # if hasattr(batch_sampler_single_gpu, 'set_epoch'):
+        #    batch_sampler_single_gpu.set_epoch(current_epoch)
 
-    else:  # single‑GPU / CPU
         loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size),
+            full_dataset,
+            batch_sampler=batch_sampler_single_gpu,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
@@ -307,28 +335,34 @@ def prepare_scanpath_dataset(
     stimuli,
     fixations,
     centerbias,
-    batch_size,
-    num_workers,
+    batch_size: int,        # This is the PER-GPU batch size
+    num_workers: int,
     is_distributed: bool,
     is_master: bool,
-    device: torch.device, # Added device for barrier call
+    device: torch.device,   # device is kept for consistency, used by barrier
     path: Path | None = None,
+    current_epoch: int = 0, # Added: current epoch for DistributedSampler
 ):
-    """ Prepares the DataLoader for scanpath prediction (fixation-based). """
-    lmdb_path = str(path) if path else None
-    if lmdb_path:
+    """
+    Prepares the DataLoader for scanpath prediction (fixation-based),
+    handling DDP with shape-aware batching correctly.
+    """
+    lmdb_path_str = str(path) if path else None
+    if lmdb_path_str:
         if is_master:
             try:
-                path.mkdir(parents=True, exist_ok=True)
-                _logger.info(f"Using LMDB cache for scanpath dataset at: {lmdb_path}")
+                if path: path.mkdir(parents=True, exist_ok=True)
+                _logger.info(f"Using LMDB cache for scanpath dataset at: {lmdb_path_str}")
             except OSError as e:
                 _logger.error(f"Failed to create LMDB directory {path}: {e}")
-                lmdb_path = None # Fallback
+                lmdb_path_str = None # Fallback
         if is_distributed:
+            # The original barrier call didn't use device_ids if device was CPU.
             # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
-            dist.barrier() # Removed device_ids
+            dist.barrier() # Simplified barrier call as in your provided code
 
-    dataset = FixationDataset(
+    # 1. Create the full dataset instance
+    full_dataset = FixationDataset(
         stimuli=stimuli,
         fixations=fixations,
         centerbias_model=centerbias,
@@ -336,38 +370,68 @@ def prepare_scanpath_dataset(
         allow_missing_fixations=True,
         transform=FixationMaskTransform(sparse=False),
         average="image",
-        lmdb_path=lmdb_path,
+        lmdb_path=lmdb_path_str,
     )
+
+    loader: torch.utils.data.DataLoader # Type hint for clarity
+
     if is_distributed:
-        # 1. give each process its own slice & shuffle every epoch
-        base_sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True, drop_last=True)
-
-        # 2. wrap it in a shape‑aware batch sampler
-        batch_sampler = ImageDatasetSampler(
-            data_source=dataset,
-            batch_size=batch_size,
-            shuffle=False          # base_sampler already shuffles
+        # DDP Path:
+        # 2. Create a DistributedSampler for the full dataset.
+        #    drop_last=True is important for consistent batch counts across GPUs when using Subset.
+        distributed_sampler = torch.utils.data.DistributedSampler(
+            full_dataset,
+            shuffle=True,       # Shuffles the global list of indices
+            drop_last=True      # Ensures all GPUs get the same number of samples
         )
+        # CRITICAL: Set the epoch for the DistributedSampler for proper shuffling each epoch
+        distributed_sampler.set_epoch(current_epoch)
 
-        # Important: route base_sampler’s indices into batch_sampler
-        batch_sampler.batches = [
-            batch for batch in batch_sampler.batches
-            if all(idx in base_sampler for idx in batch)
-        ]
+        # 3. Create a Subset of the full_dataset for the current rank.
+        #    iter(distributed_sampler) yields the indices assigned to the current rank.
+        rank_subset_indices = list(iter(distributed_sampler))
+        rank_dataset_subset = torch.utils.data.Subset(full_dataset, rank_subset_indices)
 
+        # 4. Use ImageDatasetSampler on this rank-specific subset.
+        #    It will perform shape-aware batching ONLY on the data for this GPU.
+        #    Set shuffle=True if ImageDatasetSampler should shuffle items within the
+        #    rank's subset before forming shape-compatible batches.
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            data_source=rank_dataset_subset, # Operates on the subset for this rank
+            batch_size=batch_size,           # Per-GPU batch size
+            shuffle=True                     # Shuffle items within the subset before batching by shape
+        )
+        # Optional: if ImageDatasetSampler itself has epoch-aware internal shuffling
+        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
+        #     shape_aware_batch_sampler.set_epoch(current_epoch)
+
+        # 5. Create the DataLoader for DDP
         loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_sampler=batch_sampler,
+            rank_dataset_subset,        # Use the subset for this rank
+            batch_sampler=shape_aware_batch_sampler, # Custom batch sampler
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
-    )
+            # drop_last is effectively handled by ImageDatasetSampler and DistributedSampler(drop_last=True)
+        )
     else:
-        # single‑GPU: just reuse ImageDatasetSampler exactly like spatial path
+        # Non-Distributed Path (Single GPU or CPU):
+        # Use ImageDatasetSampler on the full dataset directly, as in your "before" code.
+        # This assumes ImageDatasetSampler's shuffle=True handles epoch shuffling correctly
+        # for the non-DDP case, or that you call set_epoch on it if available.
+        batch_sampler_single_gpu = ImageDatasetSampler(
+            full_dataset,
+            batch_size=batch_size,
+            shuffle=True  # Assuming this enables shuffling within ImageDatasetSampler
+        )
+        # Optional: if ImageDatasetSampler itself has epoch-aware internal shuffling
+        # if hasattr(batch_sampler_single_gpu, 'set_epoch'):
+        #    batch_sampler_single_gpu.set_epoch(current_epoch)
+
         loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_sampler=ImageDatasetSampler(dataset, batch_size=batch_size),
+            full_dataset,
+            batch_sampler=batch_sampler_single_gpu,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
