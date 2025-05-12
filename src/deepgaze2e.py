@@ -1,3 +1,5 @@
+# deepgaze2e.py
+
 from collections import OrderedDict
 import importlib
 import os
