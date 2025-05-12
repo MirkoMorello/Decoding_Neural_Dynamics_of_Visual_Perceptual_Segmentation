@@ -8,10 +8,17 @@ Launch with torchrun, e.g.:
 The script falls back to single‑GPU/CPU when no distributed environment
 variables are present, so you can still run it exactly like the original.
 """
+import os
+import sys
+
+current_script_path = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(current_script_path))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import argparse
 import logging
-import os
 import pickle
 import shutil
 import sys
@@ -114,39 +121,40 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 # -----------------------------------------------------------------------------
-# PATH MANGLING so we can import deepgaze_pytorch.* no matter where script is.
-# -----------------------------------------------------------------------------
-script_dir = Path(__file__).parent.resolve()
-sys.path.append(str(script_dir / "../"))  # deepgaze_pytorch is one level up
-
-# -----------------------------------------------------------------------------
 # --- DeepGaze III Imports -----------------------------------------------------
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# --- DeepGaze III Imports (from your local src directory) --------------------
 # -----------------------------------------------------------------------------
 try:
     # Data handling classes
-    from deepgaze_pytorch.data import (
+    from src.data import (  # CHANGED
         FixationDataset, FixationMaskTransform,
         ImageDataset, ImageDatasetSampler)
     # Backbone feature extractor
-    from deepgaze_pytorch.dinov2_backbone import DinoV2Backbone
+    from src.dinov2_backbone import DinoV2Backbone # CHANGED
+    from src.dinogaze import (build_saliency_network, build_scanpath_network, build_fixation_selection_network)
     # Custom layers used in DeepGaze models
-    from deepgaze_pytorch.layers import (
+    from src.layers import (
         Bias, Conv2dMultiInput, FlexibleScanpathHistoryEncoding,
-        LayerNorm, LayerNormMultiInput, SelfAttention) # Added SelfAttention
+        LayerNorm, LayerNormMultiInput, SelfAttention)
     # Core model modules
-    from deepgaze_pytorch.modules import DeepGazeIII, FeatureExtractor, DeepGazeII # DeepGazeII needed for copied _train
+    from src.modules import DeepGazeIII, DeepGazeII # CHANGED
     # Original metric functions (CPU AUC specifically)
-    from deepgaze_pytorch.metrics import log_likelihood, nss, auc as auc_cpu_fn # Keep original CPU AUC separate
+    from src.metrics import log_likelihood, nss, auc as auc_cpu_fn # CHANGED
     # NOTE: The original _train function is NO LONGER imported.
     # It's copied and modified within this script below.
 except ImportError as e:
-    # Use logger if available, otherwise print
-    try:
-        _logger.critical(f"Error importing DeepGaze modules: {e}")
-        _logger.critical("Please ensure 'deepgaze_pytorch' directory is accessible.")
-    except NameError:
-        print(f"Error importing DeepGaze modules: {e}")
-        print("Please ensure 'deepgaze_pytorch' directory is accessible.")
+    actual_error_message = str(e) # Get the real Python error
+    logger_instance_name = "_logger"
+    if logger_instance_name in locals() and locals()[logger_instance_name] is not None:
+        locals()[logger_instance_name].critical(f"PYTHON IMPORT ERROR: {actual_error_message}") # Print the real error
+        locals()[logger_instance_name].critical(f"Current sys.path: {sys.path}")
+        locals()[logger_instance_name].critical("Ensure 'src' is in sys.path and contains __init__.py and all required .py files with correct internal imports.")
+    else:
+        print(f"PYTHON IMPORT ERROR: {actual_error_message}") # Print the real error
+        print(f"Current sys.path: {sys.path}")
+        print("Ensure 'src' is in sys.path and contains __init__.py and all required .py files with correct internal imports.")
     sys.exit(1)
 
 # -----------------------------------------------------------------------------
@@ -154,77 +162,6 @@ except ImportError as e:
 # -----------------------------------------------------------------------------
 _logger = logging.getLogger("train_dinogaze_ddp") # Get logger instance
 
-# -----------------------------------------------------------------------------
-# MODEL‑BUILDING HELPERS (Copied from original script with comments)
-# -----------------------------------------------------------------------------
-
-def build_saliency_network(input_channels, add_sa_head=False):
-    """ Builds the saliency prediction head network. """
-    # Using _logger.info here is fine, it will only log on master
-    _logger.info(f"Building saliency network with {input_channels} input channels. Add SA Head: {add_sa_head}")
-    layers = OrderedDict()
-
-    if add_sa_head:
-        # Add SelfAttention as the first layer
-        # NOTE: SelfAttention outputs the same number of channels as input by default.
-        layers['sa_head'] = SelfAttention(input_channels, key_channels=input_channels // 8, return_attention=False)
-        layers['layernorm_sa_out'] = LayerNorm(input_channels) # Normalize SA output
-        layers['softplus_sa_out'] = nn.Softplus() # Add non-linearity after SA
-
-    # Reduced complexity slightly given potentially richer ViT features
-    layers['layernorm0'] = LayerNorm(input_channels)
-    layers['conv0'] = nn.Conv2d(input_channels, 8, (1, 1), bias=False) # Increased capacity slightly
-    layers['bias0'] = Bias(8)
-    layers['softplus0'] = nn.Softplus()
-
-    layers['layernorm1'] = LayerNorm(8)
-    layers['conv1'] = nn.Conv2d(8, 16, (1, 1), bias=False) # Increased capacity slightly
-    layers['bias1'] = Bias(16)
-    layers['softplus1'] = nn.Softplus()
-
-    layers['layernorm2'] = LayerNorm(16)
-    layers['conv2'] = nn.Conv2d(16, 1, (1, 1), bias=False)
-    layers['bias2'] = Bias(1)
-    layers['softplus2'] = nn.Softplus() # Ensures non-negative output before final log-likelihood
-
-    return nn.Sequential(layers)
-
-
-def build_scanpath_network():
-    """ Builds the network processing scanpath history. """
-    return nn.Sequential(OrderedDict([
-        ('encoding0', FlexibleScanpathHistoryEncoding(in_fixations=4, channels_per_fixation=3, out_channels=128, kernel_size=[1, 1], bias=True)),
-        ('softplus0', nn.Softplus()),
-        ('layernorm1', LayerNorm(128)),
-        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)), # Output 16 channels
-        ('bias1', Bias(16)),
-        ('softplus1', nn.Softplus()),
-    ]))
-
-def build_fixation_selection_network(scanpath_features=16):
-    """ Builds the network combining saliency and scanpath features for fixation selection. """
-    _logger.info(f"Building fixation selection network with scanpath features={scanpath_features}")
-    saliency_channels = 1 # Output of saliency network's core path before combination
-
-    # <<< FIX: DO NOT filter the channel list >>>
-    # Always provide two channel counts, even if one is 0.
-    # The multi-input layers should handle the 0-channel case.
-    in_channels_list = [saliency_channels, scanpath_features if scanpath_features > 0 else 0]
-    # in_channels_list = [ch for ch in in_channels_list if ch > 0] # <<< REMOVED THIS LINE >>>
-    _logger.info(f"  -> Configured multi-input layers for channel counts: {in_channels_list}")
-    # <<< END FIX >>>
-
-    return nn.Sequential(OrderedDict([
-        ('layernorm0', LayerNormMultiInput(in_channels_list)), # Now gets [1, 0] or [1, 16]
-        ('conv0', Conv2dMultiInput(in_channels_list, 128, (1, 1), bias=False)), # Now gets [1, 0] or [1, 16]
-        ('bias0', Bias(128)),
-        ('softplus0', nn.Softplus()),
-        ('layernorm1', LayerNorm(128)),
-        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)),
-        ('bias1', Bias(16)),
-        ('softplus1', nn.Softplus()),
-        ('conv2', nn.Conv2d(16, 1, (1, 1), bias=False)), # Final output layer
-    ]))
 
 # -----------------------------------------------------------------------------
 # DATASET HELPERS – Modified for DistributedSampler support
@@ -1631,7 +1568,10 @@ def main(args):
         if train_baseline_log_likelihood == -999.9 or val_baseline_log_likelihood == -999.9:
             _logger.critical(f"Baseline LLs invalid on rank {rank}. Exiting.")
             if is_distributed: dist.barrier(); sys.exit(1)
-
+        
+        _logger.info(f"Building saliency network with {args.C_in} input channels. Add SA Head: {args.add_sa_head}")
+        _logger.info(f"Building fixation selection network with {args.scanpath_features} scanpath features.")
+        
         model = DeepGazeIII(
             features=features, # features already on device
             saliency_network=build_saliency_network(C_in, add_sa_head=args.add_sa_head),
@@ -1801,7 +1741,7 @@ def main(args):
         scanpath_net = build_scanpath_network() if stage_scanpath_features > 0 else None
         fixsel_net = build_fixation_selection_network(scanpath_features=stage_scanpath_features)
 
-        base_model = DeepGazeIII(
+        base_model = Dinogaze(
             features=features.cpu(),
             saliency_network=saliency_net,
             scanpath_network=scanpath_net,
@@ -1944,8 +1884,8 @@ if __name__ == "__main__":
     # --- Dataloading & System ---
     parser.add_argument('--num_workers', type=int, default=None, help='Dataloader workers per rank. Default: auto (cores // world_size). Set 0 for main process loading.')
     parser.add_argument('--train_dir', default='./train_dinogaze_vitg', help='Base directory for training outputs (checkpoints, logs).')
-    parser.add_argument('--dataset_dir', default='./pysaliency_datasets', help='Directory for datasets (download/cache location).')
-    parser.add_argument('--lmdb_dir', default='./lmdb_cache_dinogaze_vitg', help='Directory for LMDB data caches.')
+    parser.add_argument('--dataset_dir', default='../data/pysaliency_datasets', help='Directory for datasets (download/cache location).')
+    parser.add_argument('--lmdb_dir', default='../data/lmdb_cache_dinogaze_vitg', help='Directory for LMDB data caches.')
     # --- Model Modifications (Experimental) ---
     parser.add_argument('--add_sa_head', action='store_true', help='Add a SelfAttention layer before the main saliency network.')
     parser.add_argument('--unfreeze_vit_layers', type=int, nargs='+', default=[], help='Indices (e.g., 10 11 for ViT-B/14) of DINOv2 blocks to unfreeze and fine-tune.')
