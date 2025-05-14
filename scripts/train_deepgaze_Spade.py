@@ -14,11 +14,8 @@ if project_root not in sys.path:
 
 import argparse
 import logging
-import pickle
-import shutil # For checkpoint management in _train (if used there)
 from pathlib import Path
 from collections import OrderedDict
-import json # For MIT stimuli.json if used
 
 import torch
 import torch.nn as nn
@@ -26,8 +23,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-import torchvision.models as tv_models # For DenseNet
+from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet201 # IMPORTANT
 
 import pysaliency
 import pysaliency.external_datasets.mit # Ensure this can be imported
@@ -35,11 +31,6 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None # Disable PIL decompression bomb check
 from pysaliency.baseline_utils import BaselineModel, CrossvalidatedBaselineModel
 import cloudpickle as cpickle
-from tqdm import tqdm
-from boltons.fileutils import atomic_save, mkdir_p # For _train
-
-# Needed for AMP if _train uses it
-from torch import amp
 
 # --- Local Project Imports ---
 try:
@@ -53,7 +44,7 @@ try:
         convert_stimuli, convert_fixation_trains # If used for MIT preprocessing
     )
     # Original DeepGaze modules and layers that we will reuse
-    from src.modules import DeepGazeIII, FeatureExtractor, DeepGazeII # DeepGazeII for _train
+    from src.modules import DeepGazeIII, FeatureExtractor, DeepGazeII, FeatureExtractor, Finalizer
     from src.layers import (
         Bias, LayerNorm, LayerNormMultiInput,
         Conv2dMultiInput, FlexibleScanpathHistoryEncoding, SelfAttention
@@ -258,50 +249,6 @@ def build_fixation_selection_network_original(scanpath_features=16):
     ]))
 
 
-# ============================================================================
-# == DenseNet Feature Extractor Wrapper ==
-# ============================================================================
-class DenseNetFeatureExtractor(nn.Module):
-    def __init__(self, densenet_model_instance, layer_paths_dict):
-        super().__init__()
-        self.densenet_features = densenet_model_instance.features # Access the 'features' sub-module
-        self.layer_paths_dict = layer_paths_dict # e.g., {'out1': 'transition1.relu', ...}
-        self.outputs = {}
-        self._hook_handles = []
-        self._register_hooks()
-
-    def _register_hooks(self):
-        for name, path_str in self.layer_paths_dict.items():
-            module = self.densenet_features
-            try:
-                for part in path_str.split('.'):
-                    module = getattr(module, part)
-                handle = module.register_forward_hook(self._save_outputs_hook(name))
-                self._hook_handles.append(handle)
-            except AttributeError:
-                _logger.error(f"Could not find submodule path '{path_str}' in DenseNet features.")
-                raise
-
-    def _save_outputs_hook(self, layer_id: str):
-        def fn(_, __, output):
-            self.outputs[layer_id] = output # No .clone() needed if backbone is frozen and not in-place ops
-        return fn
-
-    def forward(self, x):
-        self.outputs.clear()
-        # DenseNet expects input normalized with ImageNet stats
-        # Usually (B, 3, H, W)
-        # Assuming x is already preprocessed (e.g., normalized)
-        _ = self.densenet_features(x)
-        
-        # Return features in the order of keys in layer_paths_dict for consistency
-        return [self.outputs[name] for name in self.layer_paths_dict.keys()]
-
-    def remove_hooks(self): # Good practice for cleanup
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles = []
-
 
 # ============================================================================
 # == MAIN FUNCTION ==
@@ -361,59 +308,19 @@ def main(args):
         dist.barrier() # Wait for master to create dirs
 
     # --- Backbone Setup: DenseNet ---
-    if is_master: _logger.info(f"Initializing DenseNet backbone: {args.densenet_model_name}")
-    if args.densenet_model_name == 'densenet161':
-        densenet_base = tv_models.densenet161(weights=tv_models.DenseNet161_Weights.IMAGENET1K_V1)
-        # For DenseNet161, common feature extraction points and their approx channels/strides:
-        # Layer Path String (within densenet_base.features) | Output Channels | Total Stride
-        # -------------------------------------------------|-----------------|--------------
-        # pool0 (after initial conv+bn+relu+pool)          | 96              | 4
-        # denseblock1 -> transition1 -> pool               | 192             | 8
-        # denseblock2 -> transition2 -> pool               | 384             | 16
-        # denseblock3 -> transition3 -> pool               | 1056            | 32
-        # denseblock4 (then features.norm5)                | 2208            | 32
-        layers_to_extract_densenet = OrderedDict([
-            ('tr1_pool', 'transition1.pool'), # Output of maxpool in transition1
-            ('tr2_pool', 'transition2.pool'), # Output of maxpool in transition2
-            ('tr3_pool', 'transition3.pool'), # Output of maxpool in transition3
-        ])
-        C_in_densenet = 192 + 384 + 1056
-        readout_factor_densenet = 32 # Max stride from these layers
-        saliency_map_factor_densenet = 4 # Standard DeepGaze scaling for finalizer
-    elif args.densenet_model_name == 'densenet201':
-        densenet_base = tv_models.densenet201(weights=tv_models.DenseNet201_Weights.IMAGENET1K_V1)
-        # DenseNet201:
-        # Layer Path String (within densenet_base.features) | Output Channels | Total Stride
-        # -------------------------------------------------|-----------------|--------------
-        # pool0                                            | 64              | 4
-        # denseblock1 -> transition1 -> pool               | 256             | 8
-        # denseblock2 -> transition2 -> pool               | 512             | 16
-        # denseblock3 -> transition3 -> pool               | 896 (from conv in trans3) or 1792 (after denseblock3 before trans3.conv) -> check carefully.
-        #                                                    Typically use output of transition's pool
-        #                                                    Trans3 pool output is 896 channels
-        # denseblock4 (then features.norm5)                | 1920            | 32
-        layers_to_extract_densenet = OrderedDict([
-            ('tr1_pool', 'transition1.pool'),
-            ('tr2_pool', 'transition2.pool'),
-            ('tr3_pool', 'transition3.pool'),
-        ])
-        C_in_densenet = 256 + 512 + 896 # Channels after pooling in transitions
-        readout_factor_densenet = 32
-        saliency_map_factor_densenet = 4
-    else:
-        _logger.critical(f"Unsupported DenseNet model: {args.densenet_model_name}")
-        if is_distributed: dist.barrier(); sys.exit(1)
-
-    features_module = DenseNetFeatureExtractor(densenet_base, layers_to_extract_densenet)
+    if is_master: _logger.info(f"Initializing RGBDenseNet201 backbone...")
+    densenet_base_model = RGBDenseNet201(pretrained=True if not args.densenet_weights_path else args.densenet_weights_path)
+    densenet_target_layers_for_extraction = args.densenet_target_layers # From argparse
+    C_in_densenet = args.densenet_C_in # Get from args, default to 2048
+    readout_factor_densenet = args.densenet_readout_factor # Get from args, default to 4 (as per your example)
+    saliency_map_factor_densenet = 4 # Standard, from your example
+    features_module = FeatureExtractor(densenet_base_model, densenet_target_layers_for_extraction)
+    
     for param in features_module.parameters(): # Freezing the entire DenseNet
         param.requires_grad = False
     features_module.eval()
     features_module = features_module.to(device)
-    if is_master:
-        _logger.info(f"DenseNet ({args.densenet_model_name}) FeatureExtractor initialized and frozen.")
-        _logger.info(f"  Extracting from layers: {list(layers_to_extract_densenet.values())}")
-        _logger.info(f"  Calculated C_in for saliency head: {C_in_densenet}")
-        _logger.info(f"  Using readout_factor for DenseNet: {readout_factor_densenet}")
+    if is_master: _logger.info("RGBDenseNet201 with FeatureExtractor initialized and frozen.")
 
     # --- Stage Dispatch (Focus on SALICON pretraining with DenseNet+SPADE) ---
     if args.stage == 'salicon_pretrain_densenet_spade':
