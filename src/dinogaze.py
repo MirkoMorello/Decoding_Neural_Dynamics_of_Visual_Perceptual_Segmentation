@@ -1,4 +1,5 @@
 # dinogaze.py
+from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
@@ -9,7 +10,6 @@ from torch.utils import model_zoo
 from .features.densenet import RGBDenseNet201
 from .modules import FeatureExtractor, Finalizer, DeepGazeIIIMixture
 from .layers import FlexibleScanpathHistoryEncoding
-from __future__ import annotations
 from typing import Iterable, List, Tuple
 from .layers import (
     Conv2dMultiInput,
