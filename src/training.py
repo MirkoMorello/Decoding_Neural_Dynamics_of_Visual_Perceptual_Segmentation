@@ -1,486 +1,594 @@
-# training.py
+# src/training.py
 # flake8: noqa E501
-# pylint: disable=not-callable
+# pylint: disable=not-callable, unused-import, import-error, no-name-in-module
 # E501: line too long
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict # Added OrderedDict
 from datetime import datetime
 import os
-from collections import OrderedDict, defaultdict
+# import glob # Not used in the provided snippet, but might be in your full _train
+# import tempfile # Not used in the provided snippet
+# from torch.serialization import safe_globals # Not used
+
 from boltons.cacheutils import cached, LRU
-from boltons.fileutils import atomic_save
+from boltons.fileutils import atomic_save #, mkdir_p # mkdir_p not used here but maybe in _train
 import numpy as np
 import pandas as pd
+# import pysaliency # Not directly used in these functions
+# from pysaliency.filter_datasets import iterate_crossvalidation # Not used
+# from pysaliency.plotting import visualize_distribution # Not used
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from torch import amp
-from .metrics import log_likelihood, nss, auc
-from .modules import DeepGazeII
+import yaml # Not used here
+
+from torch import amp # For Automatic Mixed Precision
 import torchmetrics
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP # For type hinting
 from pathlib import Path
 import sys
 import warnings
-from .metrics import log_likelihood, nss, auc as auc_cpu_fn # Rename import to avoid conflict
+import contextlib # For model.no_sync()
+
+# Assuming these are correctly imported from your project structure or deepgaze_pytorch
+# Adjust paths if these are in deepgaze_pytorch and training.py is in src
+try:
+    from .metrics import log_likelihood, nss, auc as auc_cpu_fn # Use your metrics
+    from deepgaze_pytorch.modules import DeepGazeII # Example, if used
+    # If DeepGazeIII is also used for type hinting:
+    # from deepgaze_pytorch.modules import DeepGazeIII
+except ImportError:
+    # Fallback for direct execution or different structure
+    from metrics import log_likelihood, nss, auc as auc_cpu_fn
+    from deepgaze_pytorch.modules import DeepGazeII
 
 
-baseline_performance = cached(LRU(max_size=3))(lambda model, *args, **kwargs: model.information_gain(*args, **kwargs))
+# baseline_performance = cached(LRU(max_size=3))(lambda model, *args, **kwargs: model.information_gain(*args, **kwargs))
+# This seems to be for a pysaliency model object, not directly used in train/eval epoch here.
 
-
-def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None, is_distributed=False, is_master=True, logger=None):
-    
+def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None,
+               is_distributed=False, is_master=True, logger=None):
     """ Evaluates the model for one epoch on the validation set. Handles DDP aggregation. """
+    if logger is None:
+        logger = logging.getLogger(__name__) # Basic fallback logger
+
     model.eval()
     default_metrics = ['LL', 'IG', 'NSS', 'AUC_CPU']
     if metrics is None: metrics = default_metrics
-    if 'IG' in metrics and 'LL' not in metrics: metrics.append('LL')
-    if is_master: logger.debug(f"Evaluating metrics: {metrics}")
+    if 'IG' in metrics and 'LL' not in metrics: metrics.append('LL') # IG needs LL
+    if is_master: logger.debug(f"Evaluating with metrics: {metrics}")
 
+    # --- Initialize Accumulators & Metrics ---
     total_metric_sums = {
         name: torch.tensor(0.0, device=device, dtype=torch.float64)
-        for name in metrics if name in ['LL', 'NSS', 'AUC_CPU']
+        for name in metrics if name in ['LL', 'NSS', 'AUC_CPU'] # Metrics averaged over batches
     }
     total_weight = torch.tensor(0.0, device=device, dtype=torch.float64)
 
     auroc_metric_gpu = None
     if 'AUC_GPU' in metrics:
-        if is_master: logger.debug("Initializing GPU AUROC (max_fpr=1.0)")
+        if is_master: logger.debug("Initializing GPU AUROC (binary task, max_fpr=1.0)")
         auroc_metric_gpu = torchmetrics.AUROC(task="binary", max_fpr=1.0).to(device)
 
     metric_functions_avg = {}
     if 'LL' in metrics: metric_functions_avg['LL'] = log_likelihood
     if 'NSS' in metrics: metric_functions_avg['NSS'] = nss
     if 'AUC_CPU' in metrics:
-        if is_master: logger.debug("Will calculate CPU AUC using original function.")
+        if is_master: logger.debug("Using original CPU AUC function for AUC_CPU.")
         metric_functions_avg['AUC_CPU'] = auc_cpu_fn
 
+    # --- Validation Loop ---
     oom_error_gpu_auc = False
-    pbar_desc = "Validating" + (f" (Rank {dist.get_rank()})" if is_distributed else "")
+    pbar_desc = "Validating" + (f" (Rank {dist.get_rank()})" if is_distributed and dist.is_initialized() else "")
     pbar = tqdm(dataset, desc=pbar_desc, disable=not is_master, leave=False)
+    
+    processed_batches_count = 0
 
     with torch.no_grad():
-        batch_process_count = 0
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             try:
-                image = batch.pop('image').to(device)
-                centerbias = batch.pop('centerbias').to(device)
-                fixation_mask = batch.pop('fixation_mask').to(device)
-                x_hist = batch.pop('x_hist', torch.tensor([])).to(device)
-                y_hist = batch.pop('y_hist', torch.tensor([])).to(device)
-                weights = batch.pop('weight').to(device)
-                durations = batch.pop('durations', torch.tensor([])).to(device)
-                kwargs = {k: v.to(device) for k, v in batch.items()}
-            except Exception as e:
-                logger.error(f"Error moving batch data to device {device}: {e}")
-                continue
+                # --- Move batch to GPU & Pop data ---
+                image = batch.pop('image').to(device, non_blocking=True)
+                centerbias = batch.pop('centerbias').to(device, non_blocking=True)
+                fixation_mask = batch.pop('fixation_mask').to(device, non_blocking=True) # Target for loss
+                
+                # --- NEW: Pop segmentation_mask ---
+                segmentation_mask = batch.pop('segmentation_mask', None) # Default to None if not present
+                if segmentation_mask is not None:
+                    segmentation_mask = segmentation_mask.to(device, non_blocking=True)
+                # --- END NEW ---
 
+                x_hist = batch.pop('x_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
+                y_hist = batch.pop('y_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
+                weights = batch.pop('weight').to(device, non_blocking=True)
+                durations = batch.pop('durations', torch.tensor([], device=device)).to(device, non_blocking=True)
+                
+                # Any remaining items in batch are considered extra kwargs
+                # This was in your DINOv2 script, ensure it's intended.
+                # If not, handle batch items explicitly.
+                remaining_kwargs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            except Exception as e:
+                logger.error(f"Rank {device}: Error moving batch {batch_idx} data to device: {e}", exc_info=True)
+                continue # Skip this batch
+
+            # --- Model Forward Pass ---
             log_density = None
             try:
+                # DDP models are wrapped in model.module
                 underlying_model = model.module if is_distributed else model
+                
+                # Construct model_args ensuring order for positional args, then kwargs
+                # This depends heavily on your model's forward signature
+                # Assuming DeepGazeII/III signature: model(image, centerbias, x_hist*, y_hist*, durations*, segmentation_mask*, **kwargs)
+                
+                model_call_args = [image, centerbias]
+                model_call_kwargs = {'segmentation_mask': segmentation_mask} # Pass new mask
 
-                # No AMP during validation as inference might be sensitive
-                if isinstance(underlying_model, DeepGazeII):
-                    logger.debug("Using DeepGazeII forward.")
-                    log_density = model(image, centerbias, **kwargs)
+                if hasattr(underlying_model, 'scanpath_network') and underlying_model.scanpath_network is not None:
+                    # This indicates a DeepGazeIII-like model that might use scanpath history
+                    model_call_kwargs['x_hist'] = x_hist
+                    model_call_kwargs['y_hist'] = y_hist
+                    model_call_kwargs['durations'] = durations
+                
+                model_call_kwargs.update(remaining_kwargs) # Add any other batch items
 
-                elif getattr(underlying_model, 'scanpath_network', None) is None:
-                    # Spatial-only: Call model's forward with only image and centerbias
-                    logger.debug("Using spatial-only via model.forward(image, centerbias)")
-                    log_density = model(image, centerbias)
-                else:
-                    # Full scanpath model: Call model's forward with all relevant arguments
-                    logger.debug("Using full model forward with scanpath.")
-                    log_density = model(
-                        image, centerbias, x_hist=x_hist, y_hist=y_hist, durations=durations, **kwargs
-                    )
+                # No AMP autocast during validation
+                log_density = model(*model_call_args, **model_call_kwargs)
 
-            except torch.cuda.OutOfMemoryError as e:
-                current_rank = dist.get_rank() if is_distributed else 0
-                logger.error(
-                    f"\n\n!!! OOM ERROR during Validation Forward Pass (Rank {current_rank}) !!!\n"
-                    f"Image shape: {image.shape if 'image' in locals() else 'N/A'}, "
-                    f"Centerbias shape: {centerbias.shape if 'centerbias' in locals() else 'N/A'}\n"
-                    f"Error: {e}\nTry reducing validation batch size or model size."
-                )
-                if 'image' in locals(): del image
-                if 'centerbias' in locals(): del centerbias
-                if 'fixation_mask' in locals(): del fixation_mask
-                if 'x_hist' in locals(): del x_hist
-                if 'y_hist' in locals(): del y_hist
-                if 'weights' in locals(): del weights
-                if 'durations' in locals(): del durations
-                if 'kwargs' in locals(): del kwargs
-                if 'log_density' in locals(): del log_density
+            except torch.cuda.OutOfMemoryError:
+                current_rank_str = f"Rank {dist.get_rank()}" if is_distributed and dist.is_initialized() else "SingleOp"
+                logger.error(f"\n!!! OOM ERROR (Validation Forward) on {current_rank_str} !!!\n"
+                             f"Image: {image.shape}, Centerbias: {centerbias.shape}\n"
+                             "Try reducing validation batch size or model complexity.", exc_info=True)
+                # Critical error, re-raise to stop epoch or training
+                # Consider how _train handles this. For now, re-raise.
                 torch.cuda.empty_cache()
-                raise e
-            except Exception as forward_e:
-                logger.exception("Error during validation forward pass")
-                continue
+                raise
+            except Exception:
+                logger.error(f"Rank {device}: Error during validation forward pass for batch {batch_idx}.", exc_info=True)
+                continue # Skip this batch
 
             if log_density is None:
-                logger.error("log_density is None after forward pass, skipping batch.")
+                logger.warning(f"Rank {device}: log_density is None after forward pass for batch {batch_idx}, skipping metrics.")
                 continue
 
+            # --- Prep Targets (Dense & Binary) for metrics ---
             try:
+                # fixation_mask is the target for LL, NSS, AUC
+                # It might be sparse from dataloader, convert to dense for metrics
                 if isinstance(fixation_mask, torch.sparse.Tensor):
-                    target_mask_dense = fixation_mask.to_dense()
+                    target_mask_for_metrics = fixation_mask.to_dense()
                 else:
-                    target_mask_dense = fixation_mask
-                target_mask_int = target_mask_dense.long()
-                target_mask_binary = (target_mask_int > 0).long() # Binary mask used for most metrics
+                    target_mask_for_metrics = fixation_mask
+                
+                target_mask_for_metrics_int = target_mask_for_metrics.long()
+                # Binary mask often used for AUC, sometimes for NSS if definition requires it
+                target_mask_binary = (target_mask_for_metrics_int > 0).long()
             except Exception as e:
-                logger.error(f"Error preparing target masks: {e}")
+                logger.error(f"Rank {device}: Error preparing target masks for batch {batch_idx}: {e}", exc_info=True)
                 continue
 
-            batch_weight_sum = weights.sum()
+            # --- Calculate Batch Weight ---
+            batch_weight_sum = weights.sum() # Sum of weights for all samples in the batch
 
             # --- Accumulate Batch-Averaged Metrics (LL, NSS, AUC_CPU) ---
             if batch_weight_sum > 0:
-                current_batch_weight = batch_weight_sum
-                total_weight += current_batch_weight
-                batch_process_count += 1
+                current_batch_total_weight = batch_weight_sum # This is the sum of individual sample weights
+                total_weight += current_batch_total_weight # Accumulate total weight across all batches
+                processed_batches_count +=1
+
                 for metric_name, metric_fn in metric_functions_avg.items():
-                    if metric_name in total_metric_sums:
+                    if metric_name in total_metric_sums: # Check if this metric is requested
                         try:
-                            # <<< FIX: Pass the ORIGINAL fixation_mask >>>
-                            # LL, NSS, and the original AUC function expect the mask
-                            # potentially containing fixation counts, not just binary values.
-                            mask_for_metric = fixation_mask
-                            value = metric_fn(log_density, mask_for_metric, weights=weights)
-                            # <<< END FIX >>>
+                            # Use target_mask_for_metrics (dense, potentially counts) for LL, NSS, AUC_CPU
+                            metric_value_batch_avg = metric_fn(log_density, target_mask_for_metrics, weights=weights)
+                            
+                            if not (isinstance(metric_value_batch_avg, torch.Tensor) and metric_value_batch_avg.ndim == 0):
+                                if is_master: warnings.warn(
+                                    f"Metric function {metric_name} did not return scalar tensor! Got: {metric_value_batch_avg}", RuntimeWarning)
+                                if isinstance(metric_value_batch_avg, (int, float)):
+                                     metric_value_batch_avg = torch.tensor(metric_value_batch_avg, device=device, dtype=torch.float64)
+                                else:
+                                     continue # Skip accumulation if conversion fails
 
-                            # Accumulate results (rest of the logic is the same)
-                            if isinstance(value, torch.Tensor) and value.ndim == 0:
-                                total_metric_sums[metric_name] += value * current_batch_weight
-                            elif isinstance(value, (int, float)):
-                                total_metric_sums[metric_name] += torch.tensor(value, device=device, dtype=torch.float64) * current_batch_weight
-                            else:
-                                if is_master: warnings.warn(f"Metric {metric_name} returned non-scalar {type(value)}. Skipping.", RuntimeWarning)
+                            # Accumulate sum of (metric * weight_sum_for_batch)
+                            total_metric_sums[metric_name] += metric_value_batch_avg * current_batch_total_weight
                         except Exception as e:
-                            if is_master: warnings.warn(f"Error calculating {metric_name} for batch: {e}. Skipping.", RuntimeWarning)
-
+                            if is_master: warnings.warn(
+                                f"Error calculating metric {metric_name} for batch {batch_idx}: {e}. Skipping accumulation.", RuntimeWarning)
+            
+            # --- Update GPU AUC (if active and no previous OOM) ---
             if auroc_metric_gpu is not None and not oom_error_gpu_auc:
                 try:
-                    preds_flat = log_density.flatten()
-                    targets_flat = target_mask_binary.flatten() # Use binary target here too
-                    if torch.unique(targets_flat).numel() > 1:
-                        auroc_metric_gpu.update(preds_flat, targets_flat)
-                except torch.cuda.OutOfMemoryError as e:
-                    if is_master: warnings.warn("\n!!! OOM ERROR during GPU AUROC update !!!\nGPU AUC will be NaN. Reduce validation batch size.", RuntimeWarning)
+                    preds_for_auc_flat = log_density.flatten() # Predictions (log-probabilities or logits)
+                    targets_for_auc_flat = target_mask_binary.flatten() # Binary targets
+
+                    if torch.unique(targets_for_auc_flat).numel() > 1: # Check for both classes present
+                        auroc_metric_gpu.update(preds_for_auc_flat, targets_for_auc_flat)
+                except torch.cuda.OutOfMemoryError:
+                    if is_master: warnings.warn(
+                        "\n!!! OOM ERROR during GPU AUROC update !!!\nGPU AUC will be NaN. Reduce validation batch size.", RuntimeWarning)
                     oom_error_gpu_auc = True
-                    del auroc_metric_gpu; auroc_metric_gpu = None; torch.cuda.empty_cache()
+                    del auroc_metric_gpu; auroc_metric_gpu = None # Free memory
+                    torch.cuda.empty_cache()
                 except Exception as e:
-                    if is_master: warnings.warn(f"Error updating GPU AUROC: {e}. GPU AUC may be incorrect.", RuntimeWarning)
+                    if is_master: warnings.warn(f"Error updating GPU AUROC for batch {batch_idx}: {e}. GPU AUC may be incorrect.", RuntimeWarning)
 
-            if is_master and total_weight > 0 and batch_process_count > 0:
-                desc = "Validating"
+            # --- Update progress bar (master only) ---
+            if is_master and total_weight.item() > 0 and processed_batches_count > 0:
+                desc_suffix = ""
                 if 'LL' in total_metric_sums:
-                    local_avg_ll = (total_metric_sums["LL"] / total_weight).item()
-                    desc += f' LL_local {local_avg_ll:.5f}'
+                    current_avg_ll_local = (total_metric_sums['LL'] / total_weight).item()
+                    desc_suffix += f' LL_local {current_avg_ll_local:.4f}'
                 if 'AUC_CPU' in total_metric_sums:
-                    local_avg_auc_cpu = (total_metric_sums["AUC_CPU"] / total_weight).item()
-                    desc += f' AUC_CPU_local {local_avg_auc_cpu:.5f}'
-                pbar.set_description(desc)
+                    current_avg_auc_cpu_local = (total_metric_sums['AUC_CPU'] / total_weight).item()
+                    desc_suffix += f' AUC_CPU_local {current_avg_auc_cpu_local:.3f}'
+                pbar.set_description(pbar_desc + desc_suffix)
+    # --- End Validation Loop ---
 
+    # --- DDP Synchronization of accumulated sums ---
     if is_distributed:
         dist.all_reduce(total_weight, op=dist.ReduceOp.SUM)
-        for metric_name in total_metric_sums:
-            dist.all_reduce(total_metric_sums[metric_name], op=dist.ReduceOp.SUM)
+        for metric_name in total_metric_sums: # Iterate over keys present in total_metric_sums
+            if metric_name in metrics : # Check if this metric was requested and accumulated
+                dist.all_reduce(total_metric_sums[metric_name], op=dist.ReduceOp.SUM)
 
+    # --- Final Metric Calculation ---
     final_metrics = {}
-    total_weight_cpu = total_weight.item()
+    total_weight_cpu_val = total_weight.item() # Get scalar value for total weight
 
-    if total_weight_cpu > 0:
-        for metric_name, metric_sum in total_metric_sums.items():
-            if metric_name in metrics:
-                final_metrics[metric_name] = (metric_sum / total_weight).item()
+    if total_weight_cpu_val > 0:
+        # Calculate final averages for LL, NSS, AUC_CPU
+        for metric_name in metrics: # Iterate over requested metrics
+            if metric_name in total_metric_sums:
+                final_metrics[metric_name] = (total_metric_sums[metric_name] / total_weight).item()
 
+        # Compute final GPU AUC (if requested and didn't fail)
         if 'AUC_GPU' in metrics:
             if auroc_metric_gpu is not None and not oom_error_gpu_auc:
                 try:
+                    # Check if metric has accumulated state before computing
+                    # This check depends on the torchmetrics version and specific metric state attributes
                     metric_has_state = False
-                    if hasattr(auroc_metric_gpu, 'update_count') and auroc_metric_gpu.update_count > 0: metric_has_state = True
-                    elif hasattr(auroc_metric_gpu, 'preds') and hasattr(auroc_metric_gpu, 'target') and len(auroc_metric_gpu.preds) > 0: metric_has_state = True
-
+                    if hasattr(auroc_metric_gpu, '_update_count') and auroc_metric_gpu._update_count > 0: # Older torchmetrics
+                        metric_has_state = True
+                    elif hasattr(auroc_metric_gpu, 'update_count') and auroc_metric_gpu.update_count > 0: # Newer torchmetrics
+                        metric_has_state = True
+                    elif hasattr(auroc_metric_gpu, 'preds') and hasattr(auroc_metric_gpu, 'target') and len(getattr(auroc_metric_gpu, 'preds',[])) > 0:
+                        metric_has_state = True
+                        
                     if metric_has_state:
                         final_metrics['AUC_GPU'] = auroc_metric_gpu.compute().item()
                     else:
-                        if is_master: warnings.warn("GPU AUROC metric has no state/updates. Setting AUC_GPU to NaN.", RuntimeWarning)
+                        if is_master: warnings.warn("GPU AUROC metric may not have been updated (no state). Setting AUC_GPU to NaN.", RuntimeWarning)
                         final_metrics['AUC_GPU'] = float('nan')
                 except Exception as e:
                     if is_master: warnings.warn(f"Failed to compute final GPU AUC: {e}. Setting AUC_GPU to NaN.", RuntimeWarning)
                     final_metrics['AUC_GPU'] = float('nan')
-            else:
+            else: # OOM happened or GPU AUC was not initialized
                 final_metrics['AUC_GPU'] = float('nan')
-    else:
+    else: # Handle zero total weight case (e.g., empty validation set)
+        if is_master: logger.warning("Total weight for validation is zero. All metrics will be NaN.")
         for metric_name in metrics:
-            if metric_name != 'IG': final_metrics[metric_name] = float('nan')
+            if metric_name != 'IG': # IG is calculated from LL
+                final_metrics[metric_name] = float('nan')
 
+    # Ensure all requested metrics have a value (even if NaN)
     for metric_name in metrics:
         if metric_name != 'IG' and metric_name not in final_metrics:
             final_metrics[metric_name] = float('nan')
 
+    # Calculate IG from LL
     if 'IG' in metrics:
         ll_value = final_metrics.get('LL', float('nan'))
-        if not np.isnan(ll_value) and baseline_information_gain is not None:
+        # baseline_information_gain is a scalar (already IG, so LL - baseline_LL)
+        # If it's baseline_LL, then IG = LL_model - baseline_LL
+        if not np.isnan(ll_value) and baseline_information_gain is not None and not np.isnan(baseline_information_gain):
             final_metrics['IG'] = ll_value - baseline_information_gain
         else:
+            if is_master and (baseline_information_gain is None or np.isnan(baseline_information_gain)):
+                 logger.warning("Cannot calculate IG: baseline_information_gain is None or NaN.")
             final_metrics['IG'] = float('nan')
-
+            
+    # Reset GPU metric state for next epoch
     if auroc_metric_gpu is not None:
-        auroc_metric_gpu.reset()
+        try:
+            auroc_metric_gpu.reset()
+        except Exception as e:
+            if is_master: logger.warning(f"Error resetting AUROC metric: {e}")
 
     return final_metrics
 
 
-def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation_steps=1, is_distributed=False, is_master=True, logger=None):
-    """ Trains the model for one epoch. Handles DDP gradient sync, AMP, and Gradient Accumulation. """
-    model.train()
-    local_losses = []
-    local_batch_weights = []
-    total_batches = len(dataset)
-    # Estimate global batch size for logging (handle non-DDP case)
-    sampler = getattr(dataset, 'sampler', None) # Check if sampler exists
-    batch_size_attr = getattr(sampler, 'batch_size', getattr(dataset, 'batch_size', None)) # Try sampler first, then dataset
-    if batch_size_attr is None and hasattr(dataset, 'batch_sampler') and dataset.batch_sampler is not None: # Check batch_sampler
-        batch_size_attr = getattr(dataset.batch_sampler, 'batch_size', None)
+def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation_steps=1,
+                is_distributed=False, is_master=True, logger=None):
+    """ Trains the model for one epoch. Handles DDP, AMP, Grad Accum, and segmentation_mask. """
+    if logger is None:
+        logger = logging.getLogger(__name__) # Basic fallback logger
 
-    if batch_size_attr is not None:
-         global_batch_size_est = batch_size_attr * (dist.get_world_size() if is_distributed else 1) * gradient_accumulation_steps
-    else:
-        global_batch_size_est = "Unknown" # Fallback if size cannot be determined
-    if is_master: logger.debug(f"Estimated global batch size for logging: {global_batch_size_est}")
+    model.train() # Set model to training mode
+    
+    # Accumulators for average loss calculation for this rank
+    local_epoch_losses = []
+    local_epoch_batch_weights = [] # Sum of sample weights in each batch
 
-    # Reset optimizer gradients only at the beginning of the accumulation cycle
-    optimizer.zero_grad()
+    # Determine effective batch size for logging
+    # This is a rough estimate as batch_sampler might not always expose batch_size directly
+    world_size_for_log = dist.get_world_size() if is_distributed and dist.is_initialized() else 1
+    try:
+        # Attempt to get batch_size from loader or its sampler
+        bs_attr = getattr(dataset, 'batch_size', None)
+        if bs_attr is None and hasattr(dataset, 'batch_sampler') and dataset.batch_sampler is not None:
+            bs_attr = getattr(dataset.batch_sampler, 'batch_size', None)
+        
+        per_gpu_batch_size = bs_attr if bs_attr is not None else "Unknown"
+        if isinstance(per_gpu_batch_size, int):
+            global_batch_size_log_est = per_gpu_batch_size * world_size_for_log * gradient_accumulation_steps
+        else:
+            global_batch_size_log_est = "Unknown (per-GPU BS not found)"
+    except Exception:
+        global_batch_size_log_est = "Unknown (error getting BS)"
 
-    pbar_desc = "Training" + (f" (Rank {dist.get_rank()})" if is_distributed else "")
+    if is_master:
+        logger.debug(f"Train Epoch: Est. Global Batch Size for logging: {global_batch_size_log_est}")
+
+    # Optimizer zero_grad is handled per accumulation cycle
+    optimizer.zero_grad() # Initial zero_grad for the first cycle
+
+    pbar_desc = "Training" + (f" (Rank {dist.get_rank()})" if is_distributed and dist.is_initialized() else "")
     pbar = tqdm(dataset, desc=pbar_desc, disable=not is_master, leave=False)
+    total_batches_in_epoch = len(dataset)
 
     for batch_idx, batch in enumerate(pbar):
-
-        # Determine if this is the last micro-batch for gradient accumulation
-        is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps == 0
-        is_last_batch_in_epoch = (batch_idx + 1) == total_batches
-
-        # Context manager for DDP gradient synchronization
-        sync_context = model.no_sync() if (is_distributed and not is_accumulation_step and not is_last_batch_in_epoch) else contextlib.nullcontext()
+        # Determine if DDP gradient sync should happen for this micro-batch
+        # Sync if it's an accumulation step OR the very last micro-batch of the epoch
+        is_accumulation_boundary = (batch_idx + 1) % gradient_accumulation_steps == 0
+        is_last_micro_batch_of_epoch = (batch_idx + 1) == total_batches_in_epoch
+        
+        # `model.no_sync()` is a context manager to disable DDP gradient sync
+        # It should be used if distributed, AND it's NOT an accumulation boundary, AND it's NOT the last batch.
+        needs_ddp_sync = is_accumulation_boundary or is_last_micro_batch_of_epoch
+        sync_context = contextlib.nullcontext() # Default: sync
+        if is_distributed and not needs_ddp_sync:
+            sync_context = model.no_sync()
 
         with sync_context:
             try:
-                image = batch.pop('image').to(device)
-                centerbias = batch.pop('centerbias').to(device)
-                fixation_mask = batch.pop('fixation_mask').to(device)
-                x_hist = batch.pop('x_hist', torch.tensor([])).to(device)
-                y_hist = batch.pop('y_hist', torch.tensor([])).to(device)
-                weights = batch.pop('weight').to(device)
-                durations = batch.pop('durations', torch.tensor([])).to(device)
-                kwargs = {k: v.to(device) for k, v in batch.items()}
+                # --- Move batch to GPU & Pop data ---
+                image = batch.pop('image').to(device, non_blocking=True)
+                centerbias = batch.pop('centerbias').to(device, non_blocking=True)
+                fixation_mask = batch.pop('fixation_mask').to(device, non_blocking=True) # Target for loss
+                
+                # --- NEW: Pop segmentation_mask ---
+                segmentation_mask = batch.pop('segmentation_mask', None)
+                if segmentation_mask is not None:
+                    segmentation_mask = segmentation_mask.to(device, non_blocking=True)
+                # --- END NEW ---
+
+                x_hist = batch.pop('x_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
+                y_hist = batch.pop('y_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
+                weights = batch.pop('weight').to(device, non_blocking=True)
+                durations = batch.pop('durations', torch.tensor([], device=device)).to(device, non_blocking=True)
+                
+                remaining_kwargs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
             except Exception as e:
-                logger.error(f"Error moving batch data to device {device}: {e}")
+                logger.error(f"Rank {device}: Error moving batch {batch_idx} data to device: {e}", exc_info=True)
+                # If data loading fails for a batch, critical to reset grads if in accumulation cycle
+                if not needs_ddp_sync: optimizer.zero_grad(set_to_none=True)
                 continue
 
+            # --- Model Forward and Loss Calculation (with AMP) ---
             log_density = None
+            loss = None # Initialize loss
             try:
                 underlying_model = model.module if is_distributed else model
+                
+                # Construct model_args for forward pass
+                model_call_args = [image, centerbias]
+                model_call_kwargs = {'segmentation_mask': segmentation_mask}
 
-                # Use Automatic Mixed Precision (AMP)
-                with amp.autocast('cuda', dtype=torch.float16): # Use float16 for speed/memory
-                    if isinstance(underlying_model, DeepGazeII):
-                        logger.debug("Using DeepGazeII forward.")
-                        log_density = model(image, centerbias, **kwargs)
-                    elif getattr(underlying_model, 'scanpath_network', None) is None:
-                        logger.debug("Using spatial-only via model.forward(image, centerbias)")
-                        log_density = model(image, centerbias)
+                if hasattr(underlying_model, 'scanpath_network') and underlying_model.scanpath_network is not None:
+                    model_call_kwargs['x_hist'] = x_hist
+                    model_call_kwargs['y_hist'] = y_hist
+                    model_call_kwargs['durations'] = durations
+                
+                model_call_kwargs.update(remaining_kwargs)
+
+                with amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type=='cuda')):
+                    log_density = model(*model_call_args, **model_call_kwargs)
+                    
+                    if log_density is None: # Should not happen if model forward is correct
+                        logger.error(f"Rank {device}: log_density is None after model forward for batch {batch_idx}.")
+                        # Skip loss calculation if log_density is None
+                        raise ValueError("log_density is None from model.")
+
+
+                    # Ensure fixation_mask is dense for loss calculation
+                    if isinstance(fixation_mask, torch.sparse.Tensor):
+                        loss_target_mask = fixation_mask.to_dense()
                     else:
-                        logger.debug("Using full model forward with scanpath.")
-                        log_density = model(
-                            image, centerbias, x_hist=x_hist, y_hist=y_hist, durations=durations, **kwargs
-                        )
-
-                    if log_density is None:
-                        logger.error("log_density is None after forward pass, skipping batch.")
-                        continue
-
-                    loss = -log_likelihood(log_density, fixation_mask, weights=weights)
+                        loss_target_mask = fixation_mask
+                        
+                    current_loss_unscaled = -log_likelihood(log_density, loss_target_mask, weights=weights)
+                    
                     # Scale loss for gradient accumulation
-                    loss = loss / gradient_accumulation_steps
+                    loss = current_loss_unscaled / gradient_accumulation_steps
 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.error(f"NaN or Inf loss detected! Skipping backward/step.")
+                    logger.error(f"Rank {device}: NaN or Inf loss detected for batch {batch_idx}! Loss: {loss.item()}. Skipping backward/step.")
                     # If NaN/Inf, reset gradients accumulated so far for this step
-                    if not is_accumulation_step and not is_last_batch_in_epoch:
-                        optimizer.zero_grad() # Reset gradients for the current accumulation cycle
-                    continue
+                    # This prevents propagation of bad gradients.
+                    if not needs_ddp_sync : optimizer.zero_grad(set_to_none=True)
+                    loss = None # Mark loss as invalid for backward pass
+                    continue # Skip to next micro-batch
 
-            except Exception as forward_loss_e:
-                logger.exception("Error during training forward pass or loss calculation")
-                if not is_accumulation_step and not is_last_batch_in_epoch:
-                    optimizer.zero_grad() # Reset potentially corrupted gradients
+            except Exception as e: # Catch errors from forward pass or loss calc
+                logger.error(f"Rank {device}: Error during training forward/loss for batch {batch_idx}: {e}", exc_info=True)
+                if not needs_ddp_sync : optimizer.zero_grad(set_to_none=True)
+                loss = None # Mark loss as invalid
                 continue
 
-            # Backward pass with GradScaler
-            try:
-                # scaler.scale(loss).backward() will sync grads if sync_context is nullcontext
-                scaler.scale(loss).backward()
-            except Exception as backward_e:
-                logger.exception("Error during backward pass")
-                if not is_accumulation_step and not is_last_batch_in_epoch:
-                    optimizer.zero_grad() # Reset potentially corrupted gradients
-                continue
-
-        # Optimizer step only after accumulating gradients or at the very end
-        if is_accumulation_step or is_last_batch_in_epoch:
-            try:
-                # Unscales gradients and calls optimizer.step()
-                scaler.step(optimizer)
-                # Updates the scale for next iteration
-                scaler.update()
-                # Zero the gradients *after* the step for the next accumulation cycle
-                optimizer.zero_grad()
-            except Exception as opt_step_e:
-                logger.exception("Error during optimizer step or scaler update")
-                optimizer.zero_grad() # Ensure grads are zeroed if step failed
-                continue
-
-        # Log loss (optional: log per micro-batch or only after accumulation step)
-        detached_loss = loss.detach() * gradient_accumulation_steps # Unscale for logging
-        local_losses.append(detached_loss.cpu().numpy())
-        local_batch_weights.append(weights.detach().cpu().numpy().sum())
-        if is_master and len(local_losses) > 0:
-            current_avg_loss = np.nanmean(local_losses) if np.any(np.isnan(local_batch_weights)) else np.average(local_losses, weights=local_batch_weights)
-            pbar_desc_str = f'Training Loss (Rank 0 Avg): {current_avg_loss:.5f}'
-            if gradient_accumulation_steps > 1:
-                pbar_desc_str += f' (Acc {batch_idx % gradient_accumulation_steps + 1}/{gradient_accumulation_steps})'
-            pbar.set_description(pbar_desc_str)
+            # --- Backward pass (scaled loss) ---
+            # Only proceed if loss is valid
+            if loss is not None:
+                try:
+                    # scaler.scale(loss).backward() handles DDP sync if sync_context is nullcontext
+                    scaler.scale(loss).backward()
+                except Exception as e:
+                    logger.error(f"Rank {device}: Error during backward pass for batch {batch_idx}: {e}", exc_info=True)
+                    if not needs_ddp_sync : optimizer.zero_grad(set_to_none=True) # Reset if backward fails mid-accumulation
+                    continue # Skip optimizer step for this cycle
+            else: # Loss was NaN/Inf or None from previous error
+                if is_master: pbar.set_description(pbar_desc + " Invalid Loss - Skipping optim step")
+                # If this was supposed to be an accumulation step, we need to ensure optimizer.step isn't called
+                # with potentially corrupted gradients from previous micro-batches of this cycle.
+                # The `if is_accumulation_boundary or is_last_micro_batch_of_epoch:` below handles this.
+                # However, if an invalid loss occurs, we might want to zero grads for the current cycle.
+                if not needs_ddp_sync: optimizer.zero_grad(set_to_none=True)
 
 
-    if len(local_losses) > 0:
-        final_avg_loss = np.nanmean(local_losses) if np.any(np.isnan(local_batch_weights)) else np.average(local_losses, weights=local_batch_weights)
-        return final_avg_loss
-    else:
-        return np.nan
+        # --- Optimizer Step (at accumulation boundary or end of epoch) ---
+        if needs_ddp_sync: # This is equivalent to (is_accumulation_boundary or is_last_micro_batch_of_epoch)
+            if loss is not None: # Only step if the last micro-batch's loss was valid
+                try:
+                    # Optional: Gradient clipping (before scaler.step)
+                    # scaler.unscale_(optimizer) # Unscale gradients first if clipping
+                    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    scaler.step(optimizer) # Unscales gradients and calls optimizer.step()
+                    scaler.update()        # Updates the scale for next iteration
+                except Exception as e:
+                    logger.error(f"Rank {device}: Error during optimizer step or scaler update for cycle ending at batch {batch_idx}: {e}", exc_info=True)
+                finally:
+                    # Zero gradients for the *next* accumulation cycle, regardless of step success/failure
+                    optimizer.zero_grad(set_to_none=True)
+            else: # Loss for the micro-batch that completed the cycle was invalid
+                logger.warning(f"Rank {device}: Skipping optimizer step at batch {batch_idx} due to invalid loss in current/last micro-batch of cycle.")
+                # Gradients should already be zeroed if loss was invalid, or zero them now for next cycle
+                optimizer.zero_grad(set_to_none=True)
 
 
-def restore_from_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed=False, logger=None):
-    """ Restores training state from a checkpoint file, handling DDP 'module.' prefix and GradScaler. """
+        # --- Log Loss and Update Progress Bar ---
+        if loss is not None: # Only log if loss was valid for this micro-batch
+            # Unscale loss for logging (loss was already divided by grad_accum_steps)
+            detached_loss_value = loss.detach().item() * gradient_accumulation_steps
+            local_epoch_losses.append(detached_loss_value)
+            local_epoch_batch_weights.append(weights.sum().item()) # Sum of weights in this micro-batch
+
+            if is_master and len(local_epoch_losses) > 0:
+                # Calculate running average loss for the current epoch on this rank
+                current_avg_loss_disp = np.average(local_epoch_losses, weights=local_epoch_batch_weights if np.sum(local_epoch_batch_weights)>0 else None)
+                
+                pbar_desc_str = f"{pbar_desc} Loss (R0 Avg): {current_avg_loss_disp:.4f}"
+                if gradient_accumulation_steps > 1:
+                    pbar_desc_str += f" (Acc {(batch_idx % gradient_accumulation_steps) + 1}/{gradient_accumulation_steps})"
+                pbar.set_description(pbar_desc_str)
+    # --- End Epoch Loop ---
+
+    # Calculate average loss for the epoch for this rank
+    if len(local_epoch_losses) > 0 and sum(local_epoch_batch_weights) > 0:
+        epoch_avg_loss_local = np.average(local_epoch_losses, weights=local_epoch_batch_weights)
+    elif len(local_epoch_losses) > 0: # Unweighted average if all batch weights were zero (unlikely)
+        epoch_avg_loss_local = np.mean(local_epoch_losses)
+    else: # No valid batches processed
+        epoch_avg_loss_local = np.nan
+        if is_master: logger.warning("No valid batches processed in train_epoch, returning NaN loss.")
+
+    return epoch_avg_loss_local
+
+
+# --- restore_from_checkpoint and save_training_state (largely the same, ensure logger is passed) ---
+def restore_from_checkpoint(model, optimizer, scheduler, scaler, path, device,
+                            is_distributed=False, logger=None):
+    if logger is None: logger = logging.getLogger(__name__)
+    # ... (Your existing restore_from_checkpoint code, ensuring logger is used) ...
+    # No changes needed here for segmentation_mask specifically.
     if not os.path.exists(path):
         logger.error(f"Checkpoint path not found: {path}. Cannot restore.")
-        return 0, np.nan, False  # No checkpoint, start from scratch
+        return 0, np.nan, False
 
     logger.info(f"Restoring checkpoint from: {path} (Distributed: {is_distributed})")
     try:
-        # Load either a full checkpoint dict or a bare state_dict
         data = torch.load(path, map_location=device)
-        if not isinstance(data, dict) or 'model' not in data:
-            state_dict = data
-        else:
-            state_dict = data['model']
+        model_state_dict = data.get('model') if isinstance(data, dict) else data
+        if model_state_dict is None and isinstance(data, dict): # If 'model' key is missing but it's a dict
+             model_state_dict = data # Assume the dict itself is the state_dict (older format)
+
     except Exception as e:
         logger.exception(f"Failed to load checkpoint file {path}")
         return 0, np.nan, False
 
-    # --- Restore Model State ---
-    model_state_dict = state_dict
-    adjusted_state_dict = OrderedDict()
-    is_ddp_checkpoint = any(k.startswith('module.') for k in model_state_dict.keys())
-    current_model_is_ddp = isinstance(model, DDP)
+    # Model State
+    if model_state_dict:
+        adjusted_state_dict = OrderedDict()
+        is_ddp_checkpoint = any(k.startswith('module.') for k in model_state_dict.keys())
+        current_model_is_ddp = isinstance(model, DDP)
 
-    if current_model_is_ddp:
-        # Model is wrapped in DDP, ensure keys start with 'module.'
-        if not is_ddp_checkpoint:
-            logger.warning("Current model is DDP, but checkpoint is not. Adding 'module.' prefix.")
+        if current_model_is_ddp and not is_ddp_checkpoint:
+            logger.warning("Current model is DDP, checkpoint is not. Adding 'module.' prefix.")
+            for k, v in model_state_dict.items(): adjusted_state_dict[f'module.{k}'] = v
+        elif not current_model_is_ddp and is_ddp_checkpoint:
+            logger.warning("Current model is not DDP, checkpoint is. Removing 'module.' prefix.")
             for k, v in model_state_dict.items():
-                adjusted_state_dict[f'module.{k}'] = v
-        else:
-            logger.debug("Current model and checkpoint are both DDP. Checking prefixes.")
-            for k, v in model_state_dict.items():
-                if not k.startswith('module.'):
-                    logger.warning(f"Adding missing 'module.' prefix to key '{k}'.")
-                    adjusted_state_dict[f'module.{k}'] = v
-                else:
-                    adjusted_state_dict[k] = v
-    else:
-        # Model is not DDP, strip 'module.' if present
-        if is_ddp_checkpoint:
-            logger.warning("Current model is not DDP, but checkpoint is. Removing 'module.' prefix.")
-            for k, v in model_state_dict.items():
-                if k.startswith('module.'):
-                    adjusted_state_dict[k[len('module.'):]] = v
-                else:
-                    adjusted_state_dict[k] = v
-        else:
+                if k.startswith('module.'): adjusted_state_dict[k[len('module.'):]] = v
+                else: adjusted_state_dict[k] = v # Should not happen if is_ddp_checkpoint is true
+        else: # Both DDP or both not DDP (or one is DDP and has correct prefix)
             adjusted_state_dict = model_state_dict
-
-    try:
-        missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
-        if missing_keys:
-            logger.warning(f"Missing keys when loading model state: {missing_keys}")
-        if unexpected_keys:
-            logger.warning(f"Unexpected keys when loading model state: {unexpected_keys}")
-    except Exception as load_err:
-        logger.exception("Error loading model state_dict")
+        
+        try:
+            missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
+            if missing_keys: logger.warning(f"Missing keys in model state: {missing_keys}")
+            if unexpected_keys: logger.warning(f"Unexpected keys in model state: {unexpected_keys}")
+        except Exception as e:
+            logger.error("Error loading model state_dict.", exc_info=True)
+            # Decide if to return failure or continue with potentially partial load
+            return 0, np.nan, False # Fail on model load error
+    else:
+        logger.error("No 'model' state_dict found in checkpoint.")
         return 0, np.nan, False
 
-    # --- Restore Optimizer State ---
-    if isinstance(data, dict) and 'optimizer' in data and optimizer is not None:
-        try:
-            optimizer.load_state_dict(data['optimizer'])
-            logger.info("Optimizer state restored.")
-            # Move optimizer tensors to correct device
-            for state in optimizer.state.values():
-                for key, val in state.items():
-                    if isinstance(val, torch.Tensor):
-                        state[key] = val.to(device)
-        except Exception as e:
-            logger.warning(f"Could not restore optimizer state: {e}. Starting with fresh optimizer.")
-    elif optimizer is not None:
-        logger.warning("Optimizer state not found in checkpoint. Starting with fresh optimizer.")
 
-    # --- Restore Scheduler State ---
+    # Optimizer, Scheduler, Scaler (only if data is a dict from your save_training_state)
     scheduler_restored = False
-    if isinstance(data, dict) and 'scheduler' in data and scheduler is not None:
-        try:
-            scheduler.load_state_dict(data['scheduler'])
-            logger.info("Scheduler state restored.")
-            scheduler_restored = True
-        except Exception as e:
-            logger.warning(f"Could not restore scheduler state: {e}. Starting with fresh scheduler.")
-    elif scheduler is not None:
-        logger.warning("Scheduler state not found in checkpoint. Starting with fresh scheduler.")
+    if isinstance(data, dict):
+        if 'optimizer' in data and optimizer is not None:
+            try:
+                optimizer.load_state_dict(data['optimizer'])
+                logger.info("Optimizer state restored.")
+                for state in optimizer.state.values(): # Move optimizer state to device
+                    for k, v_opt in state.items():
+                        if isinstance(v_opt, torch.Tensor): state[k] = v_opt.to(device)
+            except Exception as e: logger.warning(f"Could not restore optimizer state: {e}. Fresh optimizer.", exc_info=True)
+        
+        if 'scheduler' in data and scheduler is not None:
+            try:
+                scheduler.load_state_dict(data['scheduler'])
+                logger.info("Scheduler state restored.")
+                scheduler_restored = True
+            except Exception as e: logger.warning(f"Could not restore scheduler state: {e}. Fresh scheduler.", exc_info=True)
 
-    # --- Restore GradScaler State (for AMP) ---
-    if isinstance(data, dict) and 'grad_scaler' in data and scaler is not None:
-        try:
-            scaler.load_state_dict(data['grad_scaler'])
-            logger.info("GradScaler state restored.")
-        except Exception as e:
-            logger.warning(f"Could not restore GradScaler state: {e}. Starting with fresh GradScaler.")
-    elif scaler is not None:
-        logger.warning("GradScaler state not found in checkpoint. Starting with fresh GradScaler.")
+        if 'grad_scaler' in data and scaler is not None:
+            try:
+                scaler.load_state_dict(data['grad_scaler'])
+                logger.info("GradScaler state restored.")
+            except Exception as e: logger.warning(f"Could not restore GradScaler state: {e}. Fresh scaler.", exc_info=True)
 
-    # --- Warn about RNG state if present ---
-    if isinstance(data, dict) and ('rng_state' in data or 'cuda_rng_state' in data):
-        logger.warning("Checkpoint contains RNG state, but it is not being restored by default.")
-
-    # --- Final bookkeeping ---
     step = data.get('step', 0) if isinstance(data, dict) else 0
-    loss = data.get('loss', np.nan) if isinstance(data, dict) else np.nan
-    if step > 0:
-        logger.info(f"Restored to step {step} with loss {loss:.5f}")
-    else:
-        logger.info("No previous step/loss found. Starting from step 0.")
-
-    return step, loss, scheduler_restored
-
+    loss_val = data.get('loss', np.nan) if isinstance(data, dict) else np.nan # Renamed to avoid conflict
+    
+    if step > 0 : logger.info(f"Restored to step {step} with loss {loss_val:.5f}")
+    else: logger.info("No previous step/loss found in checkpoint data or checkpoint was just a model state_dict.")
+    
+    return step, loss_val, scheduler_restored
 
 
-def save_training_state(model, optimizer, scheduler, scaler, step, loss, path, is_distributed=False, is_master=True, logger=None):
-    """ Saves the training state to a checkpoint file. Only master rank writes. """
-    if not is_master:
-        return
+def save_training_state(model, optimizer, scheduler, scaler, step, loss, path,
+                        is_distributed=False, is_master=True, logger=None):
+    if logger is None: logger = logging.getLogger(__name__)
+    if not is_master: return
 
     try:
         model_to_save = model.module if is_distributed else model
@@ -488,365 +596,429 @@ def save_training_state(model, optimizer, scheduler, scaler, step, loss, path, i
             'model': model_to_save.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'grad_scaler': scaler.state_dict(), # Save GradScaler state for AMP
-            # --- RNG State Saving (Optional - see note in restore_from_checkpoint) ---
-            # 'rng_state': torch.get_rng_state(),
-            # 'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, # Saves list for all GPUs
-            # --- End RNG State ---
+            'grad_scaler': scaler.state_dict(),
             'step': step,
             'loss': loss,
+            # 'rng_state': torch.get_rng_state(), # Optional
+            # 'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, # Optional
         }
-
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).parent.mkdir(parents=True, exist_ok=True) # Ensure dir exists
         with atomic_save(path, text_mode=False, overwrite_part=True) as f:
             torch.save(data, f)
         logger.debug(f"Saved checkpoint to {path} at step {step}")
     except Exception as e:
-        logger.exception(f"Failed to save checkpoint {path} at step {step}")
+        logger.error(f"Failed to save checkpoint {path} at step {step}.", exc_info=True)
 
 
-def _train(this_directory,
-        model,
-        train_loader, train_baseline_log_likelihood,
-        val_loader, val_baseline_log_likelihood,
-        optimizer, lr_scheduler,
-        gradient_accumulation_steps, # Added for train_epoch call
-        minimum_learning_rate,
-        validation_metric='IG',
-        validation_metrics=['IG', 'LL', 'AUC_CPU', 'NSS'],
-        validation_epochs=1,
-        startwith=None,
-        device=None,
-        is_distributed=False,
-        is_master=True,
-        logger=None,):
-    """ Main training loop function, adapted for DDP, AMP, Grad Accum. """
+# --- _train function (Main Loop) ---
+def _train(this_directory, model,
+           train_loader, train_baseline_log_likelihood,
+           val_loader, val_baseline_log_likelihood,
+           optimizer, lr_scheduler,
+           gradient_accumulation_steps,
+           minimum_learning_rate,
+           validation_metric='IG',
+           validation_metrics=None, # Allow None, default inside
+           validation_epochs=1,
+           startwith=None, # Path to a specific checkpoint to start/resume from
+           device=None,
+           is_distributed=False, is_master=True,
+           logger=None): # Pass logger instance
+    """ Main training loop. Now uses logger passed from the main script. """
+
+    if logger is None: # Fallback if not passed, though it should be
+        logger = logging.getLogger("train_loop")
+        logger.setLevel(logging.INFO if is_master else logging.WARNING)
+        # Add a basic handler if no handlers are configured for this logger
+        if not logger.hasHandlers():
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter(f"%(asctime)s Rank{dist.get_rank() if is_distributed and dist.is_initialized() else 0} %(levelname)s %(name)s: %(message)s")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+
+    if validation_metrics is None:
+        validation_metrics = ['IG', 'LL', 'AUC_CPU', 'NSS'] # Default from your script
 
     output_dir_path = Path(this_directory)
-    final_checkpoint_path = output_dir_path / 'final.pth'
-    finished_training = False
-
     if is_master:
-        if final_checkpoint_path.exists():
-            logger.info(f"Final checkpoint {final_checkpoint_path} already exists. Training previously finished.")
-            finished_training = True
+        logger.info(f"Output directory for this run: {output_dir_path}")
+        output_dir_path.mkdir(parents=True, exist_ok=True) # Master creates dir
 
-    finished_flag = torch.tensor([int(finished_training)], device=device, dtype=torch.int)
+    # Check if already finished
+    final_checkpoint_path = output_dir_path / 'final.pth'
+    finished_training_flag_val = 0
+    if is_master and final_checkpoint_path.exists():
+        logger.info(f"Final checkpoint {final_checkpoint_path} found. Training assumed complete for this directory.")
+        finished_training_flag_val = 1
+    
+    finished_flag_tensor = torch.tensor([finished_training_flag_val], device=device, dtype=torch.int)
     if is_distributed:
-        dist.broadcast(finished_flag, src=0)
-    if finished_flag.item() == 1:
-        current_rank = dist.get_rank() if is_distributed else 0
-        logger.info(f"Rank {current_rank} exiting: Training already finished.")
+        dist.broadcast(finished_flag_tensor, src=0) # Master informs others
+    
+    if finished_flag_tensor.item() == 1:
+        current_rank_str = f"Rank {dist.get_rank()}" if is_distributed and dist.is_initialized() else "SingleOp"
+        logger.info(f"{current_rank_str} exiting: Training already marked as finished in {this_directory}.")
         return
 
+    if device is None: # Should be set by main script
+        logger.error("Device not specified to _train function. This is required.")
+        raise ValueError("Device must be specified for _train.")
+    
+    current_rank_str = f"Rank {dist.get_rank()}" if is_distributed and dist.is_initialized() else "SingleOp"
+    logger.info(f"{current_rank_str} using device: {device}")
+
+    # GradScaler for Automatic Mixed Precision (AMP)
+    # Enabled only for CUDA devices.
+    scaler = amp.GradScaler(enabled=(device.type == 'cuda'))
+    if is_master and device.type == 'cuda': logger.info("AMP GradScaler initialized for CUDA.")
+    elif is_master: logger.info("AMP GradScaler disabled (not using CUDA or not master).")
+
+
+    # --- State for tracking progress ---
+    val_metrics_history = defaultdict(list) # Stores lists of metric values over epochs
+    # Columns for the progress log CSV
+    progress_log_columns = ['epoch', 'timestamp', 'learning_rate', 'train_loss'] + \
+                           [f'validation_{m}' for m in validation_metrics]
+    progress_df = pd.DataFrame(columns=progress_log_columns)
+    
+    current_epoch_step = 0 # Tracks the epoch number
+    last_avg_train_loss_epoch = np.nan # Avg loss of the last completed training epoch
+    scheduler_state_restored = False # Flag if LR scheduler state was loaded
+
+    # TensorBoard Writer (master only)
+    tb_writer = None
     if is_master:
+        tb_log_dir = output_dir_path / 'tensorboard_logs'
         try:
-            output_dir_path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.critical(f"Failed to create output directory {output_dir_path}: {e}")
-            if is_distributed: dist.barrier()
-            sys.exit(1)
-    if device is None:
-        raise ValueError("Device must be specified for _train function.")
-    current_rank = dist.get_rank() if is_distributed else 0
-    logger.info(f"Rank {current_rank} using device: {device}")
-
-    # Initialize GradScaler for AMP
-    scaler  = amp.GradScaler('cuda')
-
-    val_metrics_history = defaultdict(list)
-    columns = ['epoch', 'timestamp', 'learning_rate', 'loss'] + [f'validation_{m}' for m in validation_metrics]
-    progress_df = pd.DataFrame(columns=columns)
-    step = 0
-    last_train_loss = np.nan
-    scheduler_restored = False
-
-    writer = None
-    if is_master:
-        try:
-            log_dir = output_dir_path / 'log'
-            log_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"TensorBoard logs will be written to: {log_dir}")
-            writer = SummaryWriter(log_dir, flush_secs=30)
+            tb_log_dir.mkdir(parents=True, exist_ok=True)
+            tb_writer = SummaryWriter(log_dir=str(tb_log_dir), flush_secs=30)
+            logger.info(f"TensorBoard logs will be written to: {tb_log_dir}")
         except Exception as e:
-            logger.error(f"Failed to create TensorBoard writer: {e}. TensorBoard logging disabled.")
+            logger.error(f"Failed to create TensorBoard SummaryWriter at {tb_log_dir}: {e}. TB logging disabled.", exc_info=True)
 
-    checkpoint_to_load = None
-    if startwith and os.path.exists(startwith):
-        checkpoint_to_load = startwith
+    # --- Checkpoint Restoration ---
+    checkpoint_path_to_attempt_restore = None
+    if startwith and Path(startwith).exists(): # If a specific checkpoint is provided
+        checkpoint_path_to_attempt_restore = startwith
         if is_master: logger.info(f"Attempting to restore from specified checkpoint: {startwith}")
-    else:
-        step_files = sorted(output_dir_path.glob('step-*.pth'))
-        if step_files:
-            checkpoint_to_load = step_files[-1]
-            if is_master: logger.info(f"No startwith specified, found latest checkpoint in output dir: {checkpoint_to_load}")
+    else: # Try to find the latest 'step-*.pth' in the experiment directory
+        # This glob pattern needs to be correct for your checkpoint naming
+        # e.g., if checkpoints are step-0001.pth, step-0002.pth etc.
+        intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
+        if intermediate_checkpoints:
+            checkpoint_path_to_attempt_restore = intermediate_checkpoints[-1]
+            if is_master: logger.info(f"No 'startwith' specified. Found latest intermediate checkpoint: {checkpoint_path_to_attempt_restore}")
 
-    if checkpoint_to_load:
-        # <<< CHANGE: Pass scaler to restore_from_checkpoint >>>
-        step, last_train_loss, scheduler_restored = restore_from_checkpoint(
-            model, optimizer, lr_scheduler, scaler, checkpoint_to_load, device, is_distributed, logger
+    if checkpoint_path_to_attempt_restore:
+        current_epoch_step, last_avg_train_loss_epoch, scheduler_state_restored = restore_from_checkpoint(
+            model, optimizer, lr_scheduler, scaler, str(checkpoint_path_to_attempt_restore), device,
+            is_distributed, logger
         )
-        # <<< END CHANGE >>>
-        if is_master: logger.info(f"Restored training state from {checkpoint_to_load} to step {step}.")
-    elif startwith:
-        logger.warning(f"Start checkpoint specified ({startwith}) but not found. Starting from scratch.")
-    else:
-        if is_master: logger.info("No checkpoint found or specified. Starting training from scratch.")
+        if is_master: logger.info(
+            f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
+            f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}")
+    elif startwith: # Specified checkpoint not found
+        logger.warning(f"'startwith' checkpoint {startwith} not found. Starting fresh.")
+    else: # No checkpoint found at all
+        if is_master: logger.info("No checkpoint found in output directory. Starting training from scratch (epoch 0).")
 
-    log_csv_path = output_dir_path / 'log.csv'
-    if is_master and os.path.exists(log_csv_path):
+    # Load progress from log.csv if it exists
+    log_csv_path = output_dir_path / 'progress_log.csv'
+    if is_master and log_csv_path.exists():
         try:
-            loaded_df = pd.read_csv(log_csv_path)
-            if 'epoch' not in loaded_df.columns and loaded_df.index.name == 'epoch':
-                loaded_df.reset_index(inplace=True)
-            loaded_df['epoch'] = pd.to_numeric(loaded_df['epoch'], errors='coerce')
-            loaded_df.dropna(subset=['epoch'], inplace=True)
-            loaded_df['epoch'] = loaded_df['epoch'].astype(int)
+            # Load, ensuring 'epoch' is the index or a column
+            loaded_progress_df = pd.read_csv(log_csv_path)
+            if 'epoch' in loaded_progress_df.columns:
+                 loaded_progress_df.set_index('epoch', inplace=True, drop=False) # Keep epoch as col
+            elif loaded_progress_df.index.name == 'epoch':
+                 loaded_progress_df['epoch'] = loaded_progress_df.index # Ensure epoch is a column
+            
+            # Filter to include only epochs up to the restored current_epoch_step
+            if current_epoch_step > 0 :
+                progress_df = loaded_progress_df[loaded_progress_df['epoch'] <= current_epoch_step].copy()
+            else: # if current_epoch_step is 0 (fresh start or error in restore)
+                progress_df = pd.DataFrame(columns=progress_log_columns) # Start fresh DF
 
-            progress_df = loaded_df[loaded_df['epoch'] <= step].copy()
-            for metric_name in validation_metrics:
-                col = f'validation_{metric_name}'
-                if col in progress_df.columns:
-                    numeric_col = pd.to_numeric(progress_df[col], errors='coerce')
-                    val_metrics_history[metric_name] = numeric_col.dropna().tolist()
-
-            logger.info(f"Loaded previous progress from {log_csv_path} up to step {step}")
+            # Repopulate val_metrics_history from loaded progress_df
+            for metric_key in validation_metrics:
+                col_name = f'validation_{metric_key}'
+                if col_name in progress_df.columns:
+                    # Convert to numeric, coerce errors to NaN, then drop NaNs before list conversion
+                    metric_values = pd.to_numeric(progress_df[col_name], errors='coerce').dropna().tolist()
+                    if metric_values: # Only if list is not empty
+                        val_metrics_history[metric_key] = metric_values
+            logger.info(f"Loaded training progress from {log_csv_path} up to epoch {current_epoch_step}.")
         except Exception as e:
-            logger.warning(f"Could not load or parse progress from {log_csv_path}: {e}. Starting log fresh.")
-            progress_df = pd.DataFrame(columns=columns)
-            val_metrics_history = defaultdict(list)
+            logger.warning(f"Could not load or parse {log_csv_path}: {e}. Starting progress log fresh.", exc_info=True)
+            progress_df = pd.DataFrame(columns=progress_log_columns) # Reset on error
+            val_metrics_history = defaultdict(list) # Reset on error
 
-    def save_and_log_step(current_step, current_loss):
-        nonlocal progress_df, val_metrics_history
+    # --- Inner function for saving state and logging metrics for an epoch ---
+    def _run_val_and_log_epoch_state(epoch_num_completed, avg_train_loss_this_epoch):
+        nonlocal progress_df, val_metrics_history # Allow modification of outer scope vars
 
-        _val_metrics_epoch = {}
-        run_validation_this_step = (current_step % validation_epochs == 0)
+        # --- Validation ---
+        current_val_metrics = {} # Metrics for this specific validation run
+        # Run validation only on master or if validation_epochs criteria met
+        # DDP eval_epoch handles aggregation, so all ranks call it, but only master logs verbosely
+        should_run_validation = (epoch_num_completed % validation_epochs == 0) or (epoch_num_completed == 0 and not val_metrics_history) # Also run on epoch 0 if no history
 
-        if run_validation_this_step:
-            if is_master: logger.info(f"Running validation for step {current_step}...")
-            _val_metrics_epoch = eval_epoch(model, val_loader, val_baseline_log_likelihood, device, metrics=validation_metrics, is_distributed=is_distributed, is_master=is_master, logger=logger)
-            if is_master: logger.info(f"Validation results step {current_step}: {_val_metrics_epoch}")
-        else:
-            if is_master: logger.info(f"Skipping validation for step {current_step}.")
-            for m in validation_metrics: _val_metrics_epoch[m] = np.nan
+        if should_run_validation:
+            if is_master: logger.info(f"--- Running Validation for Epoch {epoch_num_completed} ---")
+            current_val_metrics = eval_epoch(
+                model, val_loader, val_baseline_log_likelihood, device,
+                metrics=validation_metrics, is_distributed=is_distributed,
+                is_master=is_master, logger=logger
+            )
+            if is_master:
+                log_str = f"Validation Epoch {epoch_num_completed} Results: "
+                for k_metric, v_metric in current_val_metrics.items(): log_str += f"{k_metric}: {v_metric:.4f} | "
+                logger.info(log_str.strip(" | "))
+                # Append to history for finding best later (only if not NaN)
+                for k_metric, v_metric in current_val_metrics.items():
+                    if not np.isnan(v_metric): val_metrics_history[k_metric].append(v_metric)
+        else: # Not a validation epoch, fill with NaNs for logging
+            if is_master: logger.info(f"Skipping validation for epoch {epoch_num_completed} (validation_epochs={validation_epochs}).")
+            for m_key in validation_metrics: current_val_metrics[m_key] = np.nan
 
+        # --- Logging and Checkpointing (Master Only) ---
         if is_master:
-            if run_validation_this_step:
-                for key, value in _val_metrics_epoch.items():
-                    if not np.isnan(value):
-                        val_metrics_history[key].append(value)
-
-            if writer:
+            # TensorBoard Logging
+            if tb_writer:
                 try:
-                    if not np.isnan(current_loss): writer.add_scalar('Loss/train', current_loss, current_step)
-                    lr = optimizer.param_groups[0]['lr']
-                    writer.add_scalar('Meta/learning_rate', lr, current_step)
-                    m = model.module if is_distributed else model
-                    # Access finalizer parameters safely
-                    finalizer = getattr(m, 'finalizer', None)
-                    if finalizer:
-                        gauss = getattr(finalizer, 'gauss', None)
-                        if gauss and hasattr(gauss, 'sigma'):
-                            try:
-                                writer.add_scalar('Params/sigma', gauss.sigma.item(), current_step)
-                            except Exception: pass # Ignore if sigma is not a tensor or item fails
-                        cb_weight = getattr(finalizer, 'center_bias_weight', None)
-                        if cb_weight is not None:
-                            try:
-                                writer.add_scalar('Params/center_bias_weight', cb_weight.item(), current_step)
-                            except Exception: pass # Ignore if not tensor or item fails
+                    if not np.isnan(avg_train_loss_this_epoch): tb_writer.add_scalar('Loss/Train_Epoch_Avg', avg_train_loss_this_epoch, epoch_num_completed)
+                    current_lr_tb = optimizer.param_groups[0]['lr']
+                    tb_writer.add_scalar('Meta/Learning_Rate', current_lr_tb, epoch_num_completed)
+                    
+                    # Log model-specific parameters like sigma, center_bias_weight
+                    # This requires model to be the unwrapped one for DDP
+                    unwrapped_model_tb = model.module if is_distributed else model
+                    if hasattr(unwrapped_model_tb, 'finalizer') and unwrapped_model_tb.finalizer is not None:
+                        finalizer_tb = unwrapped_model_tb.finalizer
+                        if hasattr(finalizer_tb, 'gauss') and hasattr(finalizer_tb.gauss, 'sigma'):
+                            tb_writer.add_scalar('Params/Finalizer_Sigma', finalizer_tb.gauss.sigma.item(), epoch_num_completed)
+                        if hasattr(finalizer_tb, 'center_bias_weight'):
+                            tb_writer.add_scalar('Params/Finalizer_CenterBiasWeight', finalizer_tb.center_bias_weight.item(), epoch_num_completed)
+                    
+                    # Log SPADE MLP parameters (e.g., norm of weights/biases) - more advanced
+                    # Example: if hasattr(unwrapped_model_tb, 'saliency_network'):
+                    #   if hasattr(unwrapped_model_tb.saliency_network, 'spade_ln0'):
+                    #     tb_writer.add_scalar('Params/SPADE_LN0_gamma_mlp_bias_norm', unwrapped_model_tb.saliency_network.spade_ln0.mlp_gamma.bias.norm().item(), epoch_num_completed)
 
-                    for key, value in _val_metrics_epoch.items():
-                        if not np.isnan(value): writer.add_scalar(f'Val/{key}', value, current_step)
-                except Exception as tb_err:
-                    logger.error(f"Error writing to TensorBoard: {tb_err}")
 
-            new_row_data = {
-                'epoch': current_step,
-                'timestamp': datetime.utcnow().isoformat(),
-                'learning_rate': optimizer.param_groups[0]['lr'],
-                'loss': current_loss
-            }
-            for key, value in _val_metrics_epoch.items():
-                new_row_data[f'validation_{key}'] = value
+                    for k_metric, v_metric in current_val_metrics.items():
+                        if not np.isnan(v_metric): tb_writer.add_scalar(f'Validation/{k_metric}', v_metric, epoch_num_completed)
+                except Exception as e_tb:
+                    logger.error(f"Error writing to TensorBoard for epoch {epoch_num_completed}: {e_tb}", exc_info=True)
 
-            if current_step in progress_df['epoch'].values:
-                progress_df = progress_df[progress_df['epoch'] != current_step]
-
+            # Pandas DataFrame Log
+            new_log_row_dict = {'epoch': epoch_num_completed,
+                                'timestamp': datetime.utcnow().isoformat(),
+                                'learning_rate': optimizer.param_groups[0]['lr'],
+                                'train_loss': avg_train_loss_this_epoch}
+            for k_metric, v_metric in current_val_metrics.items():
+                new_log_row_dict[f'validation_{k_metric}'] = v_metric
+            
+            # Append or update row in DataFrame
+            # Avoid duplicate epoch entries if resuming and re-evaluating
+            progress_df = progress_df[progress_df['epoch'] != epoch_num_completed] # Remove old entry if exists
+            new_row_df_entry = pd.DataFrame([new_log_row_dict])
+            progress_df = pd.concat([progress_df, new_row_df_entry], ignore_index=True).sort_values(by='epoch')
+            
             try:
-                new_row_df = pd.DataFrame([new_row_data])
-                progress_df = pd.concat([progress_df, new_row_df], ignore_index=True)
-                progress_df.reset_index(drop=True, inplace=True)
-            except Exception as df_err:
-                logger.error(f"Error updating progress DataFrame: {df_err}")
+                with atomic_save(str(log_csv_path), text_mode=True, overwrite_part=True) as f_csv:
+                    progress_df.to_csv(f_csv, index=False)
+                logger.info(f"Progress log saved to {log_csv_path} for epoch {epoch_num_completed}.")
+            except Exception as e_csv:
+                logger.error(f"Failed to save progress log {log_csv_path}: {e_csv}", exc_info=True)
 
-            logger.info(f"Step {current_step} Summary:\n{progress_df.iloc[-1:].to_string()}")
+            logger.info(f"Epoch {epoch_num_completed} Summary (master):\n{progress_df[progress_df['epoch'] == epoch_num_completed].to_string()}")
 
-            best_val_step = -1
-            best_val_score = np.nan
-            validation_metric_col = f'validation_{validation_metric}'
-            if validation_metric_col in progress_df.columns and not progress_df[validation_metric_col].isnull().all():
-                progress_df[validation_metric_col] = pd.to_numeric(progress_df[validation_metric_col], errors='coerce')
-                # Determine if higher is better based on common metrics
-                higher_is_better = validation_metric in ['IG', 'AUC_CPU', 'AUC_GPU', 'NSS']
-                if higher_is_better:
-                    best_val_score = progress_df[validation_metric_col].max(skipna=True)
-                else: # Assume lower is better (e.g., LL)
-                    best_val_score = progress_df[validation_metric_col].min(skipna=True)
+            # --- Checkpoint Saving ---
+            # Save checkpoint for the current epoch
+            current_epoch_ckpt_path = output_dir_path / f'step-{epoch_num_completed:04d}.pth'
+            save_training_state(model, optimizer, lr_scheduler, scaler,
+                                epoch_num_completed, avg_train_loss_this_epoch,
+                                str(current_epoch_ckpt_path), is_distributed, is_master, logger)
 
-                if not np.isnan(best_val_score):
-                    # Find the first epoch that achieved the best score
-                    matching_epochs = progress_df.loc[progress_df[validation_metric_col] == best_val_score, 'epoch']
-                    if not matching_epochs.empty:
-                        best_val_step = int(matching_epochs.iloc[0])
-                        logger.info(f"Best validation ({validation_metric}) score so far {best_val_score:.5f} occurred at step {best_val_step}")
-
-            chkpt_path = output_dir_path / f'step-{current_step:04d}.pth'
-            # Pass scaler to save its state
-            save_training_state(model, optimizer, lr_scheduler, scaler, current_step, current_loss, str(chkpt_path), is_distributed, is_master, logger = logger)
-
-
-            try:
-                with atomic_save(str(log_csv_path), text_mode=True, overwrite_part=True) as f:
-                    progress_df.to_csv(f, index=False)
-            except Exception as e:
-                logger.exception(f"Failed to save progress log {log_csv_path}")
-
-            # Clean up old checkpoints, keeping current and best validation
-            all_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
-            for cp_path in all_checkpoints:
+            # Determine best validation epoch so far
+            best_val_epoch_num = -1
+            if validation_metric_col_name := f'validation_{validation_metric}': # Python 3.8+
+                if validation_metric_col_name in progress_df.columns and not progress_df[validation_metric_col_name].dropna().empty:
+                    # Decide if higher is better (common for IG, NSS, AUC) or lower (LL)
+                    higher_is_better = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU', 'AUC_GPU']
+                    valid_scores_series = pd.to_numeric(progress_df[validation_metric_col_name], errors='coerce').dropna()
+                    
+                    if not valid_scores_series.empty:
+                        if higher_is_better:
+                            best_score_so_far = valid_scores_series.max()
+                        else:
+                            best_score_so_far = valid_scores_series.min()
+                        
+                        # Get epoch corresponding to the first occurrence of the best score
+                        best_epoch_candidates = progress_df.loc[pd.to_numeric(progress_df[validation_metric_col_name], errors='coerce') == best_score_so_far, 'epoch']
+                        if not best_epoch_candidates.empty:
+                            best_val_epoch_num = int(best_epoch_candidates.iloc[0])
+                            logger.info(f"Best validation score ({validation_metric}: {best_score_so_far:.4f}) so far was at epoch {best_val_epoch_num}.")
+            
+            # Clean up old checkpoints, keeping current and best validation one
+            all_intermediate_ckpts = sorted(output_dir_path.glob('step-*.pth'))
+            for ckpt_p in all_intermediate_ckpts:
                 try:
-                    cp_step = int(cp_path.stem.split('-')[1])
-                    # Keep current step and best validation step (if valid)
-                    if cp_step != current_step and (best_val_step == -1 or cp_step != best_val_step):
-                        cp_path.unlink()
-                        logger.debug(f"Removed old checkpoint: {cp_path}")
-                except (ValueError, IndexError, OSError) as e:
-                    logger.warning(f"Could not parse step or remove checkpoint {cp_path}: {e}")
+                    ckpt_epoch_num = int(ckpt_p.stem.split('-')[1])
+                    if ckpt_epoch_num != epoch_num_completed and ckpt_epoch_num != best_val_epoch_num:
+                        ckpt_p.unlink()
+                        logger.debug(f"Removed old intermediate checkpoint: {ckpt_p}")
+                except (ValueError, IndexError, OSError) as e_rm:
+                    logger.warning(f"Could not parse or remove old checkpoint {ckpt_p}: {e_rm}")
+        # --- End Master Only Block ---
+        
+        # All ranks need to have the same val_metrics_history if it's used for LR scheduler decisions based on val performance
+        # However, typically lr_scheduler.step() is called without direct val metric input (e.g. MultiStepLR)
+        # If using ReduceLROnPlateau, then val metric needs to be synced. For now, assume not.
 
-    needs_initial_eval = False
+    # --- Initial Evaluation if Resuming or Starting Fresh ---
+    # If current_epoch_step is 0 (fresh start) or if the loaded progress_df doesn't have this epoch.
+    needs_initial_evaluation_flag = False
     if is_master:
-        if step == 0 or (step > 0 and step not in progress_df['epoch'].values):
-            logger.info(f"Step {step} needs initial evaluation.")
-            needs_initial_eval = True
-
+        # Run initial validation if epoch 0 or if this epoch's data isn't in the loaded log
+        if current_epoch_step == 0 or \
+           (not progress_df.empty and current_epoch_step not in progress_df['epoch'].values) or \
+           (progress_df.empty and current_epoch_step > 0) : # Resumed but log was empty/corrupt
+            logger.info(f"Running initial evaluation/log for (restored) epoch {current_epoch_step}.")
+            needs_initial_evaluation_flag = True
+            
     if is_distributed:
-        needs_initial_eval_tensor = torch.tensor(int(needs_initial_eval), device=device, dtype=torch.int)
-        dist.broadcast(needs_initial_eval_tensor, src=0)
-        needs_initial_eval = bool(needs_initial_eval_tensor.item())
+        initial_eval_tensor = torch.tensor(int(needs_initial_evaluation_flag), device=device, dtype=torch.int)
+        dist.broadcast(initial_eval_tensor, src=0)
+        needs_initial_evaluation_flag = bool(initial_eval_tensor.item())
 
-    if needs_initial_eval:
-        save_and_log_step(step, last_train_loss)
-
-    if step > 0 and scheduler_restored:
-        try:
-            # lr_scheduler.step() # Step was already called at the end of the last completed epoch
-            # We only need to ensure the scheduler's internal state (_step_count) is correct.
-            # Most PyTorch schedulers handle this correctly when state_dict is loaded.
-            # If using a custom scheduler, might need manual adjustment here.
-            if is_master: logger.info(f"LR scheduler state restored for step {step}. Will step at end of next epoch.")
-        except Exception as e:
-            logger.error(f"Error checking scheduler after restore: {e}")
-    elif step > 0 and not scheduler_restored:
-        if is_master: logger.warning(f"Restored to step {step}, but scheduler state was not restored. Scheduler starts fresh.")
+    if needs_initial_evaluation_flag:
+        # last_avg_train_loss_epoch would be from checkpoint, or NaN if fresh start
+        _run_val_and_log_epoch_state(current_epoch_step, last_avg_train_loss_epoch)
 
 
-    if is_master: logger.info("Starting training loop...")
-    while True:
-        current_lr = optimizer.param_groups[0]['lr']
-        if current_lr < minimum_learning_rate:
-            if is_master: logger.info(f"Learning rate ({current_lr:.2e}) reached minimum ({minimum_learning_rate:.2e}). Stopping training.")
-            break
+    # Adjust LR scheduler if state was restored and it's not a fresh start
+    if current_epoch_step > 0 and scheduler_state_restored:
+        # If MultiStepLR, loading state_dict correctly sets its last_epoch.
+        # No explicit step needed here; it will step correctly after the *next* completed epoch.
+        if is_master: logger.info(f"LR scheduler state was restored. Current LR: {optimizer.param_groups[0]['lr']:.2e}")
+    elif current_epoch_step > 0 and not scheduler_state_restored:
+        # If resumed but scheduler wasn't restored, "fast-forward" the scheduler
+        # This is tricky and depends on scheduler type. For MultiStepLR, could call step() multiple times.
+        # Simpler: warn and let it run from its fresh state.
+        if is_master: logger.warning(f"Resumed from epoch {current_epoch_step} but scheduler state NOT restored. Scheduler starts fresh.")
 
-        step += 1
-        epoch_start_time = datetime.now()
 
+    # --- Main Training Loop ---
+    if is_master: logger.info(f"--- Starting Training Loop from Epoch {current_epoch_step + 1} ---")
+    
+    # Loop continues as long as LR is above minimum
+    # current_epoch_step is the number of *completed* epochs. So loop starts with next one.
+    epoch_to_run = current_epoch_step + 1
+
+    while optimizer.param_groups[0]['lr'] >= minimum_learning_rate:
+        if is_master: logger.info(f"--- Beginning Epoch {epoch_to_run} (LR: {optimizer.param_groups[0]['lr']:.2e}) ---")
+        
+        # Set epoch for DistributedSampler (important for shuffling)
         if is_distributed and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(step)
+            train_loader.sampler.set_epoch(epoch_to_run)
             if hasattr(val_loader, 'sampler') and hasattr(val_loader.sampler, 'set_epoch'):
-                val_loader.sampler.set_epoch(step) # Sync validation sampler too
+                val_loader.sampler.set_epoch(epoch_to_run) # Also for validation sampler if used
 
-        if is_master: logger.info(f"--- Starting Epoch {step} (LR: {current_lr:.2e}) ---")
-        # Pass scaler and gradient_accumulation_steps to train_epoch
-        last_train_loss = train_epoch(
+        epoch_start_time_actual = datetime.now()
+        
+        # Train one epoch
+        avg_train_loss_this_epoch = train_epoch(
             model, train_loader, optimizer, device, scaler,
             gradient_accumulation_steps, is_distributed, is_master, logger
         )
+        
         if is_master:
-            epoch_duration = datetime.now() - epoch_start_time
-            if np.isnan(last_train_loss):
-                logger.warning(f"Epoch {step} finished with NaN loss. Duration: {epoch_duration}")
+            epoch_duration_actual = datetime.now() - epoch_start_time_actual
+            if np.isnan(avg_train_loss_this_epoch):
+                logger.warning(f"Epoch {epoch_to_run} finished with NaN training loss. Duration: {epoch_duration_actual}")
             else:
-                logger.info(f"Epoch {step} finished. Rank 0 Avg Train Loss: {last_train_loss:.5f}. Duration: {epoch_duration}")
+                logger.info(f"Epoch {epoch_to_run} training finished. Avg Train Loss (Rank 0): {avg_train_loss_this_epoch:.5f}. Duration: {epoch_duration_actual}")
 
-        save_and_log_step(step, last_train_loss)
+        # Save state, run validation, log metrics for the completed epoch
+        _run_val_and_log_epoch_state(epoch_to_run, avg_train_loss_this_epoch)
+        
+        # Step the LR scheduler *after* completing an epoch and logging its state
+        # Only step if the epoch was successfully processed (e.g., loss wasn't NaN causing early exit for this iter)
+        if not np.isnan(avg_train_loss_this_epoch): # Or some other flag indicating successful epoch
+            try:
+                # For schedulers like ReduceLROnPlateau, you'd pass a validation metric here.
+                # e.g., if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                #     val_metric_for_scheduler = current_val_metrics.get(validation_metric, float('inf')) # or -float('inf')
+                #     lr_scheduler.step(val_metric_for_scheduler)
+                # else: # For MultiStepLR, CosineAnnealingLR, etc.
+                lr_scheduler.step()
+            except Exception as e_lr_step:
+                logger.error(f"Error stepping LR scheduler at end of epoch {epoch_to_run}: {e_lr_step}", exc_info=True)
+        else:
+            if is_master: logger.warning(f"Skipping LR scheduler step for epoch {epoch_to_run} due to invalid training loss.")
 
-        try:
-            # Step scheduler AFTER saving checkpoint for the current epoch
-            lr_scheduler.step()
-        except Exception as e:
-            logger.error(f"Error stepping scheduler at end of step {step}: {e}")
-
+        epoch_to_run += 1 # Increment for the next iteration
+    # --- End Training Loop ---
 
     if is_master:
-        logger.info("Training loop finished.")
+        logger.info("Training loop finished (LR below minimum or other condition).")
+        # Final save of the model (usually the one from the last step, not necessarily best val)
+        final_model_path = output_dir_path / 'final_model_at_lr_cutoff.pth'
         try:
-            final_path = output_dir_path / 'final.pth'
-            model_to_save = model.module if is_distributed else model
-            # Save only the model state_dict for the final model
-            torch.save(model_to_save.state_dict(), str(final_path))
-            logger.info(f"Final model state dict saved to {final_path}")
-        except Exception as e:
-            logger.exception("Failed to save final model state dict")
+            model_to_save_final = model.module if is_distributed else model
+            torch.save(model_to_save_final.state_dict(), str(final_model_path))
+            logger.info(f"Final model state_dict (at LR cutoff) saved to {final_model_path}")
+        except Exception as e_final_save:
+            logger.error(f"Failed to save final model state_dict: {e_final_save}", exc_info=True)
 
-        # --- Find and copy best validation checkpoint ---
-        best_val_step = -1
-        best_val_score = np.nan
-        validation_metric_col = f'validation_{validation_metric}'
-        if validation_metric_col in progress_df.columns and not progress_df[validation_metric_col].isnull().all():
-            progress_df[validation_metric_col] = pd.to_numeric(progress_df[validation_metric_col], errors='coerce')
-            higher_is_better = validation_metric in ['IG', 'AUC_CPU', 'AUC_GPU', 'NSS']
-            if higher_is_better:
-                best_val_score = progress_df[validation_metric_col].max(skipna=True)
-            else:
-                best_val_score = progress_df[validation_metric_col].min(skipna=True)
-            if not np.isnan(best_val_score):
-                matching_epochs = progress_df.loc[progress_df[validation_metric_col] == best_val_score, 'epoch']
-                if not matching_epochs.empty:
-                    best_val_step = int(matching_epochs.iloc[0]) # Take the first epoch that hit best score
+        # Find and copy/link the best validation checkpoint as 'final_best_val.pth'
+        # This logic is already inside _run_val_and_log_epoch_state for cleaning up,
+        # but we can re-run it here to ensure the best one is explicitly saved/copied.
+        best_val_epoch_num_final = -1
+        best_val_score_final = np.nan
+        validation_metric_col_name_final = f'validation_{validation_metric}'
+        if validation_metric_col_name_final in progress_df.columns and not progress_df[validation_metric_col_name_final].dropna().empty:
+            higher_is_better_final = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU', 'AUC_GPU']
+            valid_scores_series_final = pd.to_numeric(progress_df[validation_metric_col_name_final], errors='coerce').dropna()
+            if not valid_scores_series_final.empty:
+                best_score_final = valid_scores_series_final.max() if higher_is_better_final else valid_scores_series_final.min()
+                best_epoch_candidates_final = progress_df.loc[pd.to_numeric(progress_df[validation_metric_col_name_final], errors='coerce') == best_score_final, 'epoch']
+                if not best_epoch_candidates_final.empty:
+                    best_val_epoch_num_final = int(best_epoch_candidates_final.iloc[0])
+                    best_val_score_final = best_score_final # Store the actual score
 
-        if best_val_step > 0:
-            best_chkpt_path = output_dir_path / f'step-{best_val_step:04d}.pth'
-            if best_chkpt_path.exists():
-                final_best_path = output_dir_path / 'final_best_val.pth'
+        if best_val_epoch_num_final > 0:
+            best_epoch_ckpt_path_final = output_dir_path / f'step-{best_val_epoch_num_final:04d}.pth'
+            if best_epoch_ckpt_path_final.exists():
+                final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
                 try:
-                    # Load the full checkpoint data
-                    best_data = torch.load(best_chkpt_path, map_location='cpu', weights_only=False)
-                    # Save only the model state_dict from the best checkpoint
-                    if 'model' in best_data:
-                        model_state = best_data['model']
-                        torch.save(model_state, str(final_best_path))
-                        logger.info(f"Saved best validation model state dict (Step {best_val_step}, Score: {best_val_score:.5f}) to {final_best_path}")
-                    else:
-                        logger.error(f"Best checkpoint {best_chkpt_path} does not contain 'model' key.")
+                    # Load the model state_dict from the best checkpoint
+                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu') # Load to CPU
+                    if 'model' in best_ckpt_data:
+                        torch.save(best_ckpt_data['model'], str(final_best_val_model_path))
+                        logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}) to {final_best_val_model_path}")
+                    else: # If checkpoint is just a state_dict
+                        torch.save(best_ckpt_data, str(final_best_val_model_path))
+                        logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}, from raw state_dict) to {final_best_val_model_path}")
 
-                    # Optional: Copy full best checkpoint as well
-                    # shutil.copyfile(str(best_chkpt_path), str(output_dir_path / 'full_best_val.pth'))
-                    # logger.info(f"Copied full best validation checkpoint (Step {best_val_step}) to {output_dir_path / 'full_best_val.pth'}")
-
-                except Exception as e:
-                    logger.exception(f"Failed to save/copy best checkpoint model state {best_chkpt_path}")
+                except Exception as e_best_save:
+                    logger.error(f"Failed to save/copy best validation model from {best_epoch_ckpt_path_final}: {e_best_save}", exc_info=True)
             else:
-                logger.warning(f"Best validation checkpoint file {best_chkpt_path} not found, cannot save best model separately.")
+                logger.warning(f"Best validation checkpoint file {best_epoch_ckpt_path_final} not found. Cannot save 'final_best_val_model.pth'.")
+        else:
+            logger.warning(f"No best validation epoch found in progress log for metric '{validation_metric}'.")
 
-        # Optional cleanup of remaining step checkpoints
-        # for step_file in output_dir_path.glob('step-*.pth'):
-        #      try: step_file.unlink()
-        #      except OSError as e: logger.error(f"Failed to remove final intermediate checkpoint {step_file}: {e}")
 
-        if writer:
-            writer.close()
-
+        # Close TensorBoard writer
+        if tb_writer:
+            try:
+                tb_writer.close()
+            except Exception as e_tb_close:
+                logger.error(f"Error closing TensorBoard writer: {e_tb_close}")
+    
+    # Final barrier for DDP if used
     if is_distributed:
-        # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
-        dist.barrier() # Removed device_ids
+        dist.barrier()
+    logger.info(f"{current_rank_str} finished _train function.")
