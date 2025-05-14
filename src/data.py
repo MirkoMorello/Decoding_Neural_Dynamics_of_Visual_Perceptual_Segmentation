@@ -159,6 +159,89 @@ class ImageDataset(torch.utils.data.Dataset):
         return len(self.stimuli)
 
 
+
+class ImageDatasetWithSegmentation(ImageDataset):
+    def __init__(self, *args, segmentation_mask_dir=None, segmentation_mask_format="png", **kwargs):
+        super().__init__(*args, **kwargs) # Initialize the OriginalImageDataset
+        
+        self.segmentation_mask_dir = Path(segmentation_mask_dir) if segmentation_mask_dir else None
+        self.segmentation_mask_format = segmentation_mask_format
+        if self.segmentation_mask_dir and not self.segmentation_mask_dir.exists():
+            print(f"Warning: Segmentation mask directory does not exist: {self.segmentation_mask_dir}")
+        print(f"ImageDatasetWithSegmentation initialized. Mask dir: {self.segmentation_mask_dir}")
+
+    def __getitem__(self, key):
+        # 1. Get the data item from the parent class (OriginalImageDataset)
+        # This `original_item` will have 'image' and 'centerbias' as numpy arrays (C,H,W and H,W respectively),
+        # and 'x', 'y' as numpy arrays of coordinates.
+        # If a transform was set in OriginalImageDataset, it would have been applied by super().__getitem__
+        original_item = super().__getitem__(key)
+
+        # 2. Prepare the item for PyTorch model consumption (convert relevant fields to Tensors)
+        # The FixationMaskTransform already converts 'fixation_mask' to a tensor.
+        # We need to ensure 'image' and 'centerbias' are tensors.
+        # 'x' and 'y' are popped by FixationMaskTransform, so they don't need to be tensors here.
+        
+        final_item = {}
+        if isinstance(original_item['image'], np.ndarray):
+            final_item['image'] = torch.from_numpy(original_item['image'].copy()) # Ensure it's a tensor
+        else: # If transform already made it a tensor
+            final_item['image'] = original_item['image']
+
+        if isinstance(original_item['centerbias'], np.ndarray):
+            final_item['centerbias'] = torch.from_numpy(original_item['centerbias'].copy())
+        else:
+            final_item['centerbias'] = original_item['centerbias']
+        
+        # Weight should be a tensor for loss calculation
+        final_item['weight'] = torch.tensor(original_item.get('weight', 1.0), dtype=torch.float32)
+
+        # If FixationMaskTransform was applied by parent, 'fixation_mask' is already in original_item
+        if 'fixation_mask' in original_item:
+            final_item['fixation_mask'] = original_item['fixation_mask']
+        
+        # Copy any other items that might have been added by transform or were already there
+        for k, v in original_item.items():
+            if k not in final_item and k not in ['x', 'y', 'image', 'centerbias', 'weight']: # x,y are handled by transform
+                final_item[k] = v
+
+
+        # 3. Load and add the segmentation mask
+        if self.segmentation_mask_dir:
+            n = key # For ImageDataset, key is the stimulus index (passed to parent)
+            # self.stimuli is inherited from OriginalImageDataset
+            stimulus_filename_abs = self.stimuli.filenames[n] 
+            img_basename = Path(stimulus_filename_abs).stem
+            mask_fname = f"{img_basename}.{self.segmentation_mask_format}"
+            mask_path_full = self.segmentation_mask_dir / mask_fname
+
+            if mask_path_full.exists():
+                try:
+                    if self.segmentation_mask_format == "png":
+                        mask_pil = Image.open(mask_path_full).convert('L')
+                        mask_arr = np.array(mask_pil)
+                    elif self.segmentation_mask_format == "npy":
+                        mask_arr = np.load(mask_path_full)
+                    else:
+                        raise ValueError(f"Unsupported mask format: {self.segmentation_mask_format}")
+                    final_item['segmentation_mask'] = torch.from_numpy(mask_arr.astype(np.int64))
+                except Exception as e:
+                    print(f"Warning: Error loading segmentation mask {mask_path_full}: {e}. Using dummy mask.")
+                    img_h, img_w = final_item['image'].shape[1], final_item['image'].shape[2] # Use tensor shape
+                    final_item['segmentation_mask'] = torch.zeros((img_h, img_w), dtype=torch.long)
+            else:
+                print(f"Warning: Segmentation mask not found: {mask_path_full}. Using dummy mask.")
+                img_h, img_w = final_item['image'].shape[1], final_item['image'].shape[2]
+                final_item['segmentation_mask'] = torch.zeros((img_h, img_w), dtype=torch.long)
+        else:
+            # If no segmentation_mask_dir, create a dummy mask
+            print("Warning: No segmentation mask directory provided. Using dummy mask.")
+            img_h, img_w = final_item['image'].shape[1], final_item['image'].shape[2]
+            final_item['segmentation_mask'] = torch.zeros((img_h, img_w), dtype=torch.long)
+            
+        return final_item
+
+
 class FixationDataset(torch.utils.data.Dataset):
     def __init__(
         self,

@@ -426,3 +426,117 @@ class FlexibleScanpathHistoryEncoding(nn.Module):
             results[valid_indices] += this_result
 
         return results
+
+
+class SPADELayerNorm(nn.Module):
+    def __init__(self, norm_features, segmap_input_channels,
+                 hidden_mlp_channels=128, eps=1e-12, kernel_size=3):
+        """
+        Spatially-Adaptive Layer Normalization.
+        Normalizes the input feature map 'x' and then modulates it using
+        parameters generated from the 'segmap'.
+        The base normalization is LayerNorm over (C, H, W) dimensions.
+
+        Args:
+            norm_features (int): Number of channels (C) in the input feature map 'x'
+                                 that will be normalized.
+            segmap_input_channels (int): Number of channels in the input segmentation map.
+                                         This could be:
+                                         - 1 if segmap is (B, 1, H_seg, W_seg) with raw integer labels.
+                                         - K if segmap is one-hot encoded for K classes (B, K, H_seg, W_seg).
+                                         - Embedding dimension if integer labels are first passed through nn.Embedding.
+            hidden_mlp_channels (int): Number of hidden channels in the SPADE MLP.
+            eps (float): Epsilon for the base LayerNorm.
+            kernel_size (int): Kernel size for the convolutional layers in the SPADE MLP.
+        """
+        super().__init__()
+        self.norm_features = norm_features
+        self.eps = eps
+        self.segmap_input_channels = segmap_input_channels
+
+        padding = kernel_size // 2
+
+        # SPADE MLP: processes the segmentation map to produce modulation parameters
+        # This MLP needs to handle the segmap_input_channels correctly.
+        # If segmap_input_channels is large (e.g., from one-hot encoding a large K),
+        # the first conv might be a bottleneck. Consider an initial 1x1 conv to reduce
+        # channels if segmap_input_channels is very high.
+        # For now, assuming segmap_input_channels is manageable (e.g., 1 or a small embedding dim).
+
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(self.segmap_input_channels, hidden_mlp_channels,
+                      kernel_size=kernel_size, padding=padding, bias=True),
+            nn.ReLU(inplace=True) # Consider inplace=False if any issues arise
+        )
+        # Output 2 * norm_features channels: norm_features for gamma, norm_features for beta
+        self.mlp_gamma = nn.Conv2d(hidden_mlp_channels, norm_features,
+                                   kernel_size=kernel_size, padding=padding, bias=True)
+        self.mlp_beta = nn.Conv2d(hidden_mlp_channels, norm_features,
+                                  kernel_size=kernel_size, padding=padding, bias=True)
+
+    def forward(self, x, segmap):
+        """
+        Args:
+            x (torch.Tensor): Input feature map. Shape: (B, C, H, W),
+                              where C should be self.norm_features.
+            segmap (torch.Tensor): Segmentation map.
+                                   Shape: (B, K, H_seg, W_seg) or (B, H_seg, W_seg).
+                                   K is segmap_input_channels (if > 1) or it's unsqueezed.
+                                   H_seg, W_seg can be different from H, W (will be resized).
+
+        Returns:
+            torch.Tensor: Modulated output feature map. Shape: (B, C, H, W).
+        """
+        if x.shape[1] != self.norm_features:
+            raise ValueError(f"Input feature map channel count ({x.shape[1]}) "
+                             f"does not match norm_features ({self.norm_features}).")
+
+        # --- 1. Base Layer Normalization (Parameter-Free) ---
+        # LayerNorm is applied over the last D dimensions. For (B,C,H,W) input,
+        # and normalizing over (C,H,W), normalized_shape is (C, H, W).
+        normalized_shape = (self.norm_features, x.size(2), x.size(3))
+        # Apply F.layer_norm without learnable elementwise affine parameters
+        normalized_x = F.layer_norm(x, normalized_shape, weight=None, bias=None, eps=self.eps)
+
+        # --- 2. Prepare Segmentation Map for SPADE MLP ---
+        # Ensure segmap has a channel dimension for Conv2d
+        if segmap.ndim == 3: # (B, H_seg, W_seg) - typical for raw integer masks
+            segmap_for_conv = segmap.unsqueeze(1).float() # (B, 1, H_seg, W_seg)
+        elif segmap.ndim == 4: # (B, K, H_seg, W_seg) - e.g., one-hot or embedded
+            segmap_for_conv = segmap.float()
+        else:
+            raise ValueError(f"Unsupported segmap ndim: {segmap.ndim}. Expected 3 or 4.")
+
+        if segmap_for_conv.shape[1] != self.segmap_input_channels:
+             # This might happen if segmap is (B,1,H,W) but self.segmap_input_channels was set assuming embedding
+             # Or if segmap is (B,H,W) and segmap_input_channels != 1
+            print(f"Warning: segmap_for_conv channels ({segmap_for_conv.shape[1]}) "
+                  f"mismatch SPADELayerNorm.segmap_input_channels ({self.segmap_input_channels}). "
+                  f"Ensure segmap preprocessing (e.g., nn.Embedding) is done before this layer if needed.")
+            # If segmap_input_channels expects more (e.g. from an embedding layer)
+            # and segmap_for_conv is just (B,1,H,W), this will error in mlp_shared.
+            # For now, proceed, but this is a key point for integration.
+
+
+        # Resize segmap spatially to match the feature map 'x'
+        # Using 'nearest' interpolation is crucial for segmentation masks to preserve labels
+        # if they were categorical, though here we just need spatial alignment.
+        segmap_resized = F.interpolate(segmap_for_conv, size=x.size()[2:], mode='nearest')
+
+        # --- 3. Generate SPADE Modulation Parameters (gamma, beta) ---
+        shared_features = self.mlp_shared(segmap_resized)
+        gamma_map = self.mlp_gamma(shared_features) # Shape: (B, norm_features, H, W)
+        beta_map = self.mlp_beta(shared_features)   # Shape: (B, norm_features, H, W)
+
+        # --- 4. Apply Modulation ---
+        # The common SPADE formulation: gamma modulates around 1.
+        # Output = normalized_x * (1 + gamma_map) + beta_map
+        # Another option is: Output = normalized_x * gamma_map + beta_map
+        # Let's use the (1 + gamma) version as it's often more stable initially.
+        out = normalized_x * (1 + gamma_map) + beta_map
+
+        return out
+
+    def extra_repr(self):
+        return (f'norm_features={self.norm_features}, '
+                f'segmap_input_channels={self.segmap_input_channels}, eps={self.eps}')
