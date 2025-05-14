@@ -5,24 +5,22 @@ import os
 import pickle
 import random
 import shutil
-import numpy
-
+from pathlib import Path
 from boltons.iterutils import chunked
 import lmdb
 import numpy as np
 from PIL import Image
 import pysaliency
-from pysaliency.datasets import create_subset
 from pysaliency.utils import remove_trailing_nans
 import torch
 from tqdm import tqdm
-
+import torch.distributed as dist
+from imageio.v3 import imread, imwrite
 from torch.utils.data import Sampler, RandomSampler, BatchSampler
 import numpy as np
-import math
-import itertools
 import torch
-
+import cloudpickle as cpickle
+import json
 
 def ensure_color_image(image):
     if len(image.shape) == 2:
@@ -547,3 +545,382 @@ def _get_image_data_from_lmdb(lmdb_env, n):
     image = image.transpose(2, 0, 1)
 
     return image, centerbias_prediction
+
+
+
+def prepare_spatial_dataset(
+    stimuli,
+    fixations,
+    centerbias,
+    batch_size: int,        # This is the PER-GPU batch size
+    num_workers: int,
+    is_distributed: bool,
+    is_master: bool,
+    device: torch.device,
+    path: Path | None = None,
+    current_epoch: int = 0, # Added: current epoch for DistributedSampler
+):
+    """
+    Prepares the DataLoader for spatial (image-based) saliency prediction,
+    handling DDP with shape-aware batching correctly.
+    """
+    # ----------  LMDB bookkeeping  ----------
+    lmdb_path_str = str(path) if path else None
+    if lmdb_path_str:
+        if is_master:
+            try:
+                if path: path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Using LMDB cache for spatial dataset at: {lmdb_path_str}")
+            except OSError as e:
+                logger.error(f"Failed to create LMDB directory {path}: {e}")
+                lmdb_path_str = None # Fallback
+        if is_distributed:
+            # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
+            dist.barrier() # Simplified barrier call
+
+    # ----------  build Full Dataset ----------
+    full_dataset = ImageDataset(
+        stimuli=stimuli,
+        fixations=fixations,
+        centerbias_model=centerbias,
+        transform=FixationMaskTransform(sparse=False), # Use dense masks
+        average="image", # Average fixations per image
+        lmdb_path=lmdb_path_str,
+    )
+
+    loader: torch.utils.data.DataLoader # Type hint
+
+    # ----------  choose samplers and build DataLoader ----------
+    if is_distributed:
+        # DDP Path:
+        # 1. Create a DistributedSampler for the full dataset.
+        distributed_sampler = torch.utils.data.DistributedSampler(
+            full_dataset,
+            shuffle=True,
+            drop_last=True
+        )
+        # CRITICAL: Set the epoch for the DistributedSampler
+        distributed_sampler.set_epoch(current_epoch)
+
+        # 2. Create a Subset of the full_dataset for the current rank.
+        rank_subset_indices = list(iter(distributed_sampler))
+        rank_dataset_subset = torch.utils.data.Subset(full_dataset, rank_subset_indices)
+
+        # 3. Use ImageDatasetSampler on this rank-specific subset.
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            data_source=rank_dataset_subset, # Operates on the subset for this rank
+            batch_size=batch_size,           # Per-GPU batch size
+            shuffle=True                     # Shuffle items within the subset before batching by shape
+        )
+        # Optional: if ImageDatasetSampler has its own epoch setting
+        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
+        #     shape_aware_batch_sampler.set_epoch(current_epoch)
+
+        # 4. Create the DataLoader for DDP
+        loader = torch.utils.data.DataLoader(
+            rank_dataset_subset,
+            batch_sampler=shape_aware_batch_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+    else:
+        # Non-Distributed Path (Single GPU or CPU):
+        # Use ImageDatasetSampler on the full dataset directly.
+        batch_sampler_single_gpu = ImageDatasetSampler(
+            full_dataset,
+            batch_size=batch_size,
+            shuffle=True # Assuming this enables shuffling within ImageDatasetSampler
+        )
+        # Optional: if ImageDatasetSampler has its own epoch setting
+        # if hasattr(batch_sampler_single_gpu, 'set_epoch'):
+        #    batch_sampler_single_gpu.set_epoch(current_epoch)
+
+        loader = torch.utils.data.DataLoader(
+            full_dataset,
+            batch_sampler=batch_sampler_single_gpu,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
+    return loader
+
+
+def prepare_scanpath_dataset(
+    stimuli,
+    fixations,
+    centerbias,
+    batch_size: int,        # This is the PER-GPU batch size
+    num_workers: int,
+    is_distributed: bool,
+    is_master: bool,
+    device: torch.device,   # device is kept for consistency, used by barrier
+    path: Path | None = None,
+    current_epoch: int = 0, # Added: current epoch for DistributedSampler
+    logger = None,       # Added: logger for error messages
+):
+    """
+    Prepares the DataLoader for scanpath prediction (fixation-based),
+    handling DDP with shape-aware batching correctly.
+    """
+    lmdb_path_str = str(path) if path else None
+    if lmdb_path_str:
+        if is_master:
+            try:
+                if path: path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Using LMDB cache for scanpath dataset at: {lmdb_path_str}")
+            except OSError as e:
+                logger.error(f"Failed to create LMDB directory {path}: {e}")
+                lmdb_path_str = None # Fallback
+        if is_distributed:
+            # The original barrier call didn't use device_ids if device was CPU.
+            # dist.barrier(device_ids=[device.index] if device.type == 'cuda' else None)
+            dist.barrier() # Simplified barrier call as in your provided code
+
+    # 1. Create the full dataset instance
+    full_dataset = FixationDataset(
+        stimuli=stimuli,
+        fixations=fixations,
+        centerbias_model=centerbias,
+        included_fixations=[-1, -2, -3, -4],
+        allow_missing_fixations=True,
+        transform=FixationMaskTransform(sparse=False),
+        average="image",
+        lmdb_path=lmdb_path_str,
+    )
+
+    loader: torch.utils.data.DataLoader # Type hint for clarity
+
+    if is_distributed:
+        # DDP Path:
+        # 2. Create a DistributedSampler for the full dataset.
+        #    drop_last=True is important for consistent batch counts across GPUs when using Subset.
+        distributed_sampler = torch.utils.data.DistributedSampler(
+            full_dataset,
+            shuffle=True,       # Shuffles the global list of indices
+            drop_last=True      # Ensures all GPUs get the same number of samples
+        )
+        # CRITICAL: Set the epoch for the DistributedSampler for proper shuffling each epoch
+        distributed_sampler.set_epoch(current_epoch)
+
+        # 3. Create a Subset of the full_dataset for the current rank.
+        #    iter(distributed_sampler) yields the indices assigned to the current rank.
+        rank_subset_indices = list(iter(distributed_sampler))
+        rank_dataset_subset = torch.utils.data.Subset(full_dataset, rank_subset_indices)
+
+        # 4. Use ImageDatasetSampler on this rank-specific subset.
+        #    It will perform shape-aware batching ONLY on the data for this GPU.
+        #    Set shuffle=True if ImageDatasetSampler should shuffle items within the
+        #    rank's subset before forming shape-compatible batches.
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            data_source=rank_dataset_subset, # Operates on the subset for this rank
+            batch_size=batch_size,           # Per-GPU batch size
+            shuffle=True                     # Shuffle items within the subset before batching by shape
+        )
+        # Optional: if ImageDatasetSampler itself has epoch-aware internal shuffling
+        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
+        #     shape_aware_batch_sampler.set_epoch(current_epoch)
+
+        # 5. Create the DataLoader for DDP
+        loader = torch.utils.data.DataLoader(
+            rank_dataset_subset,        # Use the subset for this rank
+            batch_sampler=shape_aware_batch_sampler, # Custom batch sampler
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+            # drop_last is effectively handled by ImageDatasetSampler and DistributedSampler(drop_last=True)
+        )
+    else:
+        # Non-Distributed Path (Single GPU or CPU):
+        # Use ImageDatasetSampler on the full dataset directly, as in your "before" code.
+        # This assumes ImageDatasetSampler's shuffle=True handles epoch shuffling correctly
+        # for the non-DDP case, or that you call set_epoch on it if available.
+        batch_sampler_single_gpu = ImageDatasetSampler(
+            full_dataset,
+            batch_size=batch_size,
+            shuffle=True  # Assuming this enables shuffling within ImageDatasetSampler
+        )
+        # Optional: if ImageDatasetSampler itself has epoch-aware internal shuffling
+        # if hasattr(batch_sampler_single_gpu, 'set_epoch'):
+        #    batch_sampler_single_gpu.set_epoch(current_epoch)
+
+        loader = torch.utils.data.DataLoader(
+            full_dataset,
+            batch_sampler=batch_sampler_single_gpu,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
+    return loader
+
+# -----------------------------------------------------------------------------
+# MIT Data Conversion Functions (Copied from original with DDP modifications)
+# -----------------------------------------------------------------------------
+# ── shared size helper ─────────────────────────────────────────────
+def target_size(h_orig, w_orig):          # returns (width, height)
+    if h_orig < w_orig:                   # landscape
+        return 1024, 768
+    else:                                 # portrait or square
+        return 768, 1024
+
+
+
+def convert_stimulus(input_image):
+    h, w = input_image.shape[:2]
+    new_w, new_h = target_size(h, w)      # <- use helper
+    return np.array(
+        Image.fromarray(input_image).resize((new_w, new_h), Image.BILINEAR)
+    )
+
+
+def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed: bool, device: torch.device, logger = None):
+    """ Converts all stimuli in a FileStimuli object to standard sizes and saves them. """
+    assert isinstance(stimuli, pysaliency.FileStimuli)
+    new_stimuli_location = new_location / 'stimuli'
+    if is_master:
+        try:
+            new_stimuli_location.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Converting stimuli resolution and saving to {new_stimuli_location}...")
+        except OSError as e:
+            logger.critical(f"Failed to create stimuli conversion directory {new_stimuli_location}: {e}")
+            return None
+
+    new_filenames = []
+    filenames_iterable = tqdm(stimuli.filenames, desc="Converting Stimuli", disable=not is_master)
+    conversion_errors = 0
+
+    for filename in filenames_iterable:
+        try:
+            stimulus = imread(filename)
+            if stimulus.ndim == 2:
+                stimulus = np.stack([stimulus]*3, axis=-1)
+            elif stimulus.shape[2] == 1:
+                stimulus = np.concatenate([stimulus]*3, axis=-1)
+            elif stimulus.shape[2] == 4:
+                stimulus = stimulus[:,:,:3]
+            if stimulus.shape[2] != 3:
+                if is_master: logger.warning(f"Skipping stimulus {filename} with unexpected shape {stimulus.shape}")
+                conversion_errors += 1
+                continue
+            new_stimulus = convert_stimulus(stimulus)
+            basename = os.path.basename(filename)
+            new_filename = new_stimuli_location / basename
+            if is_master:
+                # Store original shape in the JSON metadata if using FileStimuli's save method
+                # Or, handle metadata storage separately if needed.
+                if new_stimulus.shape != stimulus.shape or not new_filename.exists():
+                    try: imwrite(new_filename, new_stimulus)
+                    except Exception as e: logger.error(f"Failed to write {new_filename}: {e}"); conversion_errors +=1; continue
+                elif not new_filename.exists():
+                    try: shutil.copy(filename, new_filename)
+                    except Exception as e: logger.error(f"Failed to copy {filename} to {new_filename}: {e}"); conversion_errors += 1; continue
+            new_filenames.append(str(new_filename.resolve()))   # <- absolute
+        except Exception as read_err:
+            if is_master: logger.exception(f"Failed to read or process stimulus {filename}")
+            conversion_errors += 1
+            continue
+
+    if is_master and conversion_errors > 0:
+        logger.warning(f"Encountered {conversion_errors} errors during stimuli conversion.")
+
+    # synchronize if distributed
+    if is_distributed:
+        dist.barrier()
+
+    # persist cache and metadata
+    if is_master:
+        with open(new_location / "stimuli.pkl", "wb") as f:
+            cpickle.dump(pysaliency.FileStimuli(new_filenames), f, protocol=pickle.HIGHEST_PROTOCOL)
+        meta = {
+            "filenames": new_filenames,
+            "shapes":    [list(s) for s in pysaliency.FileStimuli(new_filenames).shapes],
+        }
+        with open(new_location / "stimuli.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+    # return a FileStimuli made from the *string* paths
+    return pysaliency.FileStimuli(new_filenames)
+
+
+
+
+def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
+                            fixations: pysaliency.FixationTrains,
+                            is_master: bool,
+                            logger) -> pysaliency.ScanpathFixations:
+    """
+    Rescale MIT‑1003 FixationTrains to 1024×768 / 768×1024 and return
+    a pysaliency.ScanpathFixations object **with correct history & time‑stamps**.
+    """
+
+    # -------------- 1. pre‑compute per‑stimulus scale factors --------------
+    orig_h = np.array([h for h, w, _ in stimuli.shapes])
+    orig_w = np.array([w for h, w, _ in stimuli.shapes])
+    tgt_w  = np.where(orig_h < orig_w, 1024, 768)
+    tgt_h  = np.where(orig_h < orig_w,  768,1024)
+    sx     = tgt_w / orig_w
+    sy     = tgt_h / orig_h
+
+    # -------------- 2. walk every scan‑path -------------------------------
+    new_xs, new_ys, new_ts  = [], [], []
+    new_x_hist, new_y_hist, new_dur = [], [], []
+
+    skipped = 0
+    for xs, ys, ts, ns in zip(fixations.train_xs,
+                              fixations.train_ys,
+                              fixations.train_ts,
+                              fixations.train_ns):
+
+        f_sx, f_sy = sx[ns], sy[ns]                       # scalar
+        xs_ = np.clip(xs * f_sx, 0, tgt_w[ns]-1e-6)
+        ys_ = np.clip(ys * f_sy, 0, tgt_h[ns]-1e-6)
+
+        new_xs.append(xs_)
+        new_ys.append(ys_)
+
+        # ---------- timestamps ----------
+        if ts is None or len(ts)==0:
+            new_ts.append(np.full_like(xs_, np.nan))
+        else:
+            new_ts.append(np.asarray(ts, dtype=float))
+
+        # ---------- scan‑path history ----------
+        # history arrays are (n_fixations, 4, 2) in MIT1003; scale both coordinates
+        if hasattr(fixations, "x_hist"):
+            hist_x = np.clip(fixations.x_hist[skipped] * f_sx, 0, tgt_w[ns]-1e-6)
+            hist_y = np.clip(fixations.y_hist[skipped] * f_sy, 0, tgt_h[ns]-1e-6)
+            new_x_hist.append(hist_x)
+            new_y_hist.append(hist_y)
+
+        if hasattr(fixations, "durations"):
+            new_dur.append(fixations.durations[skipped].copy())
+
+        skipped += 1
+
+    # -------------- 3. assemble pysaliency.Scanpaths -----------------------
+    scanpaths = pysaliency.Scanpaths(xs=new_xs, ys=new_ys, ts=new_ts,
+                                     n=fixations.train_ns,
+                                     scanpath_attributes={"subject": fixations.train_subjects})
+
+    # add optional arrays if we have them
+    if new_x_hist:  scanpaths.x_hist = new_x_hist
+    if new_y_hist:  scanpaths.y_hist = new_y_hist
+    if new_dur:     scanpaths.durations = new_dur
+
+    # -------------- 4. sanity‑check & return ------------------------------
+    xx = np.concatenate(new_xs)
+    yy = np.concatenate(new_ys)
+    assert (xx >= 0).all() and (yy >= 0).all(), "negative coords after scaling!"
+    assert (xx < tgt_w.max()).all() and (yy < tgt_h.max()).all(), "coords out of bounds!"
+
+    if is_master:
+        logger.info(f"✅ converted {len(scanpaths)} scan‑paths "
+                     f"({xx.size:,} fixations total)")
+
+    return pysaliency.ScanpathFixations(scanpaths=scanpaths)
