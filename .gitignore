@@ -22,6 +22,7 @@ parts/
 sdist/
 var/
 wheels/
+masks/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
