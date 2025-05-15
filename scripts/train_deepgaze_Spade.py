@@ -24,6 +24,8 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet201 # IMPORTANT
+import numpy as np
+import math
 
 import pysaliency
 import pysaliency.external_datasets.mit # Ensure this can be imported
@@ -37,14 +39,14 @@ try:
     # Data handling classes (ensure ImageDatasetWithSegmentation is defined in data_utils.py)
     from src.data import (
         ImageDatasetWithSegmentation, # Key change
-        OriginalImageDataset, # If you kept the original name as this
+        ImageDataset, # If you kept the original name as this
         FixationMaskTransform,
         # The prepare_... functions might need adaptation to pass segmentation_mask_dir
         # For now, we'll instantiate datasets directly in main for this script
         convert_stimuli, convert_fixation_trains # If used for MIT preprocessing
     )
     # Original DeepGaze modules and layers that we will reuse
-    from src.modules import DeepGazeIII, FeatureExtractor, DeepGazeII, FeatureExtractor, Finalizer
+    from src.modules import DeepGazeIII, FeatureExtractor, DeepGazeII, FeatureExtractor, Finalizer, encode_scanpath_features, build_fixation_selection_network, build_scanpath_network
     from src.layers import (
         Bias, LayerNorm, LayerNormMultiInput,
         Conv2dMultiInput, FlexibleScanpathHistoryEncoding, SelfAttention
@@ -215,38 +217,136 @@ class SaliencyNetworkSPADE(nn.Module):
         h = self.bias2(h)
         h = self.softplus2(h)
         return h
-
-# --- Original Scanpath and Fixation Selection Networks (No SPADE here for now) ---
-def build_scanpath_network_original():
-    """ Builds the network processing scanpath history (original version). """
-    return nn.Sequential(OrderedDict([
-        ('encoding0', FlexibleScanpathHistoryEncoding(in_fixations=4, channels_per_fixation=3, out_channels=128, kernel_size=[1, 1], bias=True)),
-        ('softplus0', nn.Softplus()),
-        ('layernorm1', LayerNorm(128)),
-        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)),
-        ('bias1', Bias(16)),
-        ('softplus1', nn.Softplus()),
-    ]))
     
-def build_fixation_selection_network_original(scanpath_features=16):
-    """ Builds the network combining saliency and scanpath features (original version). """
-    saliency_channels = 1 # Output of saliency network's core path before combination
-    in_channels_list = [saliency_channels, scanpath_features if scanpath_features > 0 else 0]
-    # Filter out zero-channel inputs if any (original DeepGaze behavior)
-    in_channels_list_filtered = [ch for ch in in_channels_list if ch > 0]
+class DeepGazeIIISpade(nn.Module): # Renaming to avoid conflict with original
+    def __init__(self, features, saliency_network, scanpath_network, 
+                 fixation_selection_network, downsample=2, readout_factor=2, 
+                 saliency_map_factor=2, included_fixations=-2, initial_sigma=8.0,
+                 finalizer_learn_sigma=True): # Added finalizer_learn_sigma
+        super().__init__()
 
-    return nn.Sequential(OrderedDict([
-        # Note: LayerNormMultiInput and Conv2dMultiInput from deepgaze_pytorch handle list of features
-        ('layernorm0', LayerNormMultiInput(in_channels_list_filtered)),
-        ('conv0', Conv2dMultiInput(in_channels_list_filtered, 128, (1, 1), bias=False)),
-        ('bias0', Bias(128)),
-        ('softplus0', nn.Softplus()),
-        ('layernorm1', LayerNorm(128)),
-        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)),
-        ('bias1', Bias(16)),
-        ('softplus1', nn.Softplus()),
-        ('conv2', nn.Conv2d(16, 1, (1, 1), bias=False)), # Final output layer
-    ]))
+        self.downsample = downsample
+        self.readout_factor = readout_factor
+        # self.saliency_map_factor = saliency_map_factor # This is used by Finalizer
+        # self.included_fixations = included_fixations # Used by scanpath logic if any
+
+        self.features = features # This is your DenseNet+FeatureExtractor or DinoV2Backbone
+        if hasattr(self.features, 'parameters'): # Freeze backbone if it has parameters
+            for param in self.features.parameters():
+                param.requires_grad = False
+        if hasattr(self.features, 'eval'):
+            self.features.eval()
+
+        self.saliency_network = saliency_network # This will be your SaliencyNetworkSPADE instance
+        self.scanpath_network = scanpath_network
+        self.fixation_selection_network = fixation_selection_network
+
+        self.finalizer = Finalizer( # from deepgaze_pytorch.modules
+            sigma=initial_sigma,
+            learn_sigma=finalizer_learn_sigma, # Make this configurable
+            saliency_map_factor=saliency_map_factor,
+        )
+
+    def forward(self, image, centerbias, x_hist=None, y_hist=None, durations=None, 
+                segmentation_mask=None, # NEW: For SPADE
+                **kwargs): # For any other arguments from the batch
+        
+        orig_shape = image.shape # (B, C, H_orig, W_orig)
+
+        # 1. Feature Extraction
+        # Apply downsampling before feature extraction if specified
+        if self.downsample != 1:
+            img_for_features = F.interpolate(image, scale_factor=1.0 / self.downsample,
+                                             recompute_scale_factor=False, mode='bilinear', align_corners=False)
+        else:
+            img_for_features = image
+        
+        # self.features is your FeatureExtractor(RGBDenseNet201(), ...) or DinoV2Backbone()
+        # It should return a list of feature tensors
+        extracted_feature_maps = self.features(img_for_features)
+
+        # 2. Prepare features for readout network (resize & concatenate)
+        # Target spatial dimensions for features entering the readout heads
+        readout_h = math.ceil(orig_shape[2] / self.downsample / self.readout_factor)
+        readout_w = math.ceil(orig_shape[3] / self.downsample / self.readout_factor)
+        readout_spatial_shape = (readout_h, readout_w)
+
+        processed_features_list = []
+        for feat_map in extracted_feature_maps:
+            processed_features_list.append(
+                F.interpolate(feat_map, size=readout_spatial_shape, mode='bilinear', align_corners=False)
+            )
+        
+        concatenated_backbone_features = torch.cat(processed_features_list, dim=1)
+
+        # 3. Saliency Readout Head
+        # Here's the crucial part: check type and pass segmentation_mask
+        if segmentation_mask is None and isinstance(self.saliency_network, SaliencyNetworkSPADE):
+            # If SPADE network is used but no mask provided, create a dummy one or raise error
+            # For now, let's assume dummy mask handling is inside SaliencyNetworkSPADE or SPADELayerNorm
+            # or that the dataloader ALWAYS provides one (even if all zeros).
+            # The SaliencyNetworkSPADE expects the raw_segmap_long.
+            _logger = logging.getLogger(__name__) # Get a logger if not class member
+            _logger.warning("SaliencyNetworkSPADE used but no segmentation_mask provided to DeepGazeIIISpade.forward(). This might error or lead to unexpected behavior.")
+            # Create a dummy mask if absolutely necessary, but this should ideally be handled by dataloader
+            # b_dummy, _, h_dummy, w_dummy = image.shape # Use original image shape for dummy mask
+            # segmentation_mask = torch.zeros((b_dummy, h_dummy, w_dummy), dtype=torch.long, device=image.device)
+
+
+        if isinstance(self.saliency_network, SaliencyNetworkSPADE):
+            if segmentation_mask is None:
+                 raise ValueError("SaliencyNetworkSPADE requires a segmentation_mask, but None was provided.")
+            saliency_path_output = self.saliency_network(concatenated_backbone_features, segmentation_mask)
+        else: # Original saliency network (doesn't take seg_mask)
+            saliency_path_output = self.saliency_network(concatenated_backbone_features)
+
+        # 4. Scanpath Readout Head (if used)
+        scanpath_path_output = None
+        if self.scanpath_network is not None:
+            if x_hist is None or y_hist is None: # Should be handled by dataloader or training script
+                raise ValueError("Scanpath network is present, but x_hist or y_hist is None.")
+
+            # Encode scanpath features (e.g., distances, relative positions)
+            # The `encode_scanpath_features` helper needs to be available
+            scanpath_features_encoded = encode_scanpath_features(
+                x_hist, y_hist,
+                size=(orig_shape[2], orig_shape[3]), # Based on original image dimensions
+                device=image.device
+            )
+            # Resize scanpath features to match the readout spatial dimensions
+            scanpath_features_resized = F.interpolate(scanpath_features_encoded,
+                                                      size=readout_spatial_shape,
+                                                      mode='bilinear', align_corners=False)
+            
+            # If scanpath_network also becomes SPADE-enhanced in the future:
+            # if isinstance(self.scanpath_network, ScanpathNetworkSPADE): # Hypothetical
+            #     scanpath_path_output = self.scanpath_network(scanpath_features_resized, segmentation_mask)
+            # else: # Original scanpath network
+            scanpath_path_output = self.scanpath_network(scanpath_features_resized)
+        
+        # 5. Fixation Selection Network (combines saliency and scanpath outputs)
+        # The fixation_selection_network expects a tuple: (saliency_features, scanpath_features)
+        # scanpath_path_output will be None if self.scanpath_network is None.
+        # The original Conv2dMultiInput and LayerNormMultiInput handle None inputs in the tuple.
+        combined_input_for_fixsel = (saliency_path_output, scanpath_path_output)
+        final_readout_before_finalizer = self.fixation_selection_network(combined_input_for_fixsel)
+        
+        # 6. Finalizer (resizing, smoothing, centerbias, normalization)
+        saliency_log_density = self.finalizer(final_readout_before_finalizer, centerbias)
+        
+        return saliency_log_density
+
+    def train(self, mode=True): # From original DeepGazeIII
+        # Backbone features are frozen, so their mode doesn't change from eval
+        if hasattr(self.features, 'eval'): # Check if features module has eval method
+            self.features.eval()
+        
+        self.saliency_network.train(mode=mode)
+        if self.scanpath_network is not None:
+            self.scanpath_network.train(mode=mode)
+        self.fixation_selection_network.train(mode=mode)
+        self.finalizer.train(mode=mode) # Finalizer has learnable params (sigma, center_bias_weight)
+
 
 
 
@@ -309,12 +409,13 @@ def main(args):
 
     # --- Backbone Setup: DenseNet ---
     if is_master: _logger.info(f"Initializing RGBDenseNet201 backbone...")
-    densenet_base_model = RGBDenseNet201(pretrained=True if not args.densenet_weights_path else args.densenet_weights_path)
-    densenet_target_layers_for_extraction = args.densenet_target_layers # From argparse
-    C_in_densenet = args.densenet_C_in # Get from args, default to 2048
-    readout_factor_densenet = args.densenet_readout_factor # Get from args, default to 4 (as per your example)
+    densenet_base_model = RGBDenseNet201()
     saliency_map_factor_densenet = 4 # Standard, from your example
-    features_module = FeatureExtractor(densenet_base_model, densenet_target_layers_for_extraction)
+    features_module = FeatureExtractor(densenet_base_model, [
+                '1.features.denseblock4.denselayer32.norm1',
+                '1.features.denseblock4.denselayer32.conv1',
+                '1.features.denseblock4.denselayer31.conv2',
+            ])
     
     for param in features_module.parameters(): # Freezing the entire DenseNet
         param.requires_grad = False
@@ -366,7 +467,7 @@ def main(args):
                 _logger.info(f"Loaded cached TRAIN baseline LL from: {train_ll_cache_file}")
             except Exception:
                 _logger.warning(f"TRAIN LL cache miss or error. Computing...");
-                train_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_train_stimuli, SALICON_train_fixations, verbose=False, average='image')
+                train_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_train_stimuli, SALICON_train_fixations, verbose=True, average='image')
                 with open(train_ll_cache_file, 'wb') as f: cpickle.dump(train_baseline_log_likelihood, f)
                 _logger.info(f"Saved computed TRAIN baseline LL to: {train_ll_cache_file}")
             # Try loading cached val LL
@@ -375,7 +476,7 @@ def main(args):
                 _logger.info(f"Loaded cached VALIDATION baseline LL from: {val_ll_cache_file}")
             except Exception:
                 _logger.warning(f"VALIDATION LL cache miss or error. Computing...");
-                val_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_val_stimuli, SALICON_val_fixations, verbose=False, average='image')
+                val_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_val_stimuli, SALICON_val_fixations, verbose=True, average='image')
                 with open(val_ll_cache_file, 'wb') as f: cpickle.dump(val_baseline_log_likelihood, f)
                 _logger.info(f"Saved computed VALIDATION baseline LL to: {val_ll_cache_file}")
             _logger.info(f"Master Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
@@ -399,22 +500,22 @@ def main(args):
 
         # --- Build Model Components ---
         saliency_net_spade = SaliencyNetworkSPADE(
-            input_channels=C_in_densenet,
+            input_channels=2048,
             num_total_segments=args.num_total_segments,
             seg_embedding_dim=args.seg_embedding_dim,
             add_sa_head=args.add_sa_head
         )
         # For this experiment, scanpath network is None, and fixation selection uses original layers
-        scanpath_net = None # Or build_scanpath_network_original() if also testing scanpaths without SPADE
-        fixsel_net = build_fixation_selection_network_original(scanpath_features=0) # scanpath_features=0 as scanpath_net is None
+        scanpath_net = build_scanpath_network() # testing scanpaths without SPADE
+        fixsel_net = build_fixation_selection_network(scanpath_features=0) # scanpath_features=0 as scanpath_net is None
         
-        model = DeepGazeIII(
+        model = DeepGazeIIISpade(
             features=features_module, # Our DenseNetFeatureExtractor instance
             saliency_network=saliency_net_spade,
             scanpath_network=scanpath_net,
             fixation_selection_network=fixsel_net,
             downsample=1, # DenseNet features are already strided by backbone
-            readout_factor=readout_factor_densenet,
+            readout_factor=4,
             saliency_map_factor=saliency_map_factor_densenet, # Standard for DeepGaze finalizer
             included_fixations=[] # Spatial pretraining, no history
         ).to(device)
@@ -568,7 +669,7 @@ if __name__ == "__main__":
                         help='Subdirectory name under segmentation_mask_dir for validation set masks.')
     parser.add_argument('--segmentation_mask_format', default='png', choices=['png', 'npy'],
                         help='File format of the saved segmentation masks.')
-    parser.add_argument('--num_total_segments', type=int, default=17, # K_clusters + 1 if 0 is unused, or K if 0 is a segment
+    parser.add_argument('--num_total_segments', type=int, default=16, # K_clusters + 1 if 0 is unused, or K if 0 is a segment
                         help='Total number of unique segment IDs for nn.Embedding. If K-Means gives 0 to K-1, this should be K.')
     parser.add_argument('--seg_embedding_dim', type=int, default=64,
                         help='Dimension for the learned segment ID embeddings.')
