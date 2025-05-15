@@ -340,7 +340,7 @@ def main(args):
             elif is_master and args.unfreeze_vit_layers:
                 _logger.warning("Backbone unfreezing requested, but no unfrozen backbone parameters found for optimizer group.")
         optimizer = optim.Adam(param_groups, lr=args.lr)
-        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 30, 45, 60, 75, 90, 105, 120])
+        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 30, 45, 60])
 
         train_loader = prepare_spatial_dataset(SALICON_train_stimuli, SALICON_train_fixations, SALICON_centerbias, args.batch_size, args.num_workers, is_distributed, is_master, device, lmdb_directory / 'SALICON_train', _logger)
         validation_loader = prepare_spatial_dataset(SALICON_val_stimuli, SALICON_val_fixations, SALICON_centerbias, args.batch_size, args.num_workers, is_distributed, is_master, device, lmdb_directory / 'SALICON_val', _logger)
