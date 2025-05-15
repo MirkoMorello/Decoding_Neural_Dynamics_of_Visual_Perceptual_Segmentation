@@ -35,13 +35,13 @@ import contextlib # For model.no_sync()
 # Adjust paths if these are in deepgaze_pytorch and training.py is in src
 try:
     from .metrics import log_likelihood, nss, auc as auc_cpu_fn # Use your metrics
-    from deepgaze_pytorch.modules import DeepGazeII # Example, if used
+    from src.modules import DeepGazeII # Example, if used
     # If DeepGazeIII is also used for type hinting:
     # from deepgaze_pytorch.modules import DeepGazeIII
 except ImportError:
     # Fallback for direct execution or different structure
-    from metrics import log_likelihood, nss, auc as auc_cpu_fn
-    from deepgaze_pytorch.modules import DeepGazeII
+    from src.metrics import log_likelihood, nss, auc as auc_cpu_fn
+    from src.modules import DeepGazeII
 
 
 # baseline_performance = cached(LRU(max_size=3))(lambda model, *args, **kwargs: model.information_gain(*args, **kwargs))
