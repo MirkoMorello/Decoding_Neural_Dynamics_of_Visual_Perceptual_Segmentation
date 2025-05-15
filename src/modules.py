@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import GaussianFilterNd
+from .layers import GaussianFilterNd, Bias, LayerNorm, LayerNormMultiInput, Conv2dMultiInput, SelfAttention
+from collections import OrderedDict
 
 
 def encode_scanpath_features(x_hist, y_hist, size, device=None, include_x=True, include_y=True, include_duration=False):
@@ -48,6 +49,66 @@ def encode_scanpath_features(x_hist, y_hist, size, device=None, include_x=True, 
     distances = torch.sqrt(XS**2 + YS**2)
 
     return torch.cat((XS, YS, distances), axis=1)
+
+def build_saliency_network(input_channels, add_sa_head=False):
+    """ Builds the saliency prediction head network. """
+    layers = OrderedDict()
+
+    if add_sa_head:
+        # Add SelfAttention as the first layer
+        # NOTE: SelfAttention outputs the same number of channels as input by default.
+        layers['sa_head'] = SelfAttention(input_channels, key_channels=input_channels // 8, return_attention=False)
+        layers['layernorm_sa_out'] = LayerNorm(input_channels) # Normalize SA output
+        layers['softplus_sa_out'] = nn.Softplus() # Add non-linearity after SA
+
+    # Reduced complexity slightly given potentially richer ViT features
+    layers['layernorm0'] = LayerNorm(input_channels)
+    layers['conv0'] = nn.Conv2d(input_channels, 8, (1, 1), bias=False) # Increased capacity slightly
+    layers['bias0'] = Bias(8)
+    layers['softplus0'] = nn.Softplus()
+
+    layers['layernorm1'] = LayerNorm(8)
+    layers['conv1'] = nn.Conv2d(8, 16, (1, 1), bias=False) # Increased capacity slightly
+    layers['bias1'] = Bias(16)
+    layers['softplus1'] = nn.Softplus()
+
+    layers['layernorm2'] = LayerNorm(16)
+    layers['conv2'] = nn.Conv2d(16, 1, (1, 1), bias=False)
+    layers['bias2'] = Bias(1)
+    layers['softplus2'] = nn.Softplus() # Ensures non-negative output before final log-likelihood
+
+    return nn.Sequential(layers)
+
+
+def build_scanpath_network():
+    """ Builds the network processing scanpath history. """
+    return nn.Sequential(OrderedDict([
+        ('encoding0', FlexibleScanpathHistoryEncoding(in_fixations=4, channels_per_fixation=3, out_channels=128, kernel_size=[1, 1], bias=True)),
+        ('softplus0', nn.Softplus()),
+        ('layernorm1', LayerNorm(128)),
+        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)), # Output 16 channels
+        ('bias1', Bias(16)),
+        ('softplus1', nn.Softplus()),
+    ]))
+
+
+    
+def build_fixation_selection_network(scanpath_features=16):
+    """ Builds the network combining saliency and scanpath features for fixation selection. """
+    saliency_channels = 1 # Output of saliency network's core path before combination
+    in_channels_list = [saliency_channels, scanpath_features if scanpath_features > 0 else 0]
+
+    return nn.Sequential(OrderedDict([
+        ('layernorm0', LayerNormMultiInput(in_channels_list)), # Now gets [1, 0] or [1, 16]
+        ('conv0', Conv2dMultiInput(in_channels_list, 128, (1, 1), bias=False)), # Now gets [1, 0] or [1, 16]
+        ('bias0', Bias(128)),
+        ('softplus0', nn.Softplus()),
+        ('layernorm1', LayerNorm(128)),
+        ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)),
+        ('bias1', Bias(16)),
+        ('softplus1', nn.Softplus()),
+        ('conv2', nn.Conv2d(16, 1, (1, 1), bias=False)), # Final output layer
+    ]))
 
 class FeatureExtractor(torch.nn.Module):
     def __init__(self, features, targets):
