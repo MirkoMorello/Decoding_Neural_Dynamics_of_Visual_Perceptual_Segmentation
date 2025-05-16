@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import GaussianFilterNd, Bias, LayerNorm, LayerNormMultiInput, Conv2dMultiInput, SelfAttention
+from .layers import GaussianFilterNd, Bias, LayerNorm, LayerNormMultiInput, Conv2dMultiInput, SelfAttention, FlexibleScanpathHistoryEncoding
 from collections import OrderedDict
 
 
