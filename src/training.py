@@ -512,7 +512,7 @@ def restore_from_checkpoint(model, optimizer, scheduler, scaler, path, device,
 
     logger.info(f"Restoring checkpoint from: {path} (Distributed: {is_distributed})")
     try:
-        data = torch.load(path, map_location=device)
+        data = torch.load(path, map_location=device, weights_only=False)
         model_state_dict = data.get('model') if isinstance(data, dict) else data
         if model_state_dict is None and isinstance(data, dict): # If 'model' key is missing but it's a dict
              model_state_dict = data # Assume the dict itself is the state_dict (older format)
@@ -995,7 +995,7 @@ def _train(this_directory, model,
                 final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
                 try:
                     # Load the model state_dict from the best checkpoint
-                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu') # Load to CPU
+                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu', weights_only=False) # Load to CPU
                     if 'model' in best_ckpt_data:
                         torch.save(best_ckpt_data['model'], str(final_best_val_model_path))
                         logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}) to {final_best_val_model_path}")
