@@ -50,6 +50,7 @@ pyyaml = ">=6.0.2,<7"
 [pypi-dependencies]
 lmdb          = ">=1.6.2,<2"
 xformers      = "*"
+opencv-python = ">=4.11.0.86, <5"
 
 [pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu118"]
