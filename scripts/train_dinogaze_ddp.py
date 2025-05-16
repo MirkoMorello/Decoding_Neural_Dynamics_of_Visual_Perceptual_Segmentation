@@ -505,7 +505,7 @@ def main(args):
         else:
             _logger.info(f"Loading state_dict from {start_state_dict_path} (via CPU)")
             try:
-                previous_stage_state_dict = torch.load(start_state_dict_path, map_location="cpu")
+                previous_stage_state_dict = torch.load(start_state_dict_path, map_location="cpu", weights_only=False)
                 missing, unexpected = base_model.load_state_dict(previous_stage_state_dict, strict=False)
                 if is_master:
                     _logger.warning(f"Loaded previous stage state dict. Missing keys: {missing}")
