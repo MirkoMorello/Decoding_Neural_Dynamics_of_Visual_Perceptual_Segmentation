@@ -265,57 +265,112 @@ def run_mask_generation(config):
 
     print("Script finished.")
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main entry -- CLI + YAML handling (CLI overrides YAML)
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate segmentation masks using DinoV2+KMeans & build memmap banks.")
-    parser.add_argument('--config_file', type=str, default=None,
-                        help='Path to YAML configuration file. CLI args override YAML.')
 
-    # Define all arguments, they will serve as defaults if not in YAML or CLI
-    # Individual Mask Generation Args
-    parser.add_argument('--stimuli_location', type=str, help="Path to dataset (e.g., SALICON base dir).")
-    parser.add_argument('--dataset_name', type=str, choices=['SALICON_train', 'SALICON_val', 'MIT1003_twosize'], help="Dataset name.")
-    parser.add_argument('--output_dir', type=str, help="Directory to save individual generated masks.")
-    parser.add_argument('--dinov2_model_name', type=str, default='dinov2_vitl14', help="DINOv2 model name.")
-    parser.add_argument('--dinov2_patch_size', type=int, default=14, help="DINOv2 patch size.")
-    parser.add_argument('--dinov2_feature_layers_indices', type=int, nargs='+', default=[-1], help="DINOv2 layer indices.")
-    parser.add_argument('--num_segments', type=int, default=16, help="Number of K-Means segments (K).")
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help="Device.")
-    parser.add_argument('--file_format', type=str, default='png', choices=['png', 'npy'], help="Format for individual masks.")
-    parser.add_argument('--image_batch_size', type=int, default=1, help="Image batch size for DINOv2 (usually 1).")
-    parser.add_argument('--overwrite_individual_masks', action='store_true', help="Overwrite existing individual mask files.")
+    # ------------------------------------------------------------------
+    # 1. Tiny “pre-parser” – we only want to grab --config_file here
+    #    (Doing this avoids “conflicting option string” errors later.)
+    # ------------------------------------------------------------------
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument(
+        '--config_file', type=str, default=None,
+        help='YAML configuration file.  Values inside become defaults; '
+             'explicit CLI flags still win.'
+    )
+    _cfg, _remaining_cli = _pre.parse_known_args()   # _remaining_cli keeps *all*
+                                                    # other CLI arguments
 
-    # Mask Bank Building Args (Optional - if these are set, banks will be built)
-    parser.add_argument('--mask_bank_dtype', type=str, default='uint8', choices=['uint8', 'uint16'], help="Numpy dtype for mask bank storage.")
-    parser.add_argument('--build_fixed_size_bank_output_file', type=str, default=None, help="Output .npy file for fixed-size mask bank.")
-    parser.add_argument('--build_variable_size_bank_payload_file', type=str, default=None, help="Output payload .bin file for variable-size bank.")
-    parser.add_argument('--build_variable_size_bank_header_file', type=str, default=None, help="Output header .npy file for variable-size bank.")
+    # ------------------------------------------------------------------
+    # 2. Full parser (inherits the --config_file flag from the pre-parser)
+    # ------------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        parents=[_pre],
+        description=(
+            "Generate segmentation masks using DinoV2 + K-Means and optionally "
+            "package them into a mem-mapped mask bank."
+        )
+    )
 
-    # --- YAML Loading and Merging ---
-    temp_args, remaining_argv = parser.parse_known_args()
-    config_from_yaml = {}
-    if temp_args.config_file:
+    # ------------------------------------------------------------------
+    # 2a.  FULL SET OF ARGUMENTS  (same as your script)                  |
+    # ------------------------------------------------------------------
+    # Individual-mask generation
+    parser.add_argument('--stimuli_location', type=str,
+                        help="Path to dataset root (e.g. SALICON base dir).")
+    parser.add_argument('--dataset_name', type=str,
+                        choices=['SALICON_train', 'SALICON_val',
+                                 'MIT1003_twosize'],
+                        help="Which dataset split to process.")
+    parser.add_argument('--output_dir', type=str,
+                        help="Directory that receives the individual mask files.")
+
+    parser.add_argument('--dinov2_model_name', type=str,
+                        default='dinov2_vitl14')
+    parser.add_argument('--dinov2_patch_size', type=int, default=14)
+    parser.add_argument('--dinov2_feature_layers_indices', type=int, nargs='+',
+                        default=[-1],
+                        help="Indices of DinoV2 transformer blocks to take "
+                             "features from.")
+    parser.add_argument('--num_segments', type=int, default=16,
+                        help="K in K-Means.")
+    parser.add_argument('--device', type=str,
+                        default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--file_format', type=str, default='png',
+                        choices=['png', 'npy'],
+                        help="On-disk format for individual masks.")
+    parser.add_argument('--image_batch_size', type=int, default=1)
+    parser.add_argument('--overwrite_individual_masks', action='store_true',
+                        help="Re-generate existing individual mask files.")
+
+    # Mask-bank building
+    parser.add_argument('--mask_bank_dtype', type=str, default='uint8',
+                        choices=['uint8', 'uint16'],
+                        help="dtype for mem-mapped mask bank.")
+    parser.add_argument('--build_fixed_size_bank_output_file', type=str,
+                        help="If set, create a fixed-size bank (.npy).")
+    parser.add_argument('--build_variable_size_bank_payload_file', type=str,
+                        help="If set, create variable-size bank payload (.bin).")
+    parser.add_argument('--build_variable_size_bank_header_file', type=str,
+                        help="Header (.npy) for variable-size bank.")
+
+    # ------------------------------------------------------------------
+    # 3.  Read YAML and make its entries the *defaults*
+    # ------------------------------------------------------------------
+    if _cfg.config_file:
         try:
-            with open(temp_args.config_file, 'r') as f:
-                config_from_yaml = yaml.safe_load(f)
-            if config_from_yaml is None: config_from_yaml = {}
-            print(f"Loaded configuration from: {temp_args.config_file}")
-        except FileNotFoundError:
-            print(f"Warning: Config file {temp_args.config_file} not found. Using defaults/CLI args.")
+            with open(_cfg.config_file, 'r') as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+            print(f"📖  Loaded configuration from: {_cfg.config_file}")
+            # Everything from YAML becomes the new default
+            parser.set_defaults(**yaml_cfg)
         except Exception as e:
-            print(f"Error loading YAML config {temp_args.config_file}: {e}. Using defaults/CLI args.")
-    
-    # Set defaults from YAML for the parser
-    # CLI arguments provided in `remaining_argv` will override these defaults
-    parser.set_defaults(**config_from_yaml)
+            print(f"⚠️  Could not read YAML file '{_cfg.config_file}': {e}")
+            # we silently fall back to built-in defaults
 
-    # Final parse using YAML-updated defaults and any remaining CLI args
-    final_config_ns = parser.parse_args(remaining_argv)
-    final_config_dict = vars(final_config_ns) # Convert to dict for easier use in run_mask_generation
+    # ------------------------------------------------------------------
+    # 4.  Final parse – CLI flags now beat YAML/defaults
+    # ------------------------------------------------------------------
+    args = parser.parse_args(_remaining_cli)
+    cfg = vars(args)          # convert Namespace → dict for convenience
 
-    # --- Validate Required Arguments AFTER merging ---
-    required_args_for_individual_masks = ['stimuli_location', 'dataset_name', 'output_dir']
-    for req_arg in required_args_for_individual_masks:
-        if final_config_dict.get(req_arg) is None:
-            sys.exit(f"Error: Argument '{req_arg}' is required (either in YAML or CLI).")
+    # ------------------------------------------------------------------
+    # 5.  Minimal sanity-checking
+    # ------------------------------------------------------------------
+    _required = ('stimuli_location', 'dataset_name', 'output_dir')
+    missing = [k for k in _required if not cfg.get(k)]
+    if missing:
+        parser.error(f"Missing required argument(s): {', '.join(missing)}")
 
-    run_mask_generation(final_config_dict)
+    # (Optional) pretty-print the resolved configuration on first run
+    print("──────────── Effective configuration ────────────")
+    for k, v in sorted(cfg.items()):
+        print(f"{k:40s}: {v}")
+    print("──────────────────────────────────────────────────")
+
+    # ------------------------------------------------------------------
+    # 6.  Execute main routine
+    # ------------------------------------------------------------------
+    run_mask_generation(cfg)
