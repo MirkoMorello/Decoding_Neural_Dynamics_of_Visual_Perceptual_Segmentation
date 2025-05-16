@@ -12,6 +12,7 @@ project_root = os.path.dirname(os.path.dirname(current_script_path))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+import yaml # <--- Add this import
 import argparse
 import logging
 from pathlib import Path
@@ -303,14 +304,18 @@ class DeepGazeIIISpade(nn.Module): # Renaming to avoid conflict with original
         # 4. Scanpath Readout Head (if used)
         scanpath_path_output = None
         if self.scanpath_network is not None:
-            if x_hist is None or y_hist is None: # Should be handled by dataloader or training script
-                raise ValueError("Scanpath network is present, but x_hist or y_hist is None.")
-
-            # Encode scanpath features (e.g., distances, relative positions)
-            # The `encode_scanpath_features` helper needs to be available
+            # Ensure x_hist and y_hist are not empty tensors if scanpath_network is active
+            if x_hist.numel() == 0 or y_hist.numel() == 0: # Check if tensor is empty
+                # This case implies scanpath_network is active, but dataloader didn't provide history
+                # This should ideally not happen if dataset and model config are consistent.
+                raise ValueError(
+                    "Scanpath network is active, but x_hist or y_hist is an empty tensor. "
+                    "Ensure dataloader provides scanpath history for this configuration."
+                )
+            # Proceed with encoding only if x_hist and y_hist are valid (non-empty)
             scanpath_features_encoded = encode_scanpath_features(
                 x_hist, y_hist,
-                size=(orig_shape[2], orig_shape[3]), # Based on original image dimensions
+                size=(orig_shape[2], orig_shape[3]),
                 device=image.device
             )
             # Resize scanpath features to match the readout spatial dimensions
@@ -506,7 +511,7 @@ def main(args):
             add_sa_head=args.add_sa_head
         )
         # For this experiment, scanpath network is None, and fixation selection uses original layers
-        scanpath_net = build_scanpath_network() # testing scanpaths without SPADE
+        scanpath_net = None #build_scanpath_network() # testing scanpaths without SPADE
         fixsel_net = build_fixation_selection_network(scanpath_features=0) # scanpath_features=0 as scanpath_net is None
         
         model = DeepGazeIIISpade(
@@ -548,6 +553,8 @@ def main(args):
             _logger.info(f"Using VAL segmentation masks from: {val_mask_dir_full}")
             if not train_mask_dir_full.exists(): _logger.error(f"Train mask directory NOT FOUND: {train_mask_dir_full}")
             if not val_mask_dir_full.exists(): _logger.error(f"Validation mask directory NOT FOUND: {val_mask_dir_full}")
+            _logger.info(f"Segmentation mask caching: {'ENABLED' if args.cache_segmentation_masks else 'DISABLED'}")
+
 
         # LMDB path for images for SALICON (if you created one for DenseNet features)
         salicon_train_lmdb_path = lmdb_image_cache_dir / f'SALICON_train_images_{args.densenet_model_name}'
@@ -561,8 +568,13 @@ def main(args):
             average="image", # As per original DeepGaze pretraining
             segmentation_mask_dir=train_mask_dir_full,
             segmentation_mask_format=args.segmentation_mask_format,
-            lmdb_path=str(salicon_train_lmdb_path) if args.use_lmdb_images else None, # Optional LMDB for images
-            # cached = False # Usually false if using LMDB or large dataset
+            lmdb_path=str(salicon_train_lmdb_path) if args.use_lmdb_images else None,
+            # cached: Let ImageDataset decide or explicitly set False for large SALICON.
+            # If lmdb_path is provided, ImageDataset sets its internal `self.cached` to False for image/CB.
+            # cached=False, # Example: Explicitly disable parent image/CB caching for SALICON
+            
+            # --- THIS IS THE KEY CHANGE FOR MASK CACHING ---
+            cached_masks=args.cache_segmentation_masks
         )
         train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True)
                          if is_distributed else None)
@@ -582,15 +594,20 @@ def main(args):
             segmentation_mask_dir=val_mask_dir_full,
             segmentation_mask_format=args.segmentation_mask_format,
             lmdb_path=str(salicon_val_lmdb_path) if args.use_lmdb_images else None,
+            # cached=False, # Example for validation set as well
+            
+            # --- THIS IS THE KEY CHANGE FOR MASK CACHING ---
+            cached_masks=args.cache_segmentation_masks
         )
         val_sampler = (torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
                        if is_distributed else None)
         validation_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False, # Val batch size can often be larger
+            val_dataset, batch_size=args.batch_size, shuffle=False, 
             num_workers=args.num_workers, pin_memory=True, sampler=val_sampler,
             persistent_workers=args.num_workers > 0
         )
         if is_master: _logger.info(f"Validation Dataloader created. Num batches: {len(validation_loader)}")
+
 
         # --- Training ---
         # Construct a unique output directory name for this experiment
@@ -645,102 +662,132 @@ def main(args):
 
 
 # ============================================================================
-# == CLI ARGUMENT PARSER ==
+# == CLI ARGUMENT PARSER & YAML Loading ==
 # ============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DeepGazeIII with DenseNet Backbone and SPADE conditioning (Multi-GPU)")
-    
+    parser = argparse.ArgumentParser(description="Train DeepGazeIII with DenseNet+SPADE (Multi-GPU & YAML Config)")
+
+    # --- Special Argument for YAML Config File ---
+    parser.add_argument('--config_file', type=str, default=None,
+                        help='Path to a YAML configuration file. CLI args will override YAML values.')
+
+    # --- All your existing arguments ---
+    # (Define them here as before, so they can act as defaults or overrides)
     # --- Experiment Configuration ---
-    parser.add_argument('--stage', default='salicon_pretrain_densenet_spade',
-                        choices=['salicon_pretrain_densenet_spade',
+    parser.add_argument('--stage', choices=['salicon_pretrain_densenet_spade',
                                  'mit_spatial_densenet_spade',
                                  'mit_scanpath_frozen_densenet_spade',
                                  'mit_scanpath_full_densenet_spade'],
                         help='Training stage to execute.')
-    parser.add_argument('--densenet_model_name', default='densenet161', choices=['densenet161', 'densenet201'],
-                        help='DenseNet model variant from torchvision.')
-    
+    parser.add_argument('--densenet_model_name', choices=['densenet161', 'densenet201'],
+                        help='DenseNet model variant.')
+
     # --- SPADE Specific Arguments ---
-    parser.add_argument('--segmentation_mask_dir', required=True, type=str,
-                        help='Root directory containing precomputed segmentation masks (e.g., ./masks/).')
-    parser.add_argument('--train_mask_subdir_name', default='dinov2_kmeans_k16_salicon_train', type=str,
-                        help='Subdirectory name under segmentation_mask_dir for training set masks.')
-    parser.add_argument('--val_mask_subdir_name', default='dinov2_kmeans_k16_salicon_val', type=str,
-                        help='Subdirectory name under segmentation_mask_dir for validation set masks.')
-    parser.add_argument('--segmentation_mask_format', default='png', choices=['png', 'npy'],
-                        help='File format of the saved segmentation masks.')
-    parser.add_argument('--num_total_segments', type=int, default=16, # K_clusters + 1 if 0 is unused, or K if 0 is a segment
-                        help='Total number of unique segment IDs for nn.Embedding. If K-Means gives 0 to K-1, this should be K.')
-    parser.add_argument('--seg_embedding_dim', type=int, default=64,
-                        help='Dimension for the learned segment ID embeddings.')
+    parser.add_argument('--segmentation_mask_dir', type=str,
+                        help='Root directory for segmentation masks.')
+    parser.add_argument('--train_mask_subdir_name', type=str,
+                        help='Subdirectory for training set masks.')
+    parser.add_argument('--val_mask_subdir_name', type=str,
+                        help='Subdirectory for validation set masks.')
+    parser.add_argument('--segmentation_mask_format', choices=['png', 'npy'],
+                        help='File format of segmentation masks.')
+    parser.add_argument('--num_total_segments', type=int,
+                        help='Total number of unique segment IDs (K for K-Means 0 to K-1).')
+    parser.add_argument('--seg_embedding_dim', type=int, help='Dimension for segment embeddings.')
 
     # --- Training Hyperparameters ---
-    parser.add_argument('--batch_size', type=int, default=16, # DenseNet might need smaller BS than DINOv2
-                        help='Batch size *per GPU*. Effective batch size is batch_size * world_size * grad_accum.')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help='Number of forward passes to accumulate gradients before optimizer step.')
-    parser.add_argument('--lr', type=float, default=0.0005, help='Initial learning rate for the model head.')
-    parser.add_argument('--lr_milestones', type=int, nargs='+', default=[15, 30, 45],
-                        help='Epochs at which to decay learning rate for MultiStepLR.')
-    parser.add_argument('--min_lr', type=float, default=1e-7, help='Minimum learning rate threshold for scheduler.')
-    parser.add_argument('--fold', type=int, help='Cross-validation fold for MIT1003 stages (0-9).')
-    parser.add_argument('--validation_epochs', type=int, default=1, help='Run validation every N epochs.')
-    parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to a checkpoint to resume training from.')
+    parser.add_argument('--batch_size', type=int, help='Batch size *per GPU*.')
+    parser.add_argument('--gradient_accumulation_steps', type=int, help='Gradient accumulation steps.')
+    parser.add_argument('--lr', type=float, help='Initial learning rate.')
+    parser.add_argument('--lr_milestones', type=int, nargs='+', help='Epochs for LR decay.')
+    parser.add_argument('--min_lr', type=float, help='Minimum learning rate.')
+    parser.add_argument('--fold', type=int, help='Cross-validation fold for MIT1003 (0-9).')
+    parser.add_argument('--validation_epochs', type=int, help='Run validation every N epochs.')
+    parser.add_argument('--resume_checkpoint', type=str, help='Path to resume checkpoint.')
 
     # --- Dataloading & System ---
-    parser.add_argument('--num_workers', type=int, default=None,
-                        help='Dataloader workers per rank. Default: auto (cores // world_size). Set 0 for main process loading.')
-    parser.add_argument('--train_dir', default='./experiments_densenet_spade',
-                        help='Base directory for all training outputs of this script type.')
-    parser.add_argument('--dataset_dir', default='../data/pysaliency_datasets', # Adjusted relative path
-                        help='Directory for pysaliency datasets (SALICON, MIT original).')
-    parser.add_argument('--lmdb_dir', default='../data/lmdb_cache_densenet', # Adjusted relative path
-                        help='Directory for LMDB image data caches (if used).')
-    parser.add_argument('--use_lmdb_images', action='store_true', help='Use LMDB for loading stimulus images.')
-    
-    # --- Model Generic Arguments ---
-    parser.add_argument('--add_sa_head', action='store_true',
-                        help='Add a SelfAttention layer at the beginning of the saliency network.')
+    parser.add_argument('--num_workers', type=str, # Changed to str to handle 'auto' from YAML
+                        help="Dataloader workers. 'auto' or integer. If not set, determined automatically.")
+    parser.add_argument('--train_dir', help='Base directory for training outputs.')
+    parser.add_argument('--dataset_dir', help='Directory for pysaliency datasets.')
+    parser.add_argument('--lmdb_dir', help='Directory for LMDB image caches.')
+    parser.add_argument('--use_lmdb_images', action=argparse.BooleanOptionalAction, help='Use LMDB for stimulus images.') # Allows --no-use-lmdb-images
+    parser.add_argument('--cache_segmentation_masks', action=argparse.BooleanOptionalAction, help='Cache segmentation masks in RAM.')
 
-    args = parser.parse_args()
+    # --- Model Generic Arguments ---
+    parser.add_argument('--add_sa_head', action=argparse.BooleanOptionalAction, help='Add SelfAttention to saliency network.')
+
+    # --- Initial Parse for Config File Path ---
+    # Parse known args first to get config_file path without erroring on other CLI args
+    temp_args, remaining_argv = parser.parse_known_args()
+    config_args = {}
+
+    if temp_args.config_file:
+        config_file_path = Path(temp_args.config_file)
+        if config_file_path.is_file():
+            logging.info(f"Loading config file: {config_file_path}")
+            with open(config_file_path, 'r') as f:
+                config_args = yaml.safe_load(f)
+            if config_args is None: # Handle empty YAML file
+                config_args = {}
+        else:
+            print(f"Warning: Specified config file not found: {config_file_path}. Using defaults/CLI args.")
+            # Potentially exit if config file is required and not found
+            # sys.exit(f"Error: Config file {config_file_path} not found.")
+
+    # --- Set Defaults from YAML (or initial parser defaults if no YAML/key missing) ---
+    # This allows CLI to override YAML values.
+    # We effectively re-parse with YAML values as new defaults.
+    # Create a new parser or update defaults of the existing one.
+    # For simplicity here, we'll update the existing parser's defaults.
+    # For every argument defined in the parser:
+    for action in parser._actions:
+        if action.dest in config_args and action.dest != "config_file": # Don't override config_file itself
+            # Handle different action types correctly (store_true, etc.)
+            if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction)):
+                # For boolean actions, the value from YAML should directly set the default
+                # This is a bit tricky as `set_defaults` expects the default for store_true to be False
+                # Let's directly update the default value
+                parser.set_defaults(**{action.dest: config_args[action.dest]})
+            elif action.default != config_args[action.dest]: # Only update if different
+                parser.set_defaults(**{action.dest: config_args[action.dest]})
+
+    # --- Final Parse with updated defaults and remaining CLI args ---
+    # `remaining_argv` will be parsed on top of defaults (which now include YAML values)
+    final_args = parser.parse_args(remaining_argv)
+
 
     # --- Automatic Worker Count ---
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    if args.num_workers is None:
-        try:
-            cpu_count = len(os.sched_getaffinity(0)) # More accurate on Linux
-        except AttributeError:
-            cpu_count = os.cpu_count() or 1 # Fallback
-        args.num_workers = max(0, cpu_count // world_size if world_size > 0 else cpu_count)
-        if args.num_workers == 0 and world_size > 1: # Ensure at least 1 worker if multiple GPUs and cpus allow
-            if cpu_count > world_size : args.num_workers = 1
-    elif args.num_workers < 0:
-        args.num_workers = 0
-    
-    # --- Correct num_total_segments if K was specified ---
-    # If user specifies --num_segments 16 (meaning K=16 clusters, IDs 0-15),
-    # then nn.Embedding needs num_embeddings = 16.
-    # If args.num_total_segments is meant to be K, then use that.
-    # The current SaliencyNetworkSPADE uses num_total_segments directly for nn.Embedding.
-    # So, if K-Means produced K=16 segments (IDs 0 to 15), num_total_segments should be 16.
-    # My previous default of 17 was for K + 1 if 0 was a special background.
-    # Let's assume num_total_segments is the actual count of unique IDs.
-    # If K-Means gives k labels (0 to k-1), then num_total_segments should be k.
-    # The generate_masks script used --num_segments for K.
-    # So, if you ran generate_masks with --num_segments 16, then there are 16 unique labels (0-15).
-    # Thus, args.num_total_segments should be 16 for nn.Embedding.
-    # Let's clarify the argument:
-    # parser.add_argument('--num_k_segments', type=int, default=16,
-    #                     help='Number of K segments produced by K-Means (IDs 0 to K-1). nn.Embedding will use this value.')
-    # And then in main(): args.num_total_segments = args.num_k_segments
+    world_size_env = int(os.environ.get("WORLD_SIZE", 1)) # Use a different var name
+    # Handle 'auto' for num_workers from YAML/CLI
+    if isinstance(final_args.num_workers, str) and final_args.num_workers.lower() == 'auto':
+        final_args.num_workers = None # Let the original auto-detection logic handle it
 
-    if args.num_total_segments <= 0:
-        _logger.error("--num_total_segments must be positive.")
-        sys.exit(1)
+    if final_args.num_workers is None: # If still None (was 'auto' or not set)
+        try:
+            cpu_count = len(os.sched_getaffinity(0))
+        except AttributeError:
+            cpu_count = os.cpu_count() or 1
+        final_args.num_workers = max(0, cpu_count // world_size_env if world_size_env > 0 else cpu_count)
+        if final_args.num_workers == 0 and world_size_env > 1:
+            if cpu_count > world_size_env: final_args.num_workers = 1
+    elif not isinstance(final_args.num_workers, int) or final_args.num_workers < 0:
+        # If it came from YAML/CLI as a non-'auto' string or invalid int, default to 0
+        print(f"Warning: Invalid num_workers value '{final_args.num_workers}'. Defaulting to 0.")
+        final_args.num_workers = 0
+
+
+    # --- Argument Validation (Example) ---
+    if final_args.stage is None:
+        parser.error("The --stage argument (or 'stage' in YAML) is required.")
+    if final_args.segmentation_mask_dir is None and "spade" in final_args.stage:
+        parser.error("--segmentation_mask_dir (or in YAML) is required for SPADE stages.")
+    if final_args.num_total_segments is None or final_args.num_total_segments <= 0:
+         parser.error("--num_total_segments (or in YAML) must be a positive integer.")
 
 
     try:
-        main(args)
+        main(final_args) # Pass the final Namespace object
     except KeyboardInterrupt:
         _logger.warning("Training interrupted by user (KeyboardInterrupt). Cleaning up...")
         cleanup_distributed()
