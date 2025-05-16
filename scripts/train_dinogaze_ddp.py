@@ -608,74 +608,129 @@ def main(args):
 
 
 
-# -----------------------------------------------------------------------------
-# CLI ARGUMENT PARSER and Script Entry Point
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main entry-point  –  YAML config *plus* CLI  (CLI has top priority)
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DeepGazeIII with DINOv2 Backbone (Multi-GPU via torchrun)")
-    # --- Core Arguments ---
-    parser.add_argument('--stage', required=True, choices=['salicon_pretrain', 'mit_spatial', 'mit_scanpath_frozen', 'mit_scanpath_full'], help='Training stage to execute.')
-    parser.add_argument('--model_name', default='dinov2_vitg14', choices=['dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'], help='DINOv2 model variant.')
-    parser.add_argument('--layers', type=int, nargs='+', default=[-3, -2, -1], help='Indices of transformer blocks to extract features from.')
-    # --- Training Hyperparameters ---
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size *per GPU*. Effective batch size is batch_size * world_size * gradient_accumulation_steps.')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Number of forward passes to accumulate gradients before optimizer step.')
-    parser.add_argument('--lr', type=float, default=0.0005, help='Initial learning rate for the model head.')
-    parser.add_argument('--backbone_lr', type=float, default=1e-5, help='Learning rate for unfrozen backbone layers (if any).')
-    parser.add_argument('--min_lr', type=float, default=1e-7, help='Minimum learning rate threshold for scheduler.')
-    parser.add_argument('--fold', type=int, help='Cross-validation fold for MIT1003 stages (0-9). Required for MIT stages.')
-    # --- Dataloading & System ---
-    parser.add_argument('--num_workers', type=int, default=None, help='Dataloader workers per rank. Default: auto (cores // world_size). Set 0 for main process loading.')
-    parser.add_argument('--train_dir', default='./train_dinogaze_vitg', help='Base directory for training outputs (checkpoints, logs).')
-    parser.add_argument('--dataset_dir', default='../data/pysaliency_datasets', help='Directory for datasets (download/cache location).')
-    parser.add_argument('--lmdb_dir', default='../data/lmdb_cache_dinogaze_vitg', help='Directory for LMDB data caches.')
-    # --- Model Modifications (Experimental) ---
-    parser.add_argument('--add_sa_head', action='store_true', help='Add a SelfAttention layer before the main saliency network.')
-    parser.add_argument('--unfreeze_vit_layers', type=int, nargs='+', default=[], help='Indices (e.g., 10 11 for ViT-B/14) of DINOv2 blocks to unfreeze and fine-tune.')
 
+    # ------------------------------------------------------------------
+    # 1) Tiny “pre-parser” – only to capture --config_file so we can
+    #    load the YAML *before* we declare real defaults.
+    # ------------------------------------------------------------------
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument(
+        "--config_file",
+        type=str,
+        default=None,
+        help="Optional YAML file whose values become defaults; "
+             "explicit CLI flags still override."
+    )
+    _cfg, _remaining_cli = _pre.parse_known_args()
 
-    args = parser.parse_args()
+    # ------------------------------------------------------------------
+    # 2) Full argument parser – exactly the flags you had before.
+    # ------------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        parents=[_pre],      # inherit --config_file
+        description="Train DeepGaze-III with DINOv2 backbone (multi-GPU via torchrun)"
+    )
 
-    # --- Automatic Worker Count ---
-    world_size = int(os.environ.get("WORLD_SIZE", 1)) # Get world size early for worker calc
-    if args.num_workers is None:
+    # ── Core arguments ────────────────────────────────────────────────
+    parser.add_argument('--stage', required=True,
+        choices=['salicon_pretrain',
+                 'mit_spatial',
+                 'mit_scanpath_frozen',
+                 'mit_scanpath_full'],
+        help='Training stage to execute.')
+    parser.add_argument('--model_name',
+        default='dinov2_vitg14',
+        choices=['dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'],
+        help='DINOv2 model variant.')
+    parser.add_argument('--layers', type=int, nargs='+',
+        default=[-3, -2, -1],
+        help='Indices of transformer blocks to extract features from.')
+
+    # ── Training hyper-parameters ─────────────────────────────────────
+    parser.add_argument('--batch_size', type=int, default=4,
+        help='Batch size *per GPU*. Effective global batch size is '
+             'batch_size × world_size × gradient_accumulation_steps.')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--lr', type=float, default=5e-4,
+        help='Initial learning rate for the model head.')
+    parser.add_argument('--backbone_lr', type=float, default=1e-5,
+        help='Learning rate for unfrozen backbone layers.')
+    parser.add_argument('--min_lr', type=float, default=1e-7,
+        help='Lower LR bound for schedulers.')
+    parser.add_argument('--fold', type=int,
+        help='Cross-validation fold (MIT stages only, 0-9).')
+
+    # ── Dataloading & system ──────────────────────────────────────────
+    parser.add_argument('--num_workers', type=int, default=None,
+        help="Dataloader workers per rank.  None/'auto' ⇒ cpu_cores // WORLD_SIZE.")
+    parser.add_argument('--train_dir', default='./train_dinogaze_vitg')
+    parser.add_argument('--dataset_dir', default='../data/pysaliency_datasets')
+    parser.add_argument('--lmdb_dir', default='../data/lmdb_cache_dinogaze_vitg')
+
+    # ── Model tweaks / ablations ──────────────────────────────────────
+    parser.add_argument('--add_sa_head', action='store_true',
+        help='Add a Self-Attention layer before the saliency network.')
+    parser.add_argument('--unfreeze_vit_layers', type=int, nargs='+', default=[],
+        help='Indices of ViT blocks to unfreeze & fine-tune.')
+
+    # ------------------------------------------------------------------
+    # 3) If a YAML file was given, load it and set its keys as defaults.
+    # ------------------------------------------------------------------
+    if _cfg.config_file:
         try:
-            # Use sched_getaffinity for more accurate core count on Linux
+            with open(_cfg.config_file, 'r') as yml:
+                yaml_cfg = yaml.safe_load(yml) or {}
+            print(f"Loaded configuration from: {_cfg.config_file}")
+            parser.set_defaults(**yaml_cfg)
+        except Exception as e:
+            print(f"⚠️  Could not read YAML '{_cfg.config_file}': {e} – "
+                  "continuing with built-in defaults.")
+
+    # ------------------------------------------------------------------
+    # 4) Final parse – CLI overrides YAML which overrides built-ins.
+    # ------------------------------------------------------------------
+    args = parser.parse_args(_remaining_cli)
+
+    # ------------------------------------------------------------------
+    # 5) Automatic worker-count logic (unchanged from your original).
+    # ------------------------------------------------------------------
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if args.num_workers is None:  # treat None or 'auto'
+        try:
             cpu_count = len(os.sched_getaffinity(0))
         except AttributeError:
-            cpu_count = os.cpu_count() or 1 # Fallback for non-Linux/Windows
-        # Allocate workers evenly, ensure at least 0
+            cpu_count = os.cpu_count() or 1
         args.num_workers = max(0, cpu_count // world_size)
     elif args.num_workers < 0:
-        args.num_workers = 0 # Treat negative as 0
+        args.num_workers = 0  # negative ⇒ 0 workers
 
-
-    # --- LR Adjustment Warning ---
+    # ------------------------------------------------------------------
+    # 6) Stage-specific LR warning (kept exactly as you had it).
+    # ------------------------------------------------------------------
     if args.stage == 'mit_scanpath_full' and args.lr > 1e-5:
-        # Note: We only warn here, the user might intentionally use a different LR.
-        # The actual LR is set in the main() function logic based on stage.
-        # Consider setting it directly here if the override should always happen:
-        # args.lr = 1e-5
-        # print(f"INFO: Overriding head LR for 'mit_scanpath_full' stage to 1e-5 (was {args.lr})")
-        print(f"WARNING: Recommended head LR for 'mit_scanpath_full' is 1e-5, but got {args.lr}. Using provided value.")
+        print(f"WARNING: Recommended head LR for 'mit_scanpath_full' is 1e-5, "
+              f"but got {args.lr}. Using provided value.")
+
+    # ------------------------------------------------------------------
+    # 7) Standard try/except wrapper around main().
+    # ------------------------------------------------------------------
     try:
         main(args)
     except KeyboardInterrupt:
-        # Use logger if initialized, otherwise print
         try:
-            _logger.warning("Training interrupted by user (KeyboardInterrupt). Cleaning up...")
+            _logger.warning("Training interrupted by user (Ctrl-C). Cleaning up …")
         except NameError:
-            print("Training interrupted by user (KeyboardInterrupt). Cleaning up...")
+            print("Training interrupted by user (Ctrl-C). Cleaning up …")
         cleanup_distributed()
-        sys.exit(130) # Standard exit code for Ctrl+C
-    except Exception as e:
-        # Use logger if initialized, otherwise print and traceback
+        sys.exit(130)
+    except Exception:
         try:
-            _logger.critical("Unhandled exception during main execution:")
-            _logger.exception(e)
+            _logger.critical("Unhandled exception during main execution:", exc_info=True)
         except NameError:
-            print("Unhandled exception during main execution:")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
         cleanup_distributed()
-        sys.exit(1) # General error exit code
+        sys.exit(1)
