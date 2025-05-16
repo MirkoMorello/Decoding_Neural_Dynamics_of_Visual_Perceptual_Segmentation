@@ -465,15 +465,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zlib-1.3.1-hb9d3cd8_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstandard-0.23.0-py312h66e93f0_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb8e6e7a_2.conda
-      - pypi: https://files.pythonhosted.org/packages/45/7f/0e961cf3908bc4c1c3e027de2794f867c6c89fb4916fc7dba295a0e80a2d/boltons-25.0.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/02/c3/253a89ee03fc9b9682f1541728eb66db7db22148cd94f89ab22528cd1e1b/deprecation-2.1.0-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/cb/da/8341fd3056419441286c8e26bf436923021005ece0bff5f41906476ae514/llvmlite-0.44.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/61/08/002b7a3d165115b214aff2e8333e511dc54ce64c02ece5500542f13c080b/lmdb-1.6.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/ef/82/7a9d0550484a62c6da82858ee9419f3dd1ccc9aa1c26a1e43da3ecd20b0d/natsort-8.4.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/9a/2d/e518df036feab381c23a624dac47f8445ac55686ec7f11083655eb707da3/numba-0.61.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/2c/d8/6f63147dd73373d051c5eb049ecd841207f898f50a5a1d4378594178f6cf/piexif-1.1.3-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/5b/da/3e49aad05782fa49c3b52962bc304c3cbe94babbc652d3ee848f7691f33b/pysaliency-0.2.22.tar.gz
-      - pypi: https://files.pythonhosted.org/packages/ad/1b/81855a88c6db2b114d5b2e9f96339190d5ee4d1b981d217fa32127bb00e0/schema-0.7.7-py2.py3-none-any.whl
       - pypi: https://download.pytorch.org/whl/cu118/xformers-0.0.29.post3-cp312-cp312-manylinux_2_28_x86_64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-3_kmp_llvm.conda
@@ -1023,11 +1015,6 @@ packages:
   purls: []
   size: 4213
   timestamp: 1737382993425
-- pypi: https://files.pythonhosted.org/packages/45/7f/0e961cf3908bc4c1c3e027de2794f867c6c89fb4916fc7dba295a0e80a2d/boltons-25.0.0-py3-none-any.whl
-  name: boltons
-  version: 25.0.0
-  sha256: dc9fb38bf28985715497d1b54d00b62ea866eca3938938ea9043e254a3a6ca62
-  requires_python: '>=3.7'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/brotli-1.1.0-hb9d3cd8_2.conda
   sha256: fcb0b5b28ba7492093e54f3184435144e074dfceab27ac8e6a9457e736565b0b
   md5: 98514fe74548d768907ce7a13f680e8f
@@ -1362,12 +1349,6 @@ packages:
   - pkg:pypi/defusedxml?source=hash-mapping
   size: 24062
   timestamp: 1615232388757
-- pypi: https://files.pythonhosted.org/packages/02/c3/253a89ee03fc9b9682f1541728eb66db7db22148cd94f89ab22528cd1e1b/deprecation-2.1.0-py2.py3-none-any.whl
-  name: deprecation
-  version: 2.1.0
-  sha256: a10811591210e1fb0e768a8c25517cabeabcba6f0bf96564f8ff45189f90b14a
-  requires_dist:
-  - packaging
 - conda: https://conda.anaconda.org/conda-forge/noarch/dill-0.3.8-pyhd8ed1ab_0.conda
   sha256: 482b5b566ca559119b504c53df12b08f3962a5ef8e48061d62fd58a47f8f2ec4
   md5: 78745f157d56877a2c6e7b386f66f3e2
@@ -4214,11 +4195,6 @@ packages:
   purls: []
   size: 3185408
   timestamp: 1744934126968
-- pypi: https://files.pythonhosted.org/packages/cb/da/8341fd3056419441286c8e26bf436923021005ece0bff5f41906476ae514/llvmlite-0.44.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-  name: llvmlite
-  version: 0.44.0
-  sha256: c0143a5ef336da14deaa8ec26c5449ad5b6a2b564df82fcef4be040b9cacfea9
-  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/61/08/002b7a3d165115b214aff2e8333e511dc54ce64c02ece5500542f13c080b/lmdb-1.6.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
   name: lmdb
   version: 1.6.2
@@ -4483,14 +4459,6 @@ packages:
   purls: []
   size: 1369369
   timestamp: 1744124916632
-- pypi: https://files.pythonhosted.org/packages/ef/82/7a9d0550484a62c6da82858ee9419f3dd1ccc9aa1c26a1e43da3ecd20b0d/natsort-8.4.0-py3-none-any.whl
-  name: natsort
-  version: 8.4.0
-  sha256: 4732914fb471f56b5cce04d7bae6f164a592c7712e1c85f9ef585e197299521c
-  requires_dist:
-  - fastnumbers>=2.0.0 ; extra == 'fast'
-  - pyicu>=1.0.0 ; extra == 'icu'
-  requires_python: '>=3.7'
 - conda: https://conda.anaconda.org/conda-forge/noarch/nbclient-0.10.2-pyhd8ed1ab_0.conda
   sha256: a20cff739d66c2f89f413e4ba4c6f6b59c50d5c30b5f0d840c13e8c9c2df9135
   md5: 6bb0d77277061742744176ab555b723c
@@ -4635,14 +4603,6 @@ packages:
   purls: []
   size: 2004902
   timestamp: 1743188238836
-- pypi: https://files.pythonhosted.org/packages/9a/2d/e518df036feab381c23a624dac47f8445ac55686ec7f11083655eb707da3/numba-0.61.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-  name: numba
-  version: 0.61.2
-  sha256: 5b1bb509d01f23d70325d3a5a0e237cbc9544dd50e50588bc581ba860c213546
-  requires_dist:
-  - llvmlite>=0.44.0.dev0,<0.45
-  - numpy>=1.24,<2.3
-  requires_python: '>=3.10'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.26.4-py312heda63a1_0.conda
   sha256: fe3459c75cf84dcef6ef14efcc4adb0ade66038ddd27cadb894f34f4797687d8
   md5: d8285bea2a350f63fab23bf460221f3f
@@ -5005,11 +4965,6 @@ packages:
   - pkg:pypi/pickleshare?source=hash-mapping
   size: 11748
   timestamp: 1733327448200
-- pypi: https://files.pythonhosted.org/packages/2c/d8/6f63147dd73373d051c5eb049ecd841207f898f50a5a1d4378594178f6cf/piexif-1.1.3-py2.py3-none-any.whl
-  name: piexif
-  version: 1.1.3
-  sha256: 3bc435d171720150b81b15d27e05e54b8abbde7b4242cddd81ef160d283108b6
-  requires_python: '>=2.7,!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pillow-11.1.0-py312h80c1187_0.conda
   sha256: 5c347962202b55ae4d8a463e0555c5c6ca33396266a08284bf1384399894e541
   md5: d3894405f05b2c0f351d5de3ae26fa9c
@@ -5373,24 +5328,6 @@ packages:
   - pkg:pypi/pyqt5-sip?source=hash-mapping
   size: 85809
   timestamp: 1695418132533
-- pypi: https://files.pythonhosted.org/packages/5b/da/3e49aad05782fa49c3b52962bc304c3cbe94babbc652d3ee848f7691f33b/pysaliency-0.2.22.tar.gz
-  name: pysaliency
-  version: 0.2.22
-  sha256: 670eb732e469b5d86b8024de9d23cc1560009bf0f67e16dc5129121f2b0c587f
-  requires_dist:
-  - boltons
-  - deprecation
-  - dill
-  - imageio
-  - natsort
-  - numba
-  - numpy
-  - piexif
-  - requests
-  - schema
-  - scipy
-  - setuptools
-  - tqdm
 - conda: https://conda.anaconda.org/conda-forge/linux-64/pyside6-6.9.0-py312h91f0f75_0.conda
   sha256: 4db931dccd8347140e79236378096d9a1b97b98bbd206d54cebd42491ad12535
   md5: e3a335c7530a1d0c4db621914f00f9f7
@@ -5915,12 +5852,6 @@ packages:
   - pkg:pypi/safetensors?source=compressed-mapping
   size: 431388
   timestamp: 1740651706122
-- pypi: https://files.pythonhosted.org/packages/ad/1b/81855a88c6db2b114d5b2e9f96339190d5ee4d1b981d217fa32127bb00e0/schema-0.7.7-py2.py3-none-any.whl
-  name: schema
-  version: 0.7.7
-  sha256: 5d976a5b50f36e74e2157b47097b60002bd4d42e65425fcc9c9befadb4255dde
-  requires_dist:
-  - contextlib2>=0.5.5 ; python_full_version < '3.3'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/scikit-learn-1.6.1-py312h7a48858_0.conda
   sha256: 7c869c73c95ef09edef839448ae3d153c4e3a208fb110c4260225f342d23e08e
   md5: 102727f71df02a51e9e173f2e6f87d57
