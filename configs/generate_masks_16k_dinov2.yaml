@@ -1,0 +1,29 @@
+
+
+# --- Individual Mask Generation Settings ---
+stimuli_location: './data/pysaliency_datasets/SALICON' # Path to SALICON dataset root
+dataset_name: 'SALICON_train'                 # For SALICON train set
+# stimuli_location: './data/pysaliency_datasets/MIT1003_converted' # Example for MIT
+# dataset_name: 'MIT1003_twosize'
+
+output_dir: './masks/dinov2_kmeans_k16_salicon_train' # Where individual png/npy masks go
+dinov2_model_name: 'dinov2_vitl14'
+dinov2_patch_size: 14
+dinov2_feature_layers_indices: [-1] # Use last layer features
+num_segments: 16
+device: 'cuda'
+file_format: 'png' # Format for the individual masks
+image_batch_size: 1
+overwrite_individual_masks: false # Set to true to re-generate existing individual masks
+
+# --- Mask Bank Building Settings (Optional) ---
+# Common dtype for all banks created by this run
+mask_bank_dtype: 'uint8' # 'uint8' for labels 0-255, 'uint16' for more
+
+# To build a fixed-size bank (e.g., for SALICON where all images might be resized to same size for masks)
+# Ensure all masks in 'output_dir' WILL have the same dimensions for this to work.
+# build_fixed_size_bank_output_file: './masks_output/SALICON_train_k16_dinov2l14_fixed.npy'
+
+# To build a variable-size bank (e.g., for MIT1003 or SALICON if original sizes are preserved for masks)
+build_variable_size_bank_payload_file: './masks_output/SALICON_train_k16_dinov2l14_var.bin'
+build_variable_size_bank_header_file: './masks_output/SALICON_train_k16_dinov2l14_var_header.npy'
