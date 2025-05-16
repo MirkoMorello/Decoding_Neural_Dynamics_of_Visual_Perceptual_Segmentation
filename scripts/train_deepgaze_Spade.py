@@ -12,7 +12,7 @@ project_root = os.path.dirname(os.path.dirname(current_script_path))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-import yaml # <--- Add this import
+import yaml
 import argparse
 import logging
 from pathlib import Path
@@ -24,14 +24,14 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet201 # IMPORTANT
+from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet201
 import numpy as np
 import math
 
 import pysaliency
-import pysaliency.external_datasets.mit # Ensure this can be imported
+import pysaliency.external_datasets.mit 
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None # Disable PIL decompression bomb check
+Image.MAX_IMAGE_PIXELS = None 
 from pysaliency.baseline_utils import BaselineModel, CrossvalidatedBaselineModel
 import cloudpickle as cpickle
 
@@ -358,441 +358,402 @@ class DeepGazeIIISpade(nn.Module): # Renaming to avoid conflict with original
 # ============================================================================
 # == MAIN FUNCTION ==
 # ============================================================================
-def main(args):
+def main(args: argparse.Namespace): # Expects Namespace, use args.attribute
     device, rank, world, is_master, is_distributed = init_distributed()
 
     # --- Logging Setup ---
-    log_level = logging.INFO if is_master else logging.WARNING
-    logging.basicConfig(
-        level=log_level,
-        format=f"%(asctime)s Rank{rank} %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True # Override any root logger setup
-    )
-    logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
-    _logger.setLevel(log_level)
+    log_level = logging.INFO if is_master else logging.WARNING # Default to INFO for master
+    # Override with log_level from args if provided in YAML/CLI, useful for debugging
+    if hasattr(args, 'log_level') and args.log_level is not None:
+        try:
+            log_level = getattr(logging, str(args.log_level).upper(), log_level)
+        except AttributeError:
+            print(f"Warning: Invalid log_level '{args.log_level}'. Using default.")
+
+    logging.basicConfig(level=log_level, format=f"%(asctime)s Rank{rank} %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
+    logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING) # Quieten PIL
+    _logger.setLevel(log_level) # Set level for the module's global logger instance
 
     # --- Log Arguments ---
     if is_master:
-        _logger.info("==================================================")
-        _logger.info(f"Starting DenseNet+SPADE Training: Stage '{args.stage}'")
-        _logger.info(f"  Torch Version: {torch.__version__}, CUDA: {torch.cuda.is_available()} (Version: {torch.version.cuda if torch.cuda.is_available() else 'N/A'})")
-        _logger.info(f"  DDP: Rank {rank}/{world}, Master: {is_master}, Distributed: {is_distributed}, Device: {device}")
-        _logger.info(f"  DenseNet Model: {args.densenet_model_name}")
-        _logger.info(f"  Batch Size Per GPU: {args.batch_size}, Grad Accum: {args.gradient_accumulation_steps}")
-        _logger.info(f"  Effective Global Batch Size: {args.batch_size * world * args.gradient_accumulation_steps}")
-        _logger.info(f"  LR: {args.lr}, Min LR: {args.min_lr}")
-        _logger.info(f"  Workers Per Rank: {args.num_workers}")
-        _logger.info(f"  Output Base Dir: {args.train_dir}")
-        _logger.info(f"  Dataset Dir: {args.dataset_dir}")
-        _logger.info(f"  LMDB Cache Dir (Images): {args.lmdb_dir}")
-        _logger.info(f"  Segmentation Mask Root Dir: {args.segmentation_mask_dir}")
-        _logger.info(f"  Train Mask Subdir: {args.train_mask_subdir_name}, Val Mask Subdir: {args.val_mask_subdir_name}")
-        _logger.info(f"  Mask Format: {args.segmentation_mask_format}")
-        _logger.info(f"  Num Segments (for embedding): {args.num_total_segments}, Seg Embedding Dim: {args.seg_embedding_dim}")
-        _logger.info(f"  Add SA Head to Saliency Net: {args.add_sa_head}")
-        _logger.info("==================================================")
+        _logger.info("================== Effective Configuration ==================")
+        for arg_name, arg_value in sorted(vars(args).items()):
+            _logger.info(f"  {arg_name}: {arg_value}")
+        _logger.info(f"  DDP Info: Rank {rank}/{world}, Master: {is_master}, Distributed: {is_distributed}, Device: {device}")
+        _logger.info(f"  Torch: {torch.__version__}, CUDA: {torch.version.cuda if torch.cuda.is_available() else 'N/A'}")
+        _logger.info("===========================================================")
 
     # --- Path Setup ---
     dataset_directory = Path(args.dataset_dir).resolve()
-    # train_directory is the base for all experiment outputs
-    # Specific experiment output_dir will be created under this
     train_output_base_dir = Path(args.train_dir).resolve()
-    lmdb_image_cache_dir = Path(args.lmdb_dir).resolve() # For image LMDBs
-    segmentation_mask_root_dir = Path(args.segmentation_mask_dir).resolve()
+    lmdb_image_cache_dir = Path(args.lmdb_dir).resolve()
+    # segmentation_mask_root_dir is for individual mask fallback/source
+    segmentation_mask_root_dir = Path(args.segmentation_mask_dir).resolve() if args.segmentation_mask_dir else None
 
     if is_master:
-        for p in (dataset_directory, train_output_base_dir, lmdb_image_cache_dir, segmentation_mask_root_dir):
-            try:
-                p.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                _logger.critical(f"Failed to create directory {p}: {e}. Check permissions.")
-                if is_distributed: dist.barrier()
-                sys.exit(1)
-    if is_distributed:
-        dist.barrier() # Wait for master to create dirs
+        for p in [dataset_directory, train_output_base_dir, lmdb_image_cache_dir]: # Removed seg_mask_root_dir from mandatory creation
+            if p: p.mkdir(parents=True, exist_ok=True)
+        if segmentation_mask_root_dir and not segmentation_mask_root_dir.exists():
+             _logger.warning(f"Individual mask root dir {segmentation_mask_root_dir} (for fallback/source) does not exist.")
+    if is_distributed: dist.barrier()
 
     # --- Backbone Setup: DenseNet ---
-    if is_master: _logger.info(f"Initializing RGBDenseNet201 backbone...")
-    densenet_base_model = RGBDenseNet201()
-    saliency_map_factor_densenet = 4 # Standard, from your example
-    features_module = FeatureExtractor(densenet_base_model, [
-                '1.features.denseblock4.denselayer32.norm1',
-                '1.features.denseblock4.denselayer32.conv1',
-                '1.features.denseblock4.denselayer31.conv2',
-            ])
-    
-    for param in features_module.parameters(): # Freezing the entire DenseNet
-        param.requires_grad = False
-    features_module.eval()
-    features_module = features_module.to(device)
-    if is_master: _logger.info("RGBDenseNet201 with FeatureExtractor initialized and frozen.")
+    if is_master: _logger.info(f"Initializing {args.densenet_model_name} backbone...")
+    if args.densenet_model_name == 'densenet201':
+        densenet_base_model = RGBDenseNet201()
+    # elif args.densenet_model_name == 'densenet161': # Add if you support it
+    #     from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet161
+    #     densenet_base_model = RGBDenseNet161()
+    else:
+        _logger.critical(f"Unsupported densenet_model_name: {args.densenet_model_name}"); sys.exit(1)
 
-    # --- Stage Dispatch (Focus on SALICON pretraining with DenseNet+SPADE) ---
+    saliency_map_factor_densenet = 4
+    # These are the specific layers your FeatureExtractor will hook into.
+    # Ensure these names are correct for the DenseNet version being used.
+    densenet_feature_nodes = [
+        '1.features.denseblock4.denselayer32.norm1',
+        '1.features.denseblock4.denselayer32.conv1',
+        '1.features.denseblock4.denselayer31.conv2',
+    ]
+    features_module = FeatureExtractor(densenet_base_model, densenet_feature_nodes)
+    
+    for param in features_module.parameters(): param.requires_grad = False
+    features_module.eval().to(device)
+    if is_master: _logger.info(f"{args.densenet_model_name} with FeatureExtractor (hooks: {densenet_feature_nodes}) initialized and frozen.")
+
+    # --- Stage Dispatch ---
     if args.stage == 'salicon_pretrain_densenet_spade':
         if is_master: _logger.info(f"--- Preparing SALICON Pretraining with DenseNet+SPADE ---")
 
-        # Load SALICON data and compute/load baseline log-likelihoods
+        # Load SALICON stimuli and fixations
         if is_master: _logger.info(f"Loading SALICON data from {dataset_directory}...")
-        salicon_train_loc = dataset_directory
-        salicon_val_loc = dataset_directory
-        # Ensure SALICON data is downloaded if not present (master only)
-        if is_master:
+        salicon_train_loc = dataset_directory / 'SALICON' # Assuming SALICON data is in a subdir
+        salicon_val_loc = dataset_directory / 'SALICON'
+        if is_master: # Download if not present
             try:
-                pysaliency.get_SALICON_train(location=salicon_train_loc)
-                pysaliency.get_SALICON_val(location=salicon_val_loc)
-            except Exception as e:
-                _logger.critical(f"Failed to download/access SALICON data at {salicon_train_loc}: {e}")
-                if is_distributed: dist.barrier(); sys.exit(1)
-        if is_distributed: dist.barrier() # Wait for master to potentially download
-
-        try:
-            SALICON_train_stimuli, SALICON_train_fixations = pysaliency.get_SALICON_train(location=salicon_train_loc)
-            SALICON_val_stimuli, SALICON_val_fixations = pysaliency.get_SALICON_val(location=salicon_val_loc)
-        except Exception as e:
-            _logger.critical(f"Failed to load SALICON metadata from {salicon_train_loc}: {e}")
-            if is_distributed: dist.barrier(); sys.exit(1)
+                if not (salicon_train_loc / 'stimuli' / 'train').exists(): pysaliency.get_SALICON_train(location=str(salicon_train_loc.parent))
+                if not (salicon_val_loc / 'stimuli' / 'val').exists(): pysaliency.get_SALICON_val(location=str(salicon_val_loc.parent))
+            except Exception as e: _logger.critical(f"Failed SALICON get: {e}"); dist.barrier(); sys.exit(1)
+        if is_distributed: dist.barrier()
+        SALICON_train_stimuli, SALICON_train_fixations = pysaliency.get_SALICON_train(location=str(salicon_train_loc.parent))
+        SALICON_val_stimuli, SALICON_val_fixations = pysaliency.get_SALICON_val(location=str(salicon_val_loc.parent))
         if is_master: _logger.info("SALICON data loaded.")
 
         # SALICON Centerbias and Baseline LL
-        if is_master: _logger.info("Initializing SALICON BaselineModel for centerbias...")
-        # Bandwidth and eps from original DINOv2 script for SALICON
-        SALICON_centerbias = BaselineModel(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations,
-                                           bandwidth=0.0217, eps=2e-13, caching=False) # Caching=False for BaselineModel itself
+        if is_master: _logger.info("Initializing SALICON BaselineModel...")
+        SALICON_centerbias = BaselineModel(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations, bandwidth=0.0217, eps=2e-13, caching=False)
         
-        # Paths for cached baseline log likelihoods
-        train_ll_cache_file = dataset_directory / f'salicon_baseline_train_ll_{args.densenet_model_name}.pkl' # Make cache name specific
+        train_ll_cache_file = dataset_directory / f'salicon_baseline_train_ll_{args.densenet_model_name}.pkl'
         val_ll_cache_file = dataset_directory / f'salicon_baseline_val_ll_{args.densenet_model_name}.pkl'
         train_baseline_log_likelihood, val_baseline_log_likelihood = None, None
-
         if is_master:
-            # Try loading cached train LL
             try:
-                with open(train_ll_cache_file, 'rb') as f: train_baseline_log_likelihood = cpickle.load(f)
-                _logger.info(f"Loaded cached TRAIN baseline LL from: {train_ll_cache_file}")
-            except Exception:
-                _logger.warning(f"TRAIN LL cache miss or error. Computing...");
-                train_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_train_stimuli, SALICON_train_fixations, verbose=True, average='image')
-                with open(train_ll_cache_file, 'wb') as f: cpickle.dump(train_baseline_log_likelihood, f)
-                _logger.info(f"Saved computed TRAIN baseline LL to: {train_ll_cache_file}")
-            # Try loading cached val LL
+                with open(train_ll_cache_file,'rb') as f: train_baseline_log_likelihood=cpickle.load(f)
+                _logger.info(f"Loaded TRAIN LL from {train_ll_cache_file}")
+            except:
+                _logger.warning(f"TRAIN LL cache miss for {train_ll_cache_file}. Computing...");
+                train_baseline_log_likelihood=SALICON_centerbias.information_gain(SALICON_train_stimuli, SALICON_train_fixations, verbose=True,average='image')
+                with open(train_ll_cache_file,'wb') as f: cpickle.dump(train_baseline_log_likelihood,f)
             try:
-                with open(val_ll_cache_file, 'rb') as f: val_baseline_log_likelihood = cpickle.load(f)
-                _logger.info(f"Loaded cached VALIDATION baseline LL from: {val_ll_cache_file}")
-            except Exception:
-                _logger.warning(f"VALIDATION LL cache miss or error. Computing...");
-                val_baseline_log_likelihood = SALICON_centerbias.information_gain(SALICON_val_stimuli, SALICON_val_fixations, verbose=True, average='image')
-                with open(val_ll_cache_file, 'wb') as f: cpickle.dump(val_baseline_log_likelihood, f)
-                _logger.info(f"Saved computed VALIDATION baseline LL to: {val_ll_cache_file}")
-            _logger.info(f"Master Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
+                with open(val_ll_cache_file,'rb') as f: val_baseline_log_likelihood=cpickle.load(f)
+                _logger.info(f"Loaded VAL LL from {val_ll_cache_file}")
+            except:
+                _logger.warning(f"VAL LL cache miss for {val_ll_cache_file}. Computing...");
+                val_baseline_log_likelihood=SALICON_centerbias.information_gain(SALICON_val_stimuli, SALICON_val_fixations, verbose=True,average='image')
+                with open(val_ll_cache_file,'wb') as f: cpickle.dump(val_baseline_log_likelihood,f)
+            _logger.info(f"Master Baseline LLs - Train: {train_baseline_log_likelihood or float('nan'):.5f}, Val: {val_baseline_log_likelihood or float('nan'):.5f}")
 
-        # Broadcast baseline LLs to other ranks
-        ll_list_to_broadcast = [train_baseline_log_likelihood, val_baseline_log_likelihood]
+        ll_bcast=[train_baseline_log_likelihood, val_baseline_log_likelihood]
         if is_distributed:
-            # Ensure all workers have a value, even if master failed (e.g. assign NaN)
-            if is_master and (train_baseline_log_likelihood is None or val_baseline_log_likelihood is None):
-                _logger.error("Master failed to get baseline LLs, broadcasting NaNs.")
-                ll_list_to_broadcast = [float('nan'), float('nan')]
-            dist.broadcast_object_list(ll_list_to_broadcast, src=0)
-        train_baseline_log_likelihood, val_baseline_log_likelihood = ll_list_to_broadcast
+            if is_master and (train_baseline_log_likelihood is None or val_baseline_log_likelihood is None): ll_bcast = [float('nan'), float('nan')]
+            dist.broadcast_object_list(ll_bcast,src=0)
+        train_baseline_log_likelihood,val_baseline_log_likelihood = ll_bcast
+        if np.isnan(train_baseline_log_likelihood) or np.isnan(val_baseline_log_likelihood): _logger.critical("NaN LLs received/computed on rank {rank}. Exiting."); sys.exit(1)
+        else: _logger.info(f"Rank {rank} Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
+
+        # --- Determine input channels for SaliencyNetworkSPADE via DUMMY FORWARD PASS ---
+        concatenated_channels = 0
+        dummy_h, dummy_w = 256, 256 # Default dummy size
+        if SALICON_train_stimuli and SALICON_train_stimuli.sizes:
+            try:
+                h_s, w_s = SALICON_train_stimuli.sizes[0][:2]
+                min_dim_factor = 32 # Heuristic for DenseNet based on total stride
+                dummy_h, dummy_w = max(h_s, min_dim_factor), max(w_s, min_dim_factor)
+                if is_master: _logger.info(f"Using dummy input size from dataset: H={dummy_h}, W={dummy_w} for channel calculation.")
+            except Exception as e_sz:
+                if is_master: _logger.warning(f"Could not get dataset size for dummy input ({e_sz}), using default H={dummy_h}, W={dummy_w}.")
         
-        if np.isnan(train_baseline_log_likelihood) or np.isnan(val_baseline_log_likelihood):
-             _logger.critical(f"Baseline LLs invalid (NaN) on rank {rank}. Exiting.")
-             if is_distributed: dist.barrier(); sys.exit(1)
-        else:
-            _logger.info(f"Rank {rank} Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
+        dummy_input = torch.randn(1, 3, dummy_h, dummy_w).to(device)
+        with torch.no_grad():
+            extracted_dummy_feature_maps = features_module(dummy_input) # List of tensors
+
+        if not isinstance(extracted_dummy_feature_maps, list) or not all(isinstance(t, torch.Tensor) for t in extracted_dummy_feature_maps):
+            _logger.critical(f"FeatureExtractor did not return list of tensors. Got: {type(extracted_dummy_feature_maps)}. Check FeatureExtractor/hooks."); sys.exit(1)
+        
+        concatenated_channels = sum(feat_map.shape[1] for feat_map in extracted_dummy_feature_maps)
+
+        if concatenated_channels == 0: # Should not happen if hooks are correct
+            _logger.error(f"Dummy forward pass resulted in 0 concatenated_channels! Fallback to 2048. Investigate FeatureExtractor hooks: {densenet_feature_nodes}")
+            concatenated_channels = 2048 # Previous hardcoded fallback
+        
+        if is_master:
+            _logger.info(f"Determined concatenated input channels for SPADE head: {concatenated_channels}")
+            # Try to get return_nodes if FeatureExtractor stores them (torchvision's does)
+            actual_return_nodes = getattr(features_module.feature_model if hasattr(features_module, 'feature_model') else features_module, 'return_nodes', densenet_feature_nodes)
+            for i, feat_map in enumerate(extracted_dummy_feature_maps):
+                node_name = actual_return_nodes[i] if i < len(actual_return_nodes) else f"layer_{i}"
+                _logger.info(f"  - Extracted dummy feature map {i} (from node '{node_name}') shape: {feat_map.shape}")
 
 
         # --- Build Model Components ---
         saliency_net_spade = SaliencyNetworkSPADE(
-            input_channels=2048,
+            input_channels=concatenated_channels, # Use dynamically determined channels
             num_total_segments=args.num_total_segments,
             seg_embedding_dim=args.seg_embedding_dim,
             add_sa_head=args.add_sa_head
         )
-        # For this experiment, scanpath network is None, and fixation selection uses original layers
-        scanpath_net = None #build_scanpath_network() # testing scanpaths without SPADE
-        fixsel_net = build_fixation_selection_network(scanpath_features=0) # scanpath_features=0 as scanpath_net is None
-        
+        scanpath_net = None # For SALICON pretraining, no scanpath component
+        fixsel_net = build_fixation_selection_network(scanpath_features=0) # scanpath_features=0 if scanpath_net is None
+
         model = DeepGazeIIISpade(
-            features=features_module, # Our DenseNetFeatureExtractor instance
+            features=features_module,
             saliency_network=saliency_net_spade,
             scanpath_network=scanpath_net,
             fixation_selection_network=fixsel_net,
-            downsample=1, # DenseNet features are already strided by backbone
-            readout_factor=4,
-            saliency_map_factor=saliency_map_factor_densenet, # Standard for DeepGaze finalizer
-            included_fixations=[] # Spatial pretraining, no history
+            downsample=1, # DenseNet features are already appropriately strided
+            readout_factor=4, # Factor to resize feature maps before readout heads
+            saliency_map_factor=saliency_map_factor_densenet,
+            included_fixations=[] # No scanpath history for spatial pretraining
         ).to(device)
 
-        if is_master: _logger.info("DeepGazeIII model with DenseNet backbone and SaliencyNetworkSPADE built.")
-
+        if is_master: _logger.info("DeepGazeIII SPADE model built.")
         if is_distributed:
-            # find_unused_parameters=True is safer when starting with new architectures
-            # or if parts of the model (like scanpath_network here) might be None.
-            model = DDP(model, device_ids=[device.index], output_device=device.index,
-                        broadcast_buffers=False, find_unused_parameters=True)
-            if is_master: _logger.info("Wrapped model with DDP (find_unused_parameters=True).")
+            model = DDP(model, device_ids=[device.index], find_unused_parameters=True) # find_unused if scanpath_net can be None
+            if is_master: _logger.info("Wrapped model with DDP.")
 
-        # Optimizer: only head parameters (DenseNet is frozen)
-        # All trainable parameters in `model` are part of the "head" (saliency, spade_mlps, fixsel, finalizer)
         head_params = [p for p in model.parameters() if p.requires_grad]
-        if not head_params:
-            _logger.critical("No trainable parameters found in the model! Check requires_grad settings.")
-            if is_distributed: dist.barrier(); sys.exit(1)
-            
+        if not head_params: _logger.critical("No trainable parameters found!"); sys.exit(1)
         optimizer = optim.Adam(head_params, lr=args.lr)
-        # Adjust milestones for DenseNet if needed, usually fewer epochs than full DINOv2 training
-        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones) # Use arg for milestones
+        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones)
 
-        # --- Dataloaders with Segmentation Masks ---
-        train_mask_dir_full = segmentation_mask_root_dir / args.train_mask_subdir_name
-        val_mask_dir_full = segmentation_mask_root_dir / args.val_mask_subdir_name
+        # --- Dataloaders ---
+        # Fallback individual mask dirs
+        train_mask_individual_dir = segmentation_mask_root_dir / args.train_mask_subdir_name if segmentation_mask_root_dir and args.train_mask_subdir_name else None
+        val_mask_individual_dir = segmentation_mask_root_dir / args.val_mask_subdir_name if segmentation_mask_root_dir and args.val_mask_subdir_name else None
+
+        # Fixed-size memmap bank paths
+        train_fixed_memmap = Path(args.train_mask_memmap_file).resolve() if args.train_mask_memmap_file else None
+        val_fixed_memmap = Path(args.val_mask_memmap_file).resolve() if args.val_mask_memmap_file else None
+
+        # Variable-size memmap bank paths
+        train_var_payload = Path(args.train_mask_variable_payload_file).resolve() if args.train_mask_variable_payload_file else None
+        train_var_header = Path(args.train_mask_variable_header_file).resolve() if args.train_mask_variable_header_file else None
+        val_var_payload = Path(args.val_mask_variable_payload_file).resolve() if args.val_mask_variable_payload_file else None
+        val_var_header = Path(args.val_mask_variable_header_file).resolve() if args.val_mask_variable_header_file else None
+
         if is_master:
-            _logger.info(f"Using TRAIN segmentation masks from: {train_mask_dir_full}")
-            _logger.info(f"Using VAL segmentation masks from: {val_mask_dir_full}")
-            if not train_mask_dir_full.exists(): _logger.error(f"Train mask directory NOT FOUND: {train_mask_dir_full}")
-            if not val_mask_dir_full.exists(): _logger.error(f"Validation mask directory NOT FOUND: {val_mask_dir_full}")
-            _logger.info(f"Segmentation mask caching: {'ENABLED' if args.cache_segmentation_masks else 'DISABLED'}")
+            _logger.info(f"Train Mask Config: FixedBank='{train_fixed_memmap}', VarBankPayload='{train_var_payload}', VarBankHeader='{train_var_header}', FallbackDir='{train_mask_individual_dir}'")
+            _logger.info(f"Val Mask Config: FixedBank='{val_fixed_memmap}', VarBankPayload='{val_var_payload}', VarBankHeader='{val_var_header}', FallbackDir='{val_mask_individual_dir}'")
 
 
-        # LMDB path for images for SALICON (if you created one for DenseNet features)
-        salicon_train_lmdb_path = lmdb_image_cache_dir / f'SALICON_train_images_{args.densenet_model_name}'
-        salicon_val_lmdb_path = lmdb_image_cache_dir / f'SALICON_val_images_{args.densenet_model_name}'
+        dataset_common_kwargs_train = {
+            "transform": FixationMaskTransform(sparse=False), "average": "image",
+            "lmdb_path": str(lmdb_image_cache_dir / f'SALICON_train_images_{args.densenet_model_name}') if args.use_lmdb_images else None,
+            "segmentation_mask_dir": train_mask_individual_dir,
+            "segmentation_mask_format": args.segmentation_mask_format,
+            "segmentation_mask_fixed_memmap_file": train_fixed_memmap,
+            "segmentation_mask_variable_payload_file": train_var_payload,
+            "segmentation_mask_variable_header_file": train_var_header,
+            "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
+        }
+        train_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations, centerbias_model=SALICON_centerbias, **dataset_common_kwargs_train)
+        
+        dataset_common_kwargs_val = {
+            "transform": FixationMaskTransform(sparse=False), "average": "image",
+            "lmdb_path": str(lmdb_image_cache_dir / f'SALICON_val_images_{args.densenet_model_name}') if args.use_lmdb_images else None,
+            "segmentation_mask_dir": val_mask_individual_dir,
+            "segmentation_mask_format": args.segmentation_mask_format,
+            "segmentation_mask_fixed_memmap_file": val_fixed_memmap,
+            "segmentation_mask_variable_payload_file": val_var_payload,
+            "segmentation_mask_variable_header_file": val_var_header,
+            "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
+        }
+        val_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_val_stimuli, fixations=SALICON_val_fixations, centerbias_model=SALICON_centerbias, **dataset_common_kwargs_val)
 
-        train_dataset = ImageDatasetWithSegmentation(
-            stimuli=SALICON_train_stimuli,
-            fixations=SALICON_train_fixations,
-            centerbias_model=SALICON_centerbias,
-            transform=FixationMaskTransform(sparse=False), # Dense target fixation map
-            average="image", # As per original DeepGaze pretraining
-            segmentation_mask_dir=train_mask_dir_full,
-            segmentation_mask_format=args.segmentation_mask_format,
-            lmdb_path=str(salicon_train_lmdb_path) if args.use_lmdb_images else None,
-            # cached: Let ImageDataset decide or explicitly set False for large SALICON.
-            # If lmdb_path is provided, ImageDataset sets its internal `self.cached` to False for image/CB.
-            # cached=False, # Example: Explicitly disable parent image/CB caching for SALICON
-            
-            # --- THIS IS THE KEY CHANGE FOR MASK CACHING ---
-            cached_masks=args.cache_segmentation_masks
-        )
-        train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-                         if is_distributed else None)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True,
-            persistent_workers=args.num_workers > 0
-        )
-        if is_master: _logger.info(f"Train Dataloader created. Num batches: {len(train_loader)}")
+        train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None)
+        if train_sampler and hasattr(train_sampler, 'set_epoch'): train_sampler.set_epoch(0) # Initial epoch for sampler
 
-        val_dataset = ImageDatasetWithSegmentation(
-            stimuli=SALICON_val_stimuli,
-            fixations=SALICON_val_fixations,
-            centerbias_model=SALICON_centerbias,
-            transform=FixationMaskTransform(sparse=False),
-            average="image",
-            segmentation_mask_dir=val_mask_dir_full,
-            segmentation_mask_format=args.segmentation_mask_format,
-            lmdb_path=str(salicon_val_lmdb_path) if args.use_lmdb_images else None,
-            # cached=False, # Example for validation set as well
-            
-            # --- THIS IS THE KEY CHANGE FOR MASK CACHING ---
-            cached_masks=args.cache_segmentation_masks
-        )
-        val_sampler = (torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-                       if is_distributed else None)
-        validation_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False, 
-            num_workers=args.num_workers, pin_memory=True, sampler=val_sampler,
-            persistent_workers=args.num_workers > 0
-        )
-        if is_master: _logger.info(f"Validation Dataloader created. Num batches: {len(validation_loader)}")
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                                                 num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True,
+                                                 persistent_workers=args.num_workers > 0)
+        if is_master: _logger.info(f"Train Dataloader: {len(train_loader)} batches.")
+
+        val_sampler = (torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None)
+        # No need to set_epoch for val_sampler if shuffle=False usually
+
+        validation_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                                     num_workers=args.num_workers, pin_memory=True, sampler=val_sampler,
+                                                     persistent_workers=args.num_workers > 0)
+        if is_master: _logger.info(f"Validation Dataloader: {len(validation_loader)} batches.")
 
 
         # --- Training ---
-        # Construct a unique output directory name for this experiment
-        experiment_name = (f"{args.stage}_{args.densenet_model_name}_spade_k{args.num_total_segments-1}_emb{args.seg_embedding_dim}"
-                           f"_lr{args.lr}_bs{args.batch_size*world*args.gradient_accumulation_steps}")
+        #experiment_name = (f"{args.stage}_{args.densenet_model_name}_spade_k{args.num_total_segments}_emb{args.seg_embedding_dim}"
+        #                   f"_lr{args.lr}_bs{args.batch_size*world*args.gradient_accumulation_steps}")
+        experiment_name = (f"{args.stage}")
         output_dir_experiment = train_output_base_dir / experiment_name
-        if is_master: _logger.info(f"Experiment output directory: {output_dir_experiment}")
-        
-        # CRITICAL: Ensure your _train (from src.training) handles passing 'segmentation_mask' to model.forward()
+        if is_master: _logger.info(f"Experiment output to: {output_dir_experiment}")
+
+        # In scripts/train_deepgaze_Spade.py
+# Ensure all arguments that _train expects are passed correctly.
+
         _train(
-            this_directory=str(output_dir_experiment), model=model,
-            train_loader=train_loader, train_baseline_log_likelihood=train_baseline_log_likelihood,
-            val_loader=validation_loader, val_baseline_log_likelihood=val_baseline_log_likelihood,
-            optimizer=optimizer, lr_scheduler=lr_scheduler,
+            this_directory=str(output_dir_experiment),
+            model=model,
+            # --- Explicitly use keywords for ALL subsequent arguments ---
+            train_loader=train_loader,
+            train_baseline_log_likelihood=train_baseline_log_likelihood,
+            val_loader=validation_loader,
+            val_baseline_log_likelihood=val_baseline_log_likelihood,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             minimum_learning_rate=args.min_lr,
-            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'], # Default metrics
+            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'],
             validation_epochs=args.validation_epochs,
-            startwith=args.resume_checkpoint, # For resuming a specific experiment
+            startwith=args.resume_checkpoint,
             device=device,
-            is_distributed=is_distributed, is_master=is_master,
-            logger=_logger # Pass the logger instance
+            is_distributed=is_distributed,
+            is_master=is_master,
+            logger=_logger,
         )
         if is_master: _logger.info(f"--- Stage '{args.stage}' Finished ---")
 
     elif args.stage in ['mit_spatial_densenet_spade', 'mit_scanpath_frozen_densenet_spade', 'mit_scanpath_full_densenet_spade']:
-        # Placeholder for MIT stages - would require similar adaptation:
-        # - Correct prev_stage_dir to point to the SALICON DenseNet+SPADE output
-        # - Adapt MIT data loading (stimuli, fixations, centerbias, baseline LLs)
-        # - Adapt dataloaders to use ImageDatasetWithSegmentation or FixationDatasetWithSegmentation
-        # - Pass correct segmentation_mask_dir for MIT folds
-        # - Model building logic for different MIT stages (freezing, LRs)
         fold = args.fold
-        if fold is None or not (0 <= fold < 10):
-            _logger.critical("--fold required for MIT stages. Exiting.")
-            if is_distributed: dist.barrier(); sys.exit(1)
+        if fold is None or not (0 <= fold < 10): _logger.critical("--fold required for MIT stages and must be 0-9."); sys.exit(1)
         if is_master: _logger.info(f"--- Preparing MIT1003 Stage: {args.stage} (Fold {fold}) ---")
-        _logger.warning(f"MIT stage '{args.stage}' with DenseNet+SPADE is not fully implemented in this script version.")
-        _logger.warning("You will need to adapt data loading, checkpoint paths, and potentially model freezing logic.")
-        # ... (Detailed MIT stage implementation would go here) ...
+        _logger.warning(f"MIT stage '{args.stage}' is a placeholder. Full implementation needed for data loading, model setup, etc.")
+        # TODO: Implement MIT data loading for the specific fold.
+        # This will involve:
+        # 1. Getting MIT stimuli and fixations for the current fold (e.g., from a pre-converted location).
+        #    You might use your convert_stimuli_mit and convert_fixation_trains_mit here if running for the first time.
+        #    `mit_data_path = dataset_directory / f'MIT1003_converted_fold{fold}'`
+        # 2. Loading/computing MIT centerbias for the fold.
+        # 3. Setting up paths for MIT mask banks (these will be variable-size).
+        #    `train_var_payload = Path(args.train_mask_variable_payload_file_mit_fold{fold})` (need new args or pattern)
+        # 4. Creating ImageDatasetWithSegmentation instances for MIT train/val splits of the fold.
+        # 5. Potentially loading weights from the SALICON pretraining stage into the model.
+        # 6. Adjusting optimizer/scheduler if fine-tuning with different LRs.
+        # 7. Calling _train.
 
     else:
-        _logger.critical(f"Unknown or unsupported stage for this script: {args.stage}")
-        if is_distributed: dist.barrier()
-        sys.exit(1)
+        _logger.critical(f"Unknown or unsupported stage: {args.stage}"); sys.exit(1)
 
     cleanup_distributed()
-    if is_master:
-        _logger.info("==================================================")
-        _logger.info("Training script finished successfully.")
-        _logger.info("==================================================")
+    if is_master: _logger.info("Training script finished successfully.")
 
 
-# ============================================================================
-# == CLI ARGUMENT PARSER & YAML Loading ==
-# ============================================================================
+# ──────────────────────────────────────────────────────────────────────────────
+#  Main entry-point – YAML + CLI handling
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DeepGazeIII with DenseNet+SPADE (Multi-GPU & YAML Config)")
+    # Basic logging config for startup messages before main's detailed logger
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    _module_logger = logging.getLogger(__name__) # For messages during arg parsing
 
-    # --- Special Argument for YAML Config File ---
-    parser.add_argument('--config_file', type=str, default=None,
-                        help='Path to a YAML configuration file. CLI args will override YAML values.')
+    _pre = argparse.ArgumentParser(add_help=False) # Pre-parser for config_file
+    _pre.add_argument('--config_file', type=str, default=None, help="Path to YAML configuration file.")
+    _cfg_namespace, _remaining_cli_args = _pre.parse_known_args()
 
-    # --- All your existing arguments ---
-    # (Define them here as before, so they can act as defaults or overrides)
-    # --- Experiment Configuration ---
-    parser.add_argument('--stage', choices=['salicon_pretrain_densenet_spade',
-                                 'mit_spatial_densenet_spade',
-                                 'mit_scanpath_frozen_densenet_spade',
-                                 'mit_scanpath_full_densenet_spade'],
-                        help='Training stage to execute.')
-    parser.add_argument('--densenet_model_name', choices=['densenet161', 'densenet201'],
-                        help='DenseNet model variant.')
+    # Full parser, inheriting --config_file
+    parser = argparse.ArgumentParser(parents=[_pre], description="Train DeepGazeIII with DenseNet+SPADE", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    # --- SPADE Specific Arguments ---
-    parser.add_argument('--segmentation_mask_dir', type=str,
-                        help='Root directory for segmentation masks.')
-    parser.add_argument('--train_mask_subdir_name', type=str,
-                        help='Subdirectory for training set masks.')
-    parser.add_argument('--val_mask_subdir_name', type=str,
-                        help='Subdirectory for validation set masks.')
-    parser.add_argument('--segmentation_mask_format', choices=['png', 'npy'],
-                        help='File format of segmentation masks.')
-    parser.add_argument('--num_total_segments', type=int,
-                        help='Total number of unique segment IDs (K for K-Means 0 to K-1).')
-    parser.add_argument('--seg_embedding_dim', type=int, help='Dimension for segment embeddings.')
+    # --- Define ALL arguments that can appear in YAML or CLI ---
+    # Experiment Configuration
+    parser.add_argument('--stage', choices=['salicon_pretrain_densenet_spade', 'mit_spatial_densenet_spade', 'mit_scanpath_frozen_densenet_spade', 'mit_scanpath_full_densenet_spade'], help='Training stage to execute.')
+    parser.add_argument('--densenet_model_name', default='densenet201', choices=['densenet161', 'densenet201'], help='DenseNet variant.')
+    parser.add_argument('--log_level', type=str, default=None, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help='Logging level for detailed logs.')
 
-    # --- Training Hyperparameters ---
-    parser.add_argument('--batch_size', type=int, help='Batch size *per GPU*.')
-    parser.add_argument('--gradient_accumulation_steps', type=int, help='Gradient accumulation steps.')
-    parser.add_argument('--lr', type=float, help='Initial learning rate.')
-    parser.add_argument('--lr_milestones', type=int, nargs='+', help='Epochs for LR decay.')
-    parser.add_argument('--min_lr', type=float, help='Minimum learning rate.')
-    parser.add_argument('--fold', type=int, help='Cross-validation fold for MIT1003 (0-9).')
-    parser.add_argument('--validation_epochs', type=int, help='Run validation every N epochs.')
-    parser.add_argument('--resume_checkpoint', type=str, help='Path to resume checkpoint.')
+    # SPADE-specific & Individual Mask Fallback/Source
+    parser.add_argument('--segmentation_mask_dir', type=str, help='Root directory for individual segmentation masks (fallback/source).')
+    parser.add_argument('--train_mask_subdir_name', type=str, default='train', help='Subdirectory for training set individual masks.')
+    parser.add_argument('--val_mask_subdir_name', type=str, default='val', help='Subdirectory for validation set individual masks.')
+    parser.add_argument('--segmentation_mask_format', default='png', choices=['png', 'npy'], help='File format of individual masks.')
+    parser.add_argument('--num_total_segments', type=int, default=16, help='Number of segment IDs (K for K-Means).')
+    parser.add_argument('--seg_embedding_dim', type=int, default=64, help='Segment ID embedding dimension.')
 
-    # --- Dataloading & System ---
-    parser.add_argument('--num_workers', type=str, # Changed to str to handle 'auto' from YAML
-                        help="Dataloader workers. 'auto' or integer. If not set, determined automatically.")
-    parser.add_argument('--train_dir', help='Base directory for training outputs.')
-    parser.add_argument('--dataset_dir', help='Directory for pysaliency datasets.')
-    parser.add_argument('--lmdb_dir', help='Directory for LMDB image caches.')
-    parser.add_argument('--use_lmdb_images', action=argparse.BooleanOptionalAction, help='Use LMDB for stimulus images.') # Allows --no-use-lmdb-images
-    parser.add_argument('--cache_segmentation_masks', action=argparse.BooleanOptionalAction, help='Cache segmentation masks in RAM.')
+    # Training hyper-parameters
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size per GPU.')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps.')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Initial learning-rate.')
+    parser.add_argument('--lr_milestones', type=int, nargs='+', default=[15, 30, 45], help='Epochs for LR decay.')
+    parser.add_argument('--min_lr', type=float, default=1e-7, help='Min learning rate.')
+    parser.add_argument('--fold', type=int, help='MIT1003 fold (0-9), if applicable.')
+    parser.add_argument('--validation_epochs', type=int, default=1, help='Validate every N epochs.')
+    parser.add_argument('--resume_checkpoint', type=str, help='Path to checkpoint to resume from.')
 
-    # --- Model Generic Arguments ---
-    parser.add_argument('--add_sa_head', action=argparse.BooleanOptionalAction, help='Add SelfAttention to saliency network.')
+    # Data-loading / system
+    parser.add_argument('--num_workers', type=str, default='auto', help="'auto' or integer for dataloader workers per rank.")
+    parser.add_argument('--train_dir', type=str, default='./experiments_dg3_spade', help="Base output directory for experiments.")
+    parser.add_argument('--dataset_dir', type=str, default='./data/pysaliency_datasets', help="Pysaliency datasets directory.")
+    parser.add_argument('--lmdb_dir', type=str, default='./data/lmdb_caches', help="LMDB image cache directory.")
+    parser.add_argument('--use_lmdb_images', action=argparse.BooleanOptionalAction, default=True, help='Use LMDB for stimuli.')
 
-    # --- Initial Parse for Config File Path ---
-    # Parse known args first to get config_file path without erroring on other CLI args
-    temp_args, remaining_argv = parser.parse_known_args()
-    config_args = {}
+    # Mask Bank Arguments
+    parser.add_argument('--train_mask_memmap_file', type=str, help="Fixed-size memmap bank (.npy) for TRAIN masks.")
+    parser.add_argument('--val_mask_memmap_file', type=str, help="Fixed-size memmap bank (.npy) for VAL masks.")
+    parser.add_argument('--train_mask_variable_payload_file', type=str, help="Variable-size mask PAYLOAD (.bin) for TRAIN.")
+    parser.add_argument('--train_mask_variable_header_file', type=str, help="Companion HEADER (.npy) for TRAIN variable payload.")
+    parser.add_argument('--val_mask_variable_payload_file', type=str, help="Variable-size mask PAYLOAD (.bin) for VAL.")
+    parser.add_argument('--val_mask_variable_header_file', type=str, help="Companion HEADER (.npy) for VAL variable payload.")
+    parser.add_argument('--segmentation_mask_bank_dtype', type=str, default='uint8', choices=['uint8', 'uint16'], help="Dtype for mask bank storage.")
 
-    if temp_args.config_file:
-        config_file_path = Path(temp_args.config_file)
-        if config_file_path.is_file():
-            logging.info(f"Loading config file: {config_file_path}")
-            with open(config_file_path, 'r') as f:
-                config_args = yaml.safe_load(f)
-            if config_args is None: # Handle empty YAML file
-                config_args = {}
-        else:
-            print(f"Warning: Specified config file not found: {config_file_path}. Using defaults/CLI args.")
-            # Potentially exit if config file is required and not found
-            # sys.exit(f"Error: Config file {config_file_path} not found.")
+    # Model options
+    parser.add_argument('--add_sa_head', action=argparse.BooleanOptionalAction, default=False, help='Add self-attention head to saliency network.')
 
-    # --- Set Defaults from YAML (or initial parser defaults if no YAML/key missing) ---
-    # This allows CLI to override YAML values.
-    # We effectively re-parse with YAML values as new defaults.
-    # Create a new parser or update defaults of the existing one.
-    # For simplicity here, we'll update the existing parser's defaults.
-    # For every argument defined in the parser:
-    for action in parser._actions:
-        if action.dest in config_args and action.dest != "config_file": # Don't override config_file itself
-            # Handle different action types correctly (store_true, etc.)
-            if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction, argparse.BooleanOptionalAction)):
-                # For boolean actions, the value from YAML should directly set the default
-                # This is a bit tricky as `set_defaults` expects the default for store_true to be False
-                # Let's directly update the default value
-                parser.set_defaults(**{action.dest: config_args[action.dest]})
-            elif action.default != config_args[action.dest]: # Only update if different
-                parser.set_defaults(**{action.dest: config_args[action.dest]})
-
-    # --- Final Parse with updated defaults and remaining CLI args ---
-    # `remaining_argv` will be parsed on top of defaults (which now include YAML values)
-    final_args = parser.parse_args(remaining_argv)
-
-
-    # --- Automatic Worker Count ---
-    world_size_env = int(os.environ.get("WORLD_SIZE", 1)) # Use a different var name
-    # Handle 'auto' for num_workers from YAML/CLI
-    if isinstance(final_args.num_workers, str) and final_args.num_workers.lower() == 'auto':
-        final_args.num_workers = None # Let the original auto-detection logic handle it
-
-    if final_args.num_workers is None: # If still None (was 'auto' or not set)
+    # Load YAML and set defaults
+    if _cfg_namespace.config_file:
         try:
-            cpu_count = len(os.sched_getaffinity(0))
-        except AttributeError:
-            cpu_count = os.cpu_count() or 1
-        final_args.num_workers = max(0, cpu_count // world_size_env if world_size_env > 0 else cpu_count)
-        if final_args.num_workers == 0 and world_size_env > 1:
-            if cpu_count > world_size_env: final_args.num_workers = 1
-    elif not isinstance(final_args.num_workers, int) or final_args.num_workers < 0:
-        # If it came from YAML/CLI as a non-'auto' string or invalid int, default to 0
-        print(f"Warning: Invalid num_workers value '{final_args.num_workers}'. Defaulting to 0.")
-        final_args.num_workers = 0
+            with open(_cfg_namespace.config_file, 'r') as f: yaml_cfg = yaml.safe_load(f) or {}
+            _module_logger.info(f"Loaded YAML config from: {_cfg_namespace.config_file}")
+            parser.set_defaults(**yaml_cfg) # YAML values become defaults
+        except FileNotFoundError: _module_logger.warning(f"YAML config file not found: {_cfg_namespace.config_file}")
+        except Exception as e: _module_logger.warning(f"Could not read/parse YAML '{_cfg_namespace.config_file}': {e}")
+
+    final_args_ns = parser.parse_args(_remaining_cli_args) # CLI overrides YAML-based defaults
+
+    # Post-processing (num_workers)
+    # ... (your existing robust num_workers post-processing logic) ...
+    world_size_env = int(os.environ.get("WORLD_SIZE", 1))
+    if isinstance(final_args_ns.num_workers, str) and final_args_ns.num_workers.lower() == 'auto':
+        final_args_ns.num_workers = None
+    if final_args_ns.num_workers is None: # If 'auto' or not set at all
+        try: cpu_count = len(os.sched_getaffinity(0))
+        except AttributeError: cpu_count = os.cpu_count() or 1
+        final_args_ns.num_workers = max(0, cpu_count // world_size_env if world_size_env > 0 else cpu_count)
+        if final_args_ns.num_workers == 0 and world_size_env > 1 and cpu_count > world_size_env: final_args_ns.num_workers = 1
+    else: # If it was an int from YAML or CLI
+        try: final_args_ns.num_workers = int(final_args_ns.num_workers)
+        except ValueError: _module_logger.warning(f"Invalid num_workers='{final_args_ns.num_workers}', using 0."); final_args_ns.num_workers = 0
+        if final_args_ns.num_workers < 0: _module_logger.warning(f"Negative num_workers='{final_args_ns.num_workers}', using 0."); final_args_ns.num_workers = 0
 
 
-    # --- Argument Validation (Example) ---
-    if final_args.stage is None:
-        parser.error("The --stage argument (or 'stage' in YAML) is required.")
-    if final_args.segmentation_mask_dir is None and "spade" in final_args.stage:
-        parser.error("--segmentation_mask_dir (or in YAML) is required for SPADE stages.")
-    if final_args.num_total_segments is None or final_args.num_total_segments <= 0:
-         parser.error("--num_total_segments (or in YAML) must be a positive integer.")
+    # Basic validation
+    if final_args_ns.stage is None: parser.error("--stage is required (in YAML or CLI).")
+    is_spade_stage = 'spade' in final_args_ns.stage
+    # Check if any mask source is provided if it's a SPADE stage
+    has_fixed_train_bank = final_args_ns.train_mask_memmap_file
+    has_variable_train_bank = final_args_ns.train_mask_variable_payload_file and final_args_ns.train_mask_variable_header_file
+    has_individual_masks_dir_cfg = final_args_ns.segmentation_mask_dir and final_args_ns.train_mask_subdir_name # Check if configured
 
+    if is_spade_stage and not (has_fixed_train_bank or has_variable_train_bank or has_individual_masks_dir_cfg):
+        parser.error("For SPADE stages, a mask source is required: train_mask_memmap_file (fixed), "
+                     "train_mask_variable_payload/header_file (variable), or segmentation_mask_dir + train_mask_subdir_name (individual fallback).")
+    if final_args_ns.num_total_segments <= 0: # num_total_segments has a default now
+        parser.error("--num_total_segments must be a positive integer.")
 
     try:
-        main(final_args) # Pass the final Namespace object
-    except KeyboardInterrupt:
-        _logger.warning("Training interrupted by user (KeyboardInterrupt). Cleaning up...")
-        cleanup_distributed()
-        sys.exit(130)
-    except Exception as e:
-        _logger.critical("Unhandled exception during main execution:", exc_info=True)
-        cleanup_distributed()
-        sys.exit(1)
+        main(final_args_ns)
+    except KeyboardInterrupt: _logger.warning("Training interrupted by user (Ctrl+C)."); cleanup_distributed(); sys.exit(130)
+    except Exception: _logger.critical("Unhandled exception during main execution:", exc_info=True); cleanup_distributed(); sys.exit(1)
