@@ -25,5 +25,5 @@ mask_bank_dtype: 'uint8' # 'uint8' for labels 0-255, 'uint16' for more
 # build_fixed_size_bank_output_file: './masks_output/SALICON_train_k16_dinov2l14_fixed.npy'
 
 # To build a variable-size bank (e.g., for MIT1003 or SALICON if original sizes are preserved for masks)
-build_variable_size_bank_payload_file: './masks/SALICON_train_k16_dinov2l14_var.bin'
-build_variable_size_bank_header_file: './masks/SALICON_train_k16_dinov2l14_var_header.npy'
+build_variable_size_bank_payload_file: './masks/banks/SALICON_train_k16_dinov2l14_var_payload.bin'
+build_variable_size_bank_header_file: './masks/banks/SALICON_train_k16_dinov2l14_var_header.npy'
