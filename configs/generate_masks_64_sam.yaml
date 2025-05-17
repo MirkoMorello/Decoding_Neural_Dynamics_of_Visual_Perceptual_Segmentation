@@ -1,0 +1,26 @@
+stimuli_location: "./data/pysaliency_datasets"
+dataset_name: "SALICON_train" # Change per dataset
+output_dir: "./masks/sam_vitb_k64_salicon_train" # Change per dataset/config
+file_format: "png"
+overwrite_individual_masks: false # Set to true to re-generate
+
+sam_model_type: "vit_l" # 'vit_h', 'vit_l', 'vit_b'
+sam_checkpoint_path: "./data/sam_vit_l_0b3195.pth" # IMPORTANT: Set this!
+device: "cuda"
+
+sam_points_per_side: 32
+sam_pred_iou_thresh: 0.86 # SAM defaults
+sam_stability_score_thresh: 0.92 # SAM defaults
+sam_min_mask_region_area: 100 # SAM's internal filter, pixels
+
+num_target_segments_from_sam: 64 # Your desired K for the final integer mask
+sam_background_label: 0
+sam_postprocess_min_area_ratio: 0.0005 # Filter tiny SAM masks during postprocessing
+sam_postprocess_iou_thresh_nms: 0.8   # NMS during postprocessing
+use_fp16_sam: true
+
+# Optional bank building
+mask_bank_dtype: "uint8"
+#build_fixed_size_bank_output_file: "./masks/banks/sam64/salicon_train_sam_k4_fixed.npy"
+build_variable_size_bank_payload_file: "./masks/banks/sam64/salicon_train_sam_64_var_payload.bin"
+build_variable_size_bank_header_file: "./masks/banks/sam64/salicon_train_sam_64_var_header.npy"
