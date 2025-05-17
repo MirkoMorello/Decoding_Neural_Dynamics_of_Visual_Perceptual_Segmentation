@@ -37,10 +37,10 @@ segmentation_mask_bank_dtype: 'uint8' # Dtype used for storing masks in the bank
 
 # Paths for VARIABLE-SIZE Mask Banks.
 # Ensure these paths match where `generate_masks_Dinov2.py` saves the banks for SALICON.
-train_mask_variable_payload_file: './masks/SALICON_train_k16_dinov2l14_payload.bin'
-train_mask_variable_header_file: './masks/SALICON_train_k16_dinov2l14_header.npy'
-val_mask_variable_payload_file: './masks/SALICON_val_k16_dinov2l14_payload.bin'
-val_mask_variable_header_file: './masks/SALICON_val_k16_dinov2l14_header.npy'
+train_mask_variable_payload_file: './masks/banks/SALICON_train_k16_dinov2l14_payload.bin'
+train_mask_variable_header_file: './masks/banks/SALICON_train_k16_dinov2l14_header.npy'
+val_mask_variable_payload_file: './masks/banks/SALICON_val_k16_dinov2l14_payload.bin'
+val_mask_variable_header_file: './masks/banks/SALICON_val_k16_dinov2l14_header.npy'
 
 # Fixed-size bank options are intentionally omitted or commented out to force variable-size usage.
 # train_mask_fixed_memmap_file: null # or comment out
