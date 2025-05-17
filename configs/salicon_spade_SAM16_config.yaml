@@ -1,0 +1,50 @@
+# salicon_spade_k16_config.yaml
+# For use with train_deepgaze_Spade.py
+# Configured to use VARIABLE-SIZE mask banks for SALICON for consistency with MIT1003 later.
+
+# --- Experiment Configuration ---
+stage: 'salicon_pretrain_densenet_spade'
+densenet_model_name: 'densenet201'
+
+# --- SPADE Specific Arguments ---
+# These are for the *individual* masks if memmap banks are not used or for building the banks.
+#segmentation_mask_dir: './masks/SALICON_k16_dinov2l14_individual/' # Root dir for individual masks (fallback/source)
+train_mask_subdir_name: 'train'            # Subdir under the above for train set individual masks
+val_mask_subdir_name: 'val'                # Subdir under the above for val set individual masks
+segmentation_mask_format: 'png'              # Format of the individual masks
+num_total_segments: 16                       # K for K-Means
+seg_embedding_dim: 64                        # Embedding dimension for segment IDs
+
+# --- Training Hyperparameters ---
+batch_size: 8
+gradient_accumulation_steps: 1
+lr: 0.0005 # 5e-4
+lr_milestones: [15, 30, 45]
+min_lr: 0.0000001
+fold: null # Not used for SALICON
+validation_epochs: 1
+resume_checkpoint: null
+
+# --- Dataloading & System ---
+num_workers: 8 # Number of DataLoader workers per GPU
+train_dir: './experiments/densenet_spade_sam' # Updated to reflect variable mask usage
+dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored by pysaliency
+lmdb_dir: './data/lmdb_cache_densenet'      # Where LMDB caches for images/centerbiases will be stored
+use_lmdb_images: true                       # Use LMDB for images and centerbiases
+
+# --- Segmentation Mask Bank Configuration (Using VARIABLE-SIZE for consistency) ---
+segmentation_mask_bank_dtype: 'uint8' # Dtype used for storing masks in the bank(s)
+
+# Paths for VARIABLE-SIZE Mask Banks.
+# Ensure these paths match where `generate_masks_Dinov2.py` saves the banks for SALICON.
+train_mask_variable_payload_file: './masks/banks/sam64/salicon_train_sam_16_var_payload.bin'
+train_mask_variable_header_file: './masks/banks/sam64/salicon_train_sam_16_var_header.npy'
+val_mask_variable_payload_file: './masks/banks/sam64/salicon_val_sam_16_var_payload.bin'
+val_mask_variable_header_file: './masks/banks/sam64/salicon_val_sam_16_var_header.npy'
+
+# Fixed-size bank options are intentionally omitted or commented out to force variable-size usage.
+# train_mask_fixed_memmap_file: null # or comment out
+# val_mask_fixed_memmap_file: null   # or comment out
+
+# --- Model Generic Arguments ---
+add_sa_head: false
