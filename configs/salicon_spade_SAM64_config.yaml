@@ -27,7 +27,7 @@ resume_checkpoint: null
 
 # --- Dataloading & System ---
 num_workers: 8 # Number of DataLoader workers per GPU
-train_dir: './experiments/densenet_spade_sam' # Updated to reflect variable mask usage
+train_dir: './experiments/densenet_spade_sam_64' # Updated to reflect variable mask usage
 dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored by pysaliency
 lmdb_dir: './data/lmdb_cache_densenet'      # Where LMDB caches for images/centerbiases will be stored
 use_lmdb_images: true                       # Use LMDB for images and centerbiases

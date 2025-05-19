@@ -1,6 +1,6 @@
 stimuli_location: "./data/pysaliency_datasets"
 dataset_name: "SALICON_val" # Change per dataset
-output_dir: "./masks/sam_vitb_k16_salicon_val" # Change per dataset/config
+output_dir: "./masks/sam_vitb_16_salicon_val" # Change per dataset/config
 file_format: "png"
 overwrite_individual_masks: false # Set to true to re-generate
 
