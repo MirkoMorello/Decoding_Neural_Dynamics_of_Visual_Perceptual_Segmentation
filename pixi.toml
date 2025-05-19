@@ -10,11 +10,12 @@ register-kernel = "python -m ipykernel install --user --name=pixi-decode-dynamic
 
 # Install GPU-enabled PyTorch, TorchVision, and xformers via pip
 install-gpu-packages = "python -m pip install --force-reinstall torch==2.6.0+cu118 torchvision==0.21.0+cu118 xformers --index-url https://download.pytorch.org/whl/cu118"
+install-pyg-packages = "python -m pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.6.0+cu118.html"
 pysaliency-dev = { cmd = "pip install --force-reinstall git+https://github.com/matthias-k/pysaliency.git@dev" }
 
 
 # Full setup: conda deps, then GPU pip packages, then register kernel
-setup = "pixi install && pixi run install-gpu-packages && pixi run register-kernel && pysaliency-dev"
+setup = "pixi install && pixi run install-gpu-packages && pixi run install-pyg-packages && pixi run pysaliency-dev && pixi run register-kernel"
 
 serve = "jupyter lab"
 
@@ -53,4 +54,8 @@ xformers      = "*"
 opencv-python = ">=4.11.0.86, <5"
 
 [pypi-options]
-extra-index-urls = ["https://download.pytorch.org/whl/cu118"]
+extra-index-urls = [
+    "https://download.pytorch.org/whl/cu118",
+    "https://data.pyg.org/whl/torch-2.6.0+cu118.html" # Add this line
+]
+
