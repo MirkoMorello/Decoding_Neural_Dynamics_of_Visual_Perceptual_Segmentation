@@ -43,6 +43,7 @@ except ImportError:
     from src.metrics import log_likelihood, nss, auc as auc_cpu_fn
     from src.modules import DeepGazeII
 
+import logging
 
 # baseline_performance = cached(LRU(max_size=3))(lambda model, *args, **kwargs: model.information_gain(*args, **kwargs))
 # This seems to be for a pysaliency model object, not directly used in train/eval epoch here.
