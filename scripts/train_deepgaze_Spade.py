@@ -42,8 +42,6 @@ try:
         ImageDatasetWithSegmentation, # Key change
         ImageDataset, # If you kept the original name as this
         FixationMaskTransform,
-        # The prepare_... functions might need adaptation to pass segmentation_mask_dir
-        # For now, we'll instantiate datasets directly in main for this script
         convert_stimuli, convert_fixation_trains # If used for MIT preprocessing
     )
     # Original DeepGaze modules and layers that we will reuse

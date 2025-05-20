@@ -35,6 +35,7 @@ from pysaliency.baseline_utils import (BaselineModel,
 import cloudpickle as cpickle
 import pysaliency
 from tqdm import tqdm
+import yaml
 from boltons.fileutils import atomic_save # Needed for copied _train
 
 
@@ -243,6 +244,9 @@ def main(args):
 
     # ======================= STAGE DISPATCH ============================
     if args.stage == 'salicon_pretrain':
+        current_lr = args.lr_salicon
+        current_downsample = args.downsample_salicon
+        current_milestones = args.lr_milestones_salicon
         if is_master: _logger.info("--- Preparing SALICON Pretraining Stage ---")
 
         if is_master: _logger.info(f"Loading SALICON data from {dataset_directory}...")
@@ -319,7 +323,7 @@ def main(args):
             saliency_network=build_saliency_network(C_in, add_sa_head=args.add_sa_head),
             scanpath_network=None,
             fixation_selection_network=build_fixation_selection_network(scanpath_features=0),
-            downsample=1,
+            downsample=current_downsample,
             readout_factor=readout_factor,
             saliency_map_factor=4,
             included_fixations=[]
