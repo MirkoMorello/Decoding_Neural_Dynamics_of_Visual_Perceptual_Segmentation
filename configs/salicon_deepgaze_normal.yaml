@@ -1,0 +1,49 @@
+# config_deepgaze_original_ddp.yaml
+# Configuration for training the original DeepGaze III (DenseNet-201 backbone) with DDP.
+# For use with train_deepgaze_original_ddp.py
+
+# --- Experiment Configuration ---
+stage: 'salicon_pretrain' # Choose from: 'salicon_pretrain', 'mit_spatial', 'mit_scanpath_frozen', 'mit_scanpath_full'
+log_level: 'INFO'         # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# --- Model Configuration ---
+# Backbone is fixed to DenseNet-201 with specific hooks as per original DeepGaze III.
+downsample_salicon: 1.5   # Initial image downsampling factor for SALICON pretraining stage.
+downsample_mit: 2.0       # Initial image downsampling factor for all MIT1003 fine-tuning stages.
+
+# --- Training Hyperparameters ---
+batch_size: 16                  # Batch size per GPU. Notebook used 32; adjust based on VRAM.
+gradient_accumulation_steps: 1  # Number of steps to accumulate gradients before optimizer step.
+min_lr: 0.0000001               # Minimum learning rate for the scheduler (1e-7).
+validation_epochs: 1            # Run validation every N epochs.
+resume_checkpoint: null         # Optional: Path to a specific checkpoint (.pth) to resume training from.
+                                # If null, _train will try to resume from 'step-*.pth' in the stage's output directory.
+                                # For MIT stages, it will first try to load from the *previous* stage's 'final.pth' or 'final_best_val.pth'.
+
+# --- MIT1003 Specific ---
+fold: 0                         # Cross-validation fold for MIT stages (0-9). Only used if stage starts with 'mit_'.
+
+# --- Stage-Specific Learning Rates and Milestones ---
+# SALICON Pretraining Stage
+lr_salicon: 0.001
+lr_milestones_salicon: [15, 30, 45, 60, 75, 90, 105, 120]
+
+# MIT1003 Spatial Fine-tuning Stage
+lr_mit_spatial: 0.001
+lr_milestones_mit_spatial: [3, 6, 9, 12, 15, 18, 21, 24]
+
+# MIT1003 Scanpath Fine-tuning (Frozen Saliency Parts) Stage
+lr_mit_scanpath_frozen: 0.001
+lr_milestones_mit_scanpath_frozen: [10, 20, 30, 31, 32, 33, 34, 35] # From notebook
+
+# MIT1003 Scanpath Fine-tuning (Full Model) Stage
+lr_mit_scanpath_full: 0.00001 # 1e-5, as used in the notebook
+lr_milestones_mit_scanpath_full: [3, 6, 9, 12, 15, 18, 21, 24]
+
+
+# --- Dataloading & System ---
+num_workers: 'auto'             # Number of DataLoader workers per GPU. 'auto' or an integer.
+train_dir: './experiments_deepgaze_original' # Base output directory for all experiment stages.
+dataset_dir: './data/pysaliency_datasets'    # Root directory where pysaliency datasets (SALICON, MIT1003) are stored/downloaded.
+lmdb_dir: './data/lmdb_caches_deepgaze_original' # Directory for LMDB image caches.
+use_lmdb_images: true           # Whether to use LMDB for caching dataset images (recommended for speed).
