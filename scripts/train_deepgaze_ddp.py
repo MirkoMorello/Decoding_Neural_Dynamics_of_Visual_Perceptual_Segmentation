@@ -129,24 +129,20 @@ def build_scanpath_network():
 
 
 def build_fixation_selection_network(scanpath_features=16):
-    # Input is a tuple: (saliency_output [1 channel], scanpath_output [scanpath_features channels])
-    # scanpath_features=0 if no scanpath network
-    input_dims = [1] # Saliency features
-    if scanpath_features > 0:
-        input_dims.append(scanpath_features)
-    
+    """ Builds the network combining saliency and scanpath features for fixation selection. """
+    saliency_channels = 1 # Output of saliency network's core path before combination
+    in_channels_list = [saliency_channels, scanpath_features if scanpath_features > 0 else 0]
+
     return nn.Sequential(OrderedDict([
-        ('layernorm0', LayerNormMultiInput(input_dims)),
-        ('conv0', Conv2dMultiInput(input_dims, 128, (1, 1), bias=False)),
+        ('layernorm0', LayerNormMultiInput(in_channels_list)), # Now gets [1, 0] or [1, 16]
+        ('conv0', Conv2dMultiInput(in_channels_list, 128, (1, 1), bias=False)), # Now gets [1, 0] or [1, 16]
         ('bias0', Bias(128)),
         ('softplus0', nn.Softplus()),
-
         ('layernorm1', LayerNorm(128)),
         ('conv1', nn.Conv2d(128, 16, (1, 1), bias=False)),
         ('bias1', Bias(16)),
         ('softplus1', nn.Softplus()),
-
-        ('conv2', nn.Conv2d(16, 1, (1, 1), bias=False)), # Final output, 1 channel
+        ('conv2', nn.Conv2d(16, 1, (1, 1), bias=False)), # Final output layer
     ]))
 
 # ============================================================================
@@ -719,7 +715,7 @@ if __name__ == "__main__":
     )
 
     # --- Core arguments ---
-    parser.add_argument('--stage', required=True,
+    parser.add_argument('--stage',
         choices=['salicon_pretrain', 'mit_spatial', 'mit_scanpath_frozen', 'mit_scanpath_full'],
         help='Training stage to execute.')
     parser.add_argument('--log_level', type=str, default="INFO", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
