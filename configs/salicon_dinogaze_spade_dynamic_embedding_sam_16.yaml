@@ -53,10 +53,16 @@ segmentation_mask_bank_dtype: 'uint8' # Dtype used for storing SAM masks in the 
 
 # Option 2: Variable-size mask banks (more flexible for SAM masks of different image sizes)
 # Ensure these paths match where your SAM mask generation script saves/saved them.
-train_mask_variable_payload_file: './masks/banks/sam16/salicon_train_sam_16_var_payload.bin'
-train_mask_variable_header_file: './masks/banks/sam16/salicon_train_sam_16_var_header.npy'
-val_mask_variable_payload_file: './masks/banks/sam16/salicon_val_sam_16_var_payload.bin'
-val_mask_variable_header_file: './masks/banks/sam16/salicon_val_sam_16_var_header.npy'
+train_mask_variable_payload_file: './masks/salicon/banks/sam16/salicon_train_sam_16_var_payload.bin'
+train_mask_variable_header_file: './masks/salicon/banks/sam16/salicon_train_sam_16_var_header.npy'
+val_mask_variable_payload_file: './masks/salicon/banks/sam16/salicon_val_sam_16_var_payload.bin'
+val_mask_variable_header_file: './masks/salicon/banks/sam16/salicon_val_sam_16_var_header.npy'
+
+
+train_mask_variable_payload_file_mit: './masks/mit1003/banks/sam16/salicon_train_sam_16_var_payload.bin'
+train_mask_variable_header_file_mit: './masks/mit1003/banks/sam16/salicon_train_sam_16_var_header.npy'
+val_mask_variable_payload_file_mit: './masks/mit1003/banks/sam16/salicon_val_sam_16_var_payload.bin'
+val_mask_variable_header_file_mit: './masks/mit1003/banks/sam16/salicon_val_sam_16_var_header.npy'
 
 # Option 3: Using individual mask files (if no banks are prepared)
 # Ensure segmentation_mask_dir, train_mask_subdir_name, val_mask_subdir_name are set correctly.
