@@ -293,7 +293,7 @@ class DeepGazeIII(torch.nn.Module):
             saliency_map_factor=self.saliency_map_factor,
         )
 
-    def forward(self, x, centerbias, x_hist=None, y_hist=None, durations=None):
+    def forward(self, x, centerbias, x_hist=None, y_hist=None, durations=None, **kwargs):
         orig_shape = x.shape
         x = F.interpolate(x, scale_factor=1 / self.downsample)
         x = self.features(x)
@@ -347,7 +347,7 @@ class DeepGazeIIIMixture(torch.nn.Module):
         self.fixation_selection_networks = torch.nn.ModuleList(fixation_selection_networks)
         self.finalizers = torch.nn.ModuleList(finalizers)
 
-    def forward(self, x, centerbias, x_hist=None, y_hist=None, durations=None):
+    def forward(self, x, centerbias, x_hist=None, y_hist=None, durations=None, **kwargs):
         orig_shape = x.shape
         x = F.interpolate(
             x,
