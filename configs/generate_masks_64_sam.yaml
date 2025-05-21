@@ -1,6 +1,6 @@
 stimuli_location: "./data/pysaliency_datasets"
 dataset_name: "SALICON_train" # Change per dataset
-output_dir: "./masks/sam_vitb_k64_salicon_train" # Change per dataset/config
+output_dir: "./masks/salicon/sam_vitl_k64_salicon_train" # Change per dataset/config
 file_format: "png"
 overwrite_individual_masks: false # Set to true to re-generate
 
@@ -22,5 +22,5 @@ use_fp16_sam: true
 # Optional bank building
 mask_bank_dtype: "uint8"
 #build_fixed_size_bank_output_file: "./masks/banks/sam64/salicon_train_sam_k4_fixed.npy"
-build_variable_size_bank_payload_file: "./masks/banks/sam64/salicon_train_sam_64_var_payload.bin"
-build_variable_size_bank_header_file: "./masks/banks/sam64/salicon_train_sam_64_var_header.npy"
+build_variable_size_bank_payload_file: "./masks/salicon/banks/sam64/salicon_train_sam_64_var_payload.bin"
+build_variable_size_bank_header_file: "./masks/salicon/banks/sam64/salicon_train_sam_64_var_header.npy"
