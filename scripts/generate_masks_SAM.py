@@ -12,6 +12,7 @@ from tqdm import tqdm
 import yaml
 import logging
 import time # For simple timing
+import pickle # For loading MIT1003_twosize stimuli.pkl
 
 # SAM specific imports
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
@@ -254,11 +255,11 @@ def run_sam_mask_generation_worker(rank: int, world_size: int, config: dict):
             mit_base_path = Path(config['stimuli_location'])
             if not mit_base_path.is_dir(): # If stimuli_location points directly to pkl or its parent
                  mit_base_path = mit_base_path.parent
-            mit_converted_stimuli_path = mit_base_path / "MIT1003_twosize" / "stimuli.pkl"
+            mit_converted_stimuli_path = mit_base_path / "stimuli.pkl"
             if not mit_converted_stimuli_path.exists():
                  logger.error(f"[Worker {rank}] MIT1003_twosize stimuli.pkl not found at {mit_converted_stimuli_path}"); return
             with open(mit_converted_stimuli_path, "rb") as f:
-                 stimuli_obj = pysaliency.load_stimuli(f)
+                stimuli_obj = pickle.load(f) # pysaliency has its own load/save
         else:
             logger.error(f"[Worker {rank}] Unknown dataset_name: {config['dataset_name']}"); return
         stimuli_paths_full_list = stimuli_obj.filenames

@@ -12,6 +12,7 @@ from PIL import Image
 from sklearn.cluster import KMeans
 from torchvision import transforms as pth_transforms
 from tqdm import tqdm
+import pickle
 
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -159,7 +160,7 @@ def run_mask_generation(config):
             if not mit_converted_stimuli_path.exists():
                  print(f"MIT1003_twosize stimuli.pkl not found at {mit_converted_stimuli_path}"); return
             with open(mit_converted_stimuli_path, "rb") as f:
-                 stimuli_obj = pysaliency.load_stimuli(f) # pysaliency has its own load/save
+                 stimuli_obj = pickle.load(f) # pysaliency has its own load/save
         else:
             print(f"Unknown dataset_name: {config['dataset_name']}"); return
         
