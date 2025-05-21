@@ -43,7 +43,7 @@ lr_milestones_mit_scanpath_full: [3, 6, 9, 12, 15, 18, 21, 24]
 
 # --- Dataloading & System ---
 num_workers: 'auto'             # Number of DataLoader workers per GPU. 'auto' or an integer.
-train_dir: './experiments_deepgaze_original' # Base output directory for all experiment stages.
+train_dir: './experiments/experiments_deepgaze_original' # Base output directory for all experiment stages.
 dataset_dir: './data/pysaliency_datasets'    # Root directory where pysaliency datasets (SALICON, MIT1003) are stored/downloaded.
 lmdb_dir: './data/lmdb_caches_deepgaze_original' # Directory for LMDB image caches.
 use_lmdb_images: true           # Whether to use LMDB for caching dataset images (recommended for speed).
