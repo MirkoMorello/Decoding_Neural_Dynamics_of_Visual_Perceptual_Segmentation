@@ -244,22 +244,28 @@ class ImageDataset(torch.utils.data.Dataset):
 class ImageDatasetWithSegmentation(ImageDataset):
     def __init__(self, *args,
                  segmentation_mask_dir: str | Path | None = None,
+                 # segmentation_mask_subdir will be handled via kwargs.pop
                  segmentation_mask_format: str = "png",
-                 # Args for fixed-size memmap bank
                  segmentation_mask_fixed_memmap_file: str | Path | None = None,
-                 # Args for variable-size memmap bank
                  segmentation_mask_variable_payload_file: str | Path | None = None,
                  segmentation_mask_variable_header_file: str | Path | None = None,
-                 segmentation_mask_bank_dtype: str = "uint8", # Dtype of data in bank(s)
+                 segmentation_mask_bank_dtype: str = "uint8",
                  **kwargs): # Parent class args (stimuli, fixations, lmdb_path, cached, etc.)
+                             # and potentially 'segmentation_mask_subdir'
 
-        # `cached` kwarg for parent (ImageDataset) is passed via **kwargs.
-        # This controls RAM caching for image/centerbias/fixation-coords.
+        # Consume 'segmentation_mask_subdir' from kwargs before calling super().
+        # This is the specific subdirectory for the current dataset (e.g., "salicon/train_sam64" or "mit1003/all_sam64").
+        # It will be combined with segmentation_mask_dir (the root) if loading individual files.
+        _segmentation_mask_subdir_str = kwargs.pop('segmentation_mask_subdir', None)
+        self.segmentation_mask_subdir_for_loading = Path(_segmentation_mask_subdir_str) if _segmentation_mask_subdir_str else None
+
+        # Now call parent init with the remaining kwargs
         super().__init__(*args, **kwargs)
 
-        self.segmentation_mask_dir = Path(segmentation_mask_dir) if segmentation_mask_dir else None
+        # --- Initialize attributes specific to ImageDatasetWithSegmentation ---
+        self.segmentation_mask_dir = Path(segmentation_mask_dir) if segmentation_mask_dir else None # This is the ROOT directory for all mask sets
         self.segmentation_mask_format = segmentation_mask_format.lower()
-        self._mask_bank_dtype_np = np.dtype(segmentation_mask_bank_dtype) # dtype for reading banks
+        self._mask_bank_dtype_np = np.dtype(segmentation_mask_bank_dtype)
 
         # Fixed-size memmap attributes
         self.mask_fixed_mmap_bank = None
@@ -275,11 +281,12 @@ class ImageDatasetWithSegmentation(ImageDataset):
             if fixed_memmap_path.exists():
                 try:
                     self.mask_fixed_mmap_bank = np.memmap(fixed_memmap_path, mode='r', dtype=self._mask_bank_dtype_np)
-                    self.mask_fixed_mmap_shape = self.mask_fixed_mmap_bank.shape
-                    if not (len(self.mask_fixed_mmap_shape) == 3 and self.mask_fixed_mmap_shape[0] == len(self.stimuli)):
-                        logger.error(f"Fixed mask memmap shape {self.mask_fixed_mmap_shape} incompatible with stimuli count {len(self.stimuli)}. Disabling fixed memmap.")
-                        self.mask_fixed_mmap_bank = None; self.mask_fixed_mmap_shape = None
+                    # Validate shape: (N, H, W), where N must match stimuli count
+                    if not (self.mask_fixed_mmap_bank.ndim == 3 and self.mask_fixed_mmap_bank.shape[0] == len(self.stimuli)):
+                        logger.error(f"Fixed mask memmap shape {self.mask_fixed_mmap_bank.shape} incompatible with stimuli count {len(self.stimuli)}. Disabling fixed memmap.")
+                        self.mask_fixed_mmap_bank = None
                     else:
+                        self.mask_fixed_mmap_shape = self.mask_fixed_mmap_bank.shape # Store (N,H,W)
                         logger.info(f"Successfully memory-mapped FIXED-SIZE segmentation masks from: {fixed_memmap_path} with shape {self.mask_fixed_mmap_shape}")
                 except Exception as e:
                     logger.error(f"Error memory-mapping fixed-size masks from {fixed_memmap_path}: {e}. Will try other methods.")
@@ -299,119 +306,133 @@ class ImageDatasetWithSegmentation(ImageDataset):
                     if not (self.mask_variable_header_data.ndim == 2 and \
                             self.mask_variable_header_data.shape[1] == 3 and \
                             self.mask_variable_header_data.shape[0] == len(self.stimuli)):
-                        logger.error(f"Variable mask header shape {self.mask_variable_header_data.shape} incompatible. Disabling variable memmap.")
+                        logger.error(f"Variable mask header shape {self.mask_variable_header_data.shape} incompatible with stimuli count {len(self.stimuli)}. Disabling variable memmap.")
                         self.mask_variable_header_data = None
                     else:
                         self.mask_variable_payload_mmap = np.memmap(payload_path, dtype=self._mask_bank_dtype_np, mode='r')
                         logger.info(f"Successfully set up VARIABLE-SIZE mask loading from: Payload '{payload_path}', Header '{header_path}'")
                 except Exception as e:
                     logger.error(f"Error setting up variable-size mask loading: {e}. Will try individual files.")
-                    self.mask_variable_payload_mmap = None; self.mask_variable_header_data = None
+                    self.mask_variable_payload_mmap = None
+                    self.mask_variable_header_data = None
             else:
-                logger.warning("Variable-size mask payload or header file not found.")
+                logger.warning(f"Variable-size mask payload or header file not found. Needed: {payload_path} and {header_path}")
 
-        # --- Fallback to Individual File Loading if no memmap banks are active ---
-        fixed_memmap_active = self.mask_fixed_mmap_bank is not None
-        variable_memmap_active = self.mask_variable_payload_mmap is not None and \
-                                 self.mask_variable_header_data is not None
-
-        if not fixed_memmap_active and not variable_memmap_active: # Corrected condition
-            if self.segmentation_mask_dir:
-                if not self.segmentation_mask_dir.exists():
-                    logger.warning(f"Fallback: Individual segmentation mask directory does not exist: {self.segmentation_mask_dir}")
-                else:
-                    logger.info(f"Fallback: Using individual mask files from {self.segmentation_mask_dir} (since no memmap banks were successfully loaded/configured).")
-            else:
-                logger.warning("No mask memmap banks or individual mask directory provided. Dummy masks will be used for all items.")
-        elif fixed_memmap_active:
+        # --- Log Chosen Mask Loading Strategy ---
+        self.mask_loading_strategy = "dummy" # Default
+        if self.mask_fixed_mmap_bank is not None:
+            self.mask_loading_strategy = "fixed_bank"
             logger.info(f"Using FIXED-SIZE memmap bank for segmentation masks.")
-        elif variable_memmap_active:
+        elif self.mask_variable_payload_mmap is not None and self.mask_variable_header_data is not None:
+            self.mask_loading_strategy = "variable_bank"
             logger.info(f"Using VARIABLE-SIZE memmap bank for segmentation masks.")
+        elif self.segmentation_mask_dir and self.segmentation_mask_subdir_for_loading:
+            full_individual_mask_path_base = self.segmentation_mask_dir / self.segmentation_mask_subdir_for_loading
+            if full_individual_mask_path_base.exists():
+                self.mask_loading_strategy = "individual_files"
+                logger.info(f"Fallback: Using individual mask files from {full_individual_mask_path_base}.")
+            else:
+                logger.warning(f"Fallback directory for individual masks ({full_individual_mask_path_base}) does not exist. Dummy masks will be used.")
+        elif self.segmentation_mask_dir:
+             logger.warning(f"Individual mask root directory ({self.segmentation_mask_dir}) provided, but specific subdir for this dataset is missing or invalid. Dummy masks will be used.")
+        else:
+            logger.warning("No valid mask source (bank or individual files dir+subdir) configured. Dummy masks will be used.")
 
 
     def __getitem__(self, key: int): # key is the stimulus index 'n'
         # 1. Get base item (image, centerbias, fixations, weight) from parent ImageDataset
         original_item = super().__getitem__(key)
 
-        # 2. Prepare final_item dictionary and convert base items to tensors
+        # 2. Prepare final_item dictionary and convert base items to tensors if they are numpy
         final_item = {}
-        if isinstance(original_item['image'], np.ndarray):
-            final_item['image'] = torch.from_numpy(original_item['image'].copy()) # CHW, float32
-        else: # Already a tensor if parent transform did it
-            final_item['image'] = original_item['image']
+        for k_orig, v_orig in original_item.items():
+            if isinstance(v_orig, np.ndarray):
+                final_item[k_orig] = torch.from_numpy(v_orig.copy()) # Ensure copy for safety
+            elif isinstance(v_orig, (torch.Tensor, float, int)): # Pass tensors and scalars directly
+                final_item[k_orig] = v_orig
+            else: # For other types, just assign (e.g., strings, lists if any)
+                 final_item[k_orig] = v_orig
+        
+        # Ensure 'weight' is a tensor
+        if 'weight' not in final_item or not isinstance(final_item['weight'], torch.Tensor):
+            final_item['weight'] = torch.tensor(original_item.get('weight', 1.0), dtype=torch.float32)
 
-        if isinstance(original_item['centerbias'], np.ndarray):
-            final_item['centerbias'] = torch.from_numpy(original_item['centerbias'].copy()) # HW, float32
-        else: # Already a tensor
-            final_item['centerbias'] = original_item['centerbias']
 
-        final_item['weight'] = torch.tensor(original_item.get('weight', 1.0), dtype=torch.float32)
-
-        if 'fixation_mask' in original_item: # If FixationMaskTransform was applied by parent
-            final_item['fixation_mask'] = original_item['fixation_mask']
-
-        # Copy any other items from parent
-        for k, v in original_item.items():
-            if k not in final_item and k not in ['x', 'y', 'image', 'centerbias', 'weight']:
-                final_item[k] = v
-
-        # 3. Load Segmentation Mask
+        # 3. Load Segmentation Mask based on determined strategy
         mask_tensor_to_add = None
 
-        # --- Try Fixed-Size Memmap Bank First ---
-        if self.mask_fixed_mmap_bank is not None:
+        if self.mask_loading_strategy == "fixed_bank":
             try:
-                mask_np_view = self.mask_fixed_mmap_bank[key] # (H, W) view
-                mask_np_copy = np.array(mask_np_view) # Explicit copy
-                mask_tensor_to_add = torch.from_numpy(mask_np_copy.astype(np.int64))
-            except IndexError: logger.error(f"Index {key} out of bounds for fixed mask bank. Using dummy.")
-            except Exception as e: logger.error(f"Error from fixed mask bank for key {key}: {e}. Using dummy.")
+                # self.mask_fixed_mmap_shape should be (N, H, W)
+                # So, mask_np_view is (H, W)
+                mask_np_view = self.mask_fixed_mmap_bank[key]
+                mask_np_copy = np.array(mask_np_view) # Explicit copy from memmap view
+                mask_tensor_to_add = torch.from_numpy(mask_np_copy.astype(np.int64)) # Use Long for segment IDs
+            except IndexError: logger.error(f"Index {key} out of bounds for fixed mask bank. Using dummy mask.")
+            except Exception as e: logger.error(f"Error reading from fixed mask bank for key {key}: {e}. Using dummy mask.")
 
-        # --- Else, Try Variable-Size Memmap Bank ---
-        elif self.mask_variable_payload_mmap is not None and self.mask_variable_header_data is not None:
+        elif self.mask_loading_strategy == "variable_bank":
             try:
                 offset, H, W = self.mask_variable_header_data[key]
-                if H == 0 and W == 0: # Error placeholder from bank build
-                    logger.debug(f"Skipping variable mask for key {key} due to bank build error.")
+                if H == 0 and W == 0: # Placeholder for error during bank creation
+                    logger.debug(f"Skipping variable mask for key {key} due to bank build error indicated in header.")
+                elif H < 0 or W < 0: # Invalid dimensions
+                    logger.warning(f"Invalid dimensions H={H}, W={W} in variable mask header for key {key}. Using dummy mask.")
                 else:
                     num_elements = H * W
-                    # Ensure offset and num_elements are within bounds of the payload mmap
                     if offset + num_elements > self.mask_variable_payload_mmap.size:
-                        raise ValueError(f"Calculated slice [{offset}:{offset+num_elements}] exceeds payload size {self.mask_variable_payload_mmap.size}")
+                        raise ValueError(f"Calculated slice [{offset}:{offset+num_elements}] (size {num_elements}) "
+                                         f"from H={H},W={W} exceeds payload size {self.mask_variable_payload_mmap.size} "
+                                         f"for key {key}. Header might be corrupt or mismatched.")
                     
                     mask_1d_view = self.mask_variable_payload_mmap[offset : offset + num_elements]
                     mask_np_array = np.array(mask_1d_view).reshape(H, W) # Copy and reshape
                     mask_tensor_to_add = torch.from_numpy(mask_np_array.astype(np.int64))
-            except IndexError: logger.error(f"Index {key} out of bounds for variable mask header. Using dummy.")
-            except Exception as e: logger.error(f"Error from variable mask bank for key {key}: {e}. Using dummy.")
+            except IndexError: logger.error(f"Index {key} out of bounds for variable mask header. Using dummy mask.")
+            except ValueError as ve: # Catch specific value errors from size checks
+                 logger.error(f"ValueError for variable mask bank for key {key}: {ve}. Using dummy mask.")
+            except Exception as e: logger.error(f"Error reading from variable mask bank for key {key}: {e}. Using dummy mask.")
 
-        # --- Else, Fallback to Individual File Loading ---
-        if mask_tensor_to_add is None and self.segmentation_mask_dir and self.segmentation_mask_dir.exists():
+        elif self.mask_loading_strategy == "individual_files":
+            # This assumes self.segmentation_mask_dir and self.segmentation_mask_subdir_for_loading are valid Path objects
             try:
+                if not hasattr(self.stimuli, 'filenames') or self.stimuli.filenames is None:
+                    raise AttributeError("Dataset's stimuli object does not have 'filenames' attribute, "
+                                         "cannot load individual masks by filename.")
+                
                 stimulus_filename_abs = self.stimuli.filenames[key]
                 img_basename = Path(stimulus_filename_abs).stem
                 mask_fname = f"{img_basename}.{self.segmentation_mask_format}"
-                mask_path_full = self.segmentation_mask_dir / mask_fname
+                
+                mask_path_full = self.segmentation_mask_dir / self.segmentation_mask_subdir_for_loading / mask_fname
 
                 if mask_path_full.exists():
                     if self.segmentation_mask_format == "png":
-                        mask_pil = Image.open(mask_path_full).convert('L')
+                        mask_pil = Image.open(mask_path_full)
+                        # Ensure it's a single channel if it's L, LA, P etc.
+                        if mask_pil.mode not in ['L', 'I', 'P']: # P for palette, I for 32-bit integer pixels
+                            # If it's RGB, take one channel, or handle as error if unexpected format
+                            logger.warning(f"Mask {mask_path_full} is mode {mask_pil.mode}, expected L, I, or P. Converting to L.")
+                            mask_pil = mask_pil.convert('L')
                         mask_arr = np.array(mask_pil)
                     elif self.segmentation_mask_format == "npy":
                         mask_arr = np.load(mask_path_full)
                     else:
                         raise ValueError(f"Unsupported individual mask format: {self.segmentation_mask_format}")
                     mask_tensor_to_add = torch.from_numpy(mask_arr.astype(np.int64))
-                # else: # Mask file not found, will go to dummy
-                #    logger.debug(f"Fallback: Individual mask not found: {mask_path_full}")
-            except IndexError: logger.error(f"Fallback: Index {key} out of bounds for stimuli.filenames. Using dummy mask.")
+                else:
+                   logger.debug(f"Fallback: Individual mask file not found: {mask_path_full}")
+            except IndexError:
+                logger.error(f"Fallback: Index {key} out of bounds for stimuli.filenames. Using dummy mask.")
+            except AttributeError as ae:
+                 logger.error(f"Fallback: Error accessing stimuli filenames for individual mask loading: {ae}. Using dummy mask.")
             except Exception as e_fallback:
-                logger.warning(f"Fallback: Error loading individual mask for key {key}: {e_fallback}. Using dummy mask.")
-
-        # --- If All Else Fails, Create Dummy Mask ---
+                mask_path_str = str(mask_path_full) if 'mask_path_full' in locals() else 'N/A'
+                logger.warning(f"Fallback: Error loading individual mask for key {key} from {mask_path_str}: {e_fallback}. Using dummy mask.")
+        
+        # --- If All Else Fails or strategy is "dummy", Create Dummy Mask ---
         if mask_tensor_to_add is None:
-            # logger.debug(f"Creating dummy segmentation mask for key {key}.")
-            # Use shape of the image in final_item (already tensor)
+            # logger.debug(f"Creating dummy segmentation mask for key {key} because no valid source was found or strategy is 'dummy'.")
             img_h_final, img_w_final = final_item['image'].shape[1], final_item['image'].shape[2]
             mask_tensor_to_add = torch.zeros((img_h_final, img_w_final), dtype=torch.long)
 
