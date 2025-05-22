@@ -487,8 +487,8 @@ if __name__ == '__main__':
             elif final_config['dataset_name'] == 'MIT1003_twosize':
                 mit_base_path_bank = Path(final_config['stimuli_location'])
                 if not mit_base_path_bank.is_dir(): mit_base_path_bank = mit_base_path_bank.parent
-                mit_pkl_bank = mit_base_path_bank / "MIT1003_twosize" / "stimuli.pkl"
-                with open(mit_pkl_bank, "rb") as f_bank: stimuli_obj_bank = pysaliency.load_stimuli(f_bank)
+                mit_pkl_bank = mit_base_path_bank / "stimuli.pkl"
+                with open(mit_pkl_bank, "rb") as f_bank: stimuli_obj_bank = pickle.load(f_bank)
             else: raise ValueError(f"Unknown dataset for banking: {final_config['dataset_name']}")
             all_stimuli_for_bank = stimuli_obj_bank.filenames
         except Exception as e_bank_stim:
