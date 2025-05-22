@@ -20,7 +20,6 @@ import argparse
 import logging
 from pathlib import Path
 from collections import OrderedDict
-import pickle # For pysaliency FileStimuli caching
 
 import torch
 import torch.nn as nn
@@ -316,9 +315,7 @@ def main(args: argparse.Namespace):
     dataset_directory = Path(args.dataset_dir).resolve()
     train_output_base_dir = Path(args.train_dir).resolve()
     lmdb_image_cache_dir = Path(args.lmdb_dir).resolve()
-    # SAM mask root dir for individual files (used as fallback or primary if banks not specified)
     segmentation_mask_root_dir = Path(args.segmentation_mask_dir).resolve() if args.segmentation_mask_dir else None
-
 
     if is_master:
         for p_path in [dataset_directory, train_output_base_dir, lmdb_image_cache_dir]:
@@ -330,14 +327,14 @@ def main(args: argparse.Namespace):
     if is_master: _logger.info(f"Initializing {args.dinov2_model_name} backbone...")
     dino_backbone = DinoV2Backbone(
         layers=args.dinov2_layers_for_main_path, model_name=args.dinov2_model_name,
-        patch_size=args.dinov2_patch_size, freeze=True # Backbone is always frozen for these experiments
+        patch_size=args.dinov2_patch_size, freeze=True
     ).to(device)
-    dino_backbone.eval() # Ensure backbone is in eval mode
+    dino_backbone.eval()
     if is_master: _logger.info(f"{args.dinov2_model_name} (hooks: {args.dinov2_layers_for_main_path}) initialized and frozen.")
 
     C_dino_embed_dim = dino_backbone.num_channels
     main_path_concatenated_channels = len(args.dinov2_layers_for_main_path) * C_dino_embed_dim
-    semantic_feature_channels_for_spade = C_dino_embed_dim # Semantic features are from one DINO layer
+    semantic_feature_channels_for_spade = C_dino_embed_dim
 
     if is_master:
         _logger.info(f"DINO Channels: Single layer output (C_dino) = {C_dino_embed_dim}")
@@ -345,9 +342,8 @@ def main(args: argparse.Namespace):
         _logger.info(f"SPADE Modulation: Semantic feature channels (from one DINO layer) = {semantic_feature_channels_for_spade}")
         _logger.info(f"SPADE Modulation: Semantic features taken from DINO layer index {args.dinov2_semantic_feature_layer_idx} (actual positive index used in model)")
 
-
     # --- Stage Dispatch ---
-    if args.stage == 'salicon_pretraining':
+    if args.stage == 'salicon_pretraining': # Assuming 'salicon_pretrain_dinogaze_spade_sam' was a typo in previous script
         if is_master: _logger.info(f"--- Preparing SALICON Pretraining with DINOv2+SPADE(DynamicSAM)+Scatter ---")
         current_lr = args.lr
         current_milestones = args.lr_milestones
@@ -365,12 +361,11 @@ def main(args: argparse.Namespace):
 
         SALICON_centerbias = BaselineModel(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations, bandwidth=0.0217, eps=2e-13, caching=False)
         
-        train_ll_cache_file = dataset_directory / f'salicon_baseline_train_ll_dinogaze_{args.dinov2_model_name}.pkl' # Make cache name specific
+        train_ll_cache_file = dataset_directory / f'salicon_baseline_train_ll_dinogaze_{args.dinov2_model_name}.pkl'
         val_ll_cache_file = dataset_directory / f'salicon_baseline_val_ll_dinogaze_{args.dinov2_model_name}.pkl'
         train_baseline_log_likelihood, val_baseline_log_likelihood = None, None
 
-        if is_master: # Master computes or loads LLs
-            # ... (same LL loading/computation logic as before) ...
+        if is_master:
             try:
                 with open(train_ll_cache_file,'rb') as f: train_baseline_log_likelihood=cpickle.load(f)
                 _logger.info(f"Loaded TRAIN LL from {train_ll_cache_file}")
@@ -387,44 +382,39 @@ def main(args: argparse.Namespace):
                 with open(val_ll_cache_file,'wb') as f: cpickle.dump(val_baseline_log_likelihood,f)
             _logger.info(f"Master Baseline LLs - Train: {train_baseline_log_likelihood or float('nan'):.5f}, Val: {val_baseline_log_likelihood or float('nan'):.5f}")
 
-        ll_bcast=[train_baseline_log_likelihood, val_baseline_log_likelihood] # Broadcast to other ranks
+        ll_bcast=[train_baseline_log_likelihood, val_baseline_log_likelihood]
         if is_distributed:
             if is_master and (train_baseline_log_likelihood is None or val_baseline_log_likelihood is None): ll_bcast = [np.nan, np.nan]
             dist.broadcast_object_list(ll_bcast,src=0)
         train_baseline_log_likelihood,val_baseline_log_likelihood = ll_bcast
         if np.isnan(train_baseline_log_likelihood) or np.isnan(val_baseline_log_likelihood):
             _logger.critical(f"NaN LLs received/computed on rank {rank}. Exiting."); sys.exit(1)
-        else: _logger.info(f"Rank {rank} Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
+        else:
+            _logger.info(f"Rank {rank} Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
 
-        # --- Model Instantiation for SALICON ---
         saliency_net_spade_dynamic = SaliencyNetworkSPADEDynamic(
             input_channels_main_path=main_path_concatenated_channels,
             semantic_feature_channels_for_spade=semantic_feature_channels_for_spade
         )
-        # For spatial-only model, scanpath_features is 0
-        fixsel_net = build_fixation_selection_network(scanpath_features=0)
+        fixsel_net = build_fixation_selection_network(scanpath_features=0) 
 
         model = DinoGazeSpade(
-            features_module=dino_backbone, # Already on device
+            features_module=dino_backbone,
             saliency_network=saliency_net_spade_dynamic,
-            scanpath_network=None, # Explicitly None for SALICON pretraining (spatial only)
+            scanpath_network=None, 
             fixation_selection_network=fixsel_net,
             dinov2_patch_size=args.dinov2_patch_size,
             semantic_feature_layer_idx=args.dinov2_semantic_feature_layer_idx,
             num_sam_segments=args.num_total_sam_segments,
-            downsample_input_to_backbone=1, # Default, from DINOgaze
-            readout_factor=args.dinov2_patch_size, # DINOgaze uses patch_size as readout_factor
-            saliency_map_factor_finalizer=4, # Common value
+            downsample_input_to_backbone=1,
+            readout_factor=args.dinov2_patch_size,
+            saliency_map_factor_finalizer=4,
             initial_sigma=args.finalizer_initial_sigma
         ).to(device)
 
         if is_master: _logger.info("DinoGazeSpade (Dynamic SAM) model built for SALICON.")
         if is_distributed:
-            # find_unused_parameters=True because scanpath_network is None, so its params in fixsel_net won't get grads.
-            # Or, if fixsel_net adapts to scanpath_features=0 and has no unused scanpath params, this can be False.
-            # Given build_fixation_selection_network creates network based on scanpath_features, find_unused might be False if scanpath_features=0
-            # To be safe for now, let's use True, but False might be possible if fixsel_net is lean.
-            model = DDP(model, device_ids=[device.index], find_unused_parameters=True) # Scanpath is None
+            model = DDP(model, device_ids=[device.index], find_unused_parameters=True) 
             if is_master: _logger.info("Wrapped model with DDP.")
 
         head_params = [p for p in model.parameters() if p.requires_grad]
@@ -432,11 +422,8 @@ def main(args: argparse.Namespace):
         optimizer = optim.Adam(head_params, lr=current_lr)
         lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=current_milestones)
 
-        # --- Dataloaders for SALICON ---
-        # Mask paths (individual file fallback)
         train_mask_individual_dir = segmentation_mask_root_dir / args.train_mask_subdir_name if segmentation_mask_root_dir and args.train_mask_subdir_name else None
         val_mask_individual_dir = segmentation_mask_root_dir / args.val_mask_subdir_name if segmentation_mask_root_dir and args.val_mask_subdir_name else None
-        # Mask paths (banks)
         train_fixed_memmap = Path(args.train_mask_memmap_file).resolve() if args.train_mask_memmap_file else None
         val_fixed_memmap = Path(args.val_mask_memmap_file).resolve() if args.val_mask_memmap_file else None
         train_var_payload = Path(args.train_mask_variable_payload_file).resolve() if args.train_mask_variable_payload_file else None
@@ -445,35 +432,37 @@ def main(args: argparse.Namespace):
         val_var_header = Path(args.val_mask_variable_header_file).resolve() if args.val_mask_variable_header_file else None
 
         if is_master:
-            _logger.info(f"Train SAM Mask Config: FallbackDir='{train_mask_individual_dir}', FixedBank='{train_fixed_memmap}', VarBankPayload='{train_var_payload}'")
-            _logger.info(f"Val SAM Mask Config: FallbackDir='{val_mask_individual_dir}', FixedBank='{val_fixed_memmap}', VarBankPayload='{val_var_payload}'")
+            _logger.info(f"Train SAM Mask Config (SALICON): FallbackDir='{train_mask_individual_dir}', FixedBank='{train_fixed_memmap}', VarBankPayload='{train_var_payload}'")
+            _logger.info(f"Val SAM Mask Config (SALICON): FallbackDir='{val_mask_individual_dir}', FixedBank='{val_fixed_memmap}', VarBankPayload='{val_var_payload}'")
 
-        dataset_kwargs_train = {
+        dataset_kwargs_train_salicon = {
             "transform": FixationMaskTransform(sparse=False), "average": "image",
             "lmdb_path": str(lmdb_image_cache_dir / f'SALICON_train_imgs_dinogaze_{args.dinov2_model_name}') if args.use_lmdb_images else None,
-            "segmentation_mask_dir": train_mask_individual_dir, # For individual SAM masks
+            "segmentation_mask_dir": segmentation_mask_root_dir, # Root dir
+            "segmentation_mask_subdir": args.train_mask_subdir_name, # Subdir for SALICON train
             "segmentation_mask_format": args.segmentation_mask_format,
-            "segmentation_mask_fixed_memmap_file": train_fixed_memmap, # For fixed banks
-            "segmentation_mask_variable_payload_file": train_var_payload, # For variable banks
+            "segmentation_mask_fixed_memmap_file": train_fixed_memmap,
+            "segmentation_mask_variable_payload_file": train_var_payload,
             "segmentation_mask_variable_header_file": train_var_header,
             "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
         }
-        train_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations, centerbias_model=SALICON_centerbias, **dataset_kwargs_train)
+        train_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_train_stimuli, fixations=SALICON_train_fixations, centerbias_model=SALICON_centerbias, **dataset_kwargs_train_salicon)
         
-        dataset_kwargs_val = { # Similar for validation
+        dataset_kwargs_val_salicon = {
             "transform": FixationMaskTransform(sparse=False), "average": "image",
             "lmdb_path": str(lmdb_image_cache_dir / f'SALICON_val_imgs_dinogaze_{args.dinov2_model_name}') if args.use_lmdb_images else None,
-            "segmentation_mask_dir": val_mask_individual_dir,
+            "segmentation_mask_dir": segmentation_mask_root_dir, # Root dir
+            "segmentation_mask_subdir": args.val_mask_subdir_name, # Subdir for SALICON val
             "segmentation_mask_format": args.segmentation_mask_format,
             "segmentation_mask_fixed_memmap_file": val_fixed_memmap,
             "segmentation_mask_variable_payload_file": val_var_payload,
             "segmentation_mask_variable_header_file": val_var_header,
             "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
         }
-        val_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_val_stimuli, fixations=SALICON_val_fixations, centerbias_model=SALICON_centerbias, **dataset_kwargs_val)
+        val_dataset = ImageDatasetWithSegmentation(stimuli=SALICON_val_stimuli, fixations=SALICON_val_fixations, centerbias_model=SALICON_centerbias, **dataset_kwargs_val_salicon)
 
         train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None)
-        if train_sampler and hasattr(train_sampler, 'set_epoch'): train_sampler.set_epoch(0) # Initial epoch for DDP sampler
+        if train_sampler and hasattr(train_sampler, 'set_epoch'): train_sampler.set_epoch(0)
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
                                                  num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True,
@@ -484,17 +473,27 @@ def main(args: argparse.Namespace):
                                                      persistent_workers=args.num_workers > 0)
         if is_master: 
             _logger.info(f"Train Dataloader: {len(train_loader)} batches. Val Dataloader: {len(validation_loader)} batches.")
-            # ... (sample batch inspection logic from original script) ...
-            if not train_dataset or len(train_dataset) == 0: _logger.error("Train dataset is empty!"); sys.exit(1)
-            else:
+            if not train_dataset or len(train_dataset) == 0: 
+                _logger.error("Train dataset is empty or failed to load.")
+                sys.exit(1)
+            else: # Sample batch inspection
                 try:
                     sample_batch = next(iter(train_loader))
                     _logger.info(f"Sample batch keys: {sample_batch.keys()}")
-                    if 'segmentation_mask' not in sample_batch: _logger.error("CRITICAL: 'segmentation_mask' not in batch."); sys.exit(1)
-                    if sample_batch['segmentation_mask'].max() >= args.num_total_sam_segments:
-                         _logger.warning(f"WARNING: Max SAM ID in batch ({sample_batch['segmentation_mask'].max()}) >= num_total_sam_segments ({args.num_total_sam_segments}).")
-                except Exception as e_batch: _logger.error(f"Error inspecting sample batch: {e_batch}", exc_info=True); sys.exit(1)
-
+                    _logger.info(f"Sample image shape: {sample_batch['image'].shape}")
+                    if 'segmentation_mask' in sample_batch:
+                        _logger.info(f"Sample segmentation_mask shape: {sample_batch['segmentation_mask'].shape}, dtype: {sample_batch['segmentation_mask'].dtype}, min: {sample_batch['segmentation_mask'].min()}, max: {sample_batch['segmentation_mask'].max()}")
+                        if sample_batch['segmentation_mask'].max() >= args.num_total_sam_segments:
+                             _logger.warning(f"WARNING: Max value in sample seg mask ({sample_batch['segmentation_mask'].max()}) >= num_total_sam_segments ({args.num_total_sam_segments}). Check mask generation and config.")
+                    else:
+                        _logger.error("CRITICAL: 'segmentation_mask' not found in batch. Dataloader or ImageDatasetWithSegmentation needs to provide it.")
+                        sys.exit(1)
+                except StopIteration:
+                     _logger.error("Train dataloader is empty! Cannot get sample batch.")
+                     sys.exit(1)
+                except Exception as e_batch:
+                     _logger.error(f"Error inspecting sample batch: {e_batch}", exc_info=True)
+                     sys.exit(1)
 
         output_dir_experiment = train_output_base_dir / output_dir_stage_relative
         if is_master: _logger.info(f"Experiment output to: {output_dir_experiment}")
@@ -506,114 +505,188 @@ def main(args: argparse.Namespace):
             optimizer=optimizer, lr_scheduler=lr_scheduler,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             minimum_learning_rate=args.min_lr,
-            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'], # Assuming AUC_CPU is desired
+            validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'],
             validation_epochs=args.validation_epochs,
-            startwith=args.resume_checkpoint, # General resume, _train handles specific step
+            startwith=args.resume_checkpoint,
             device=device, is_distributed=is_distributed, is_master=is_master, logger=_logger,
         )
         if is_master: _logger.info(f"--- Stage '{args.stage}' Finished ---")
 
-    # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    # +++ MIT STAGES FOR SPATIAL FINE-TUNING OF DinoGazeSpade +++
-    # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    elif args.stage in ['mit_spatial']:
+    elif args.stage in ['mit_spatial']: # Assuming 'mit_spatial' is the correct stage name from YAML/CLI
         fold = args.fold
         if fold is None or not (0 <= fold < 10):
-            _logger.critical("--fold required for MIT stages and must be 0-9."); sys.exit(1)
+            _logger.critical("--fold (0-9) is required and must be valid for MIT stages.");
+            if is_distributed: dist.barrier()
+            sys.exit(1)
         
         if is_master: _logger.info(f"--- Preparing MIT1003 Stage: {args.stage} (Fold {fold}) ---")
-        current_lr = args.lr_mit_spatial # Use MIT specific LR
+        current_lr = args.lr_mit_spatial
         current_milestones = args.lr_milestones_mit_spatial
         
-        # Define previous stage dir for loading checkpoint
-        # Assumes SALICON pretraining stage name is 'salicon_pretraining'
-        prev_stage_name = f"salicon_pretraining_{args.dinov2_model_name}_spade_dynSAMscatter{args.num_total_sam_segments}_lr{args.lr}"
-        prev_stage_checkpoint_dir = train_output_base_dir / prev_stage_name
+        # Determine previous stage name for checkpoint loading
+        # Note: args.lr is SALICON LR, args.num_total_sam_segments is general
+        prev_stage_salicon_name = f"salicon_pretraining_{args.dinov2_model_name}_spade_dynSAMscatter{args.num_total_sam_segments}_lr{args.lr}"
+        prev_stage_checkpoint_dir = train_output_base_dir / prev_stage_salicon_name
         
         output_dir_stage_relative = f"{args.stage}_{args.dinov2_model_name}_fold{fold}_dynSAMscatter{args.num_total_sam_segments}_lr{current_lr}"
         output_dir_experiment = train_output_base_dir / output_dir_stage_relative
 
         # --- MIT Data Handling (Conversion, Splits, Baseline) ---
-        mit_converted_stimuli_path = train_output_base_dir / f'MIT1003_converted_dinogaze_sam_{args.dinov2_model_name}'
-        mit_stimuli_file_cache = mit_converted_stimuli_path / "stimuli.pkl"
-        mit_scanpaths_file_cache = mit_converted_stimuli_path / "scanpaths.pkl" # Not used for spatial, but for completeness
+        mit_converted_data_path = train_output_base_dir / f'MIT1003_converted_dinogaze_sam_{args.dinov2_model_name}'
+        mit_stimuli_cache_file = mit_converted_data_path / "stimuli.pkl"
+        # Scanpath cache is not strictly needed if we always re-process from raw for mit_fixations_flat_all
+        # but convert_fixation_trains_mit might save its own cache if designed to.
 
-        needs_conversion = True
-        if mit_stimuli_file_cache.exists(): # Only check stimuli for spatial
-            if is_master: _logger.info("Found cached converted MIT1003 stimuli.")
-            needs_conversion = False
+        needs_stimuli_conversion = True
+        if mit_stimuli_cache_file.exists():
+            if is_master and mit_stimuli_cache_file.stat().st_size > 0:
+                _logger.info(f"Found cached converted MIT1003 stimuli file: {mit_stimuli_cache_file} (size: {mit_stimuli_cache_file.stat().st_size} bytes). Will attempt to load.")
+                needs_stimuli_conversion = False
+            elif is_master:
+                _logger.warning(f"Cached stimuli file {mit_stimuli_cache_file} exists but is empty or invalid. Will regenerate.")
+        elif is_master:
+             _logger.info(f"Cached stimuli file {mit_stimuli_cache_file} not found. Will convert.")
         
         if is_distributed:
-            needs_conversion_tensor = torch.tensor(int(needs_conversion), device=device, dtype=torch.int)
-            dist.broadcast(needs_conversion_tensor, src=0)
-            needs_conversion = bool(needs_conversion_tensor.item())
+            needs_stimuli_conversion_tensor = torch.tensor(int(needs_stimuli_conversion), device=device, dtype=torch.int)
+            dist.broadcast(needs_stimuli_conversion_tensor, src=0) # Master broadcasts decision
+            needs_stimuli_conversion = bool(needs_stimuli_conversion_tensor.item())
 
-        mit_stimuli_twosize, mit_scanpaths_twosize_all = None, None # scanpaths only for full dataset processing
-        if needs_conversion:
+        mit_stimuli_twosize = None
+        mit_stimuli_orig = None # Will hold the original stimuli for scanpath scaling
+
+        if needs_stimuli_conversion:
             if is_master:
-                _logger.info(f"Converting MIT1003 data. Original from: {dataset_directory}, Processed to: {mit_converted_stimuli_path}")
-                mit_converted_stimuli_path.mkdir(parents=True, exist_ok=True)
-                try:
-                    pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(location=str(dataset_directory), replace_initial_invalid_fixations=True)
-                except ImportError: _logger.error("pysaliency.external_datasets.mit module not found."); dist.barrier(); sys.exit(1)
-                except Exception as e: _logger.critical(f"Failed to get original MIT1003: {e}"); dist.barrier(); sys.exit(1)
-            if is_distributed: dist.barrier()
-            mit_stimuli_orig, mit_scanpaths_orig = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(location=str(dataset_directory), replace_initial_invalid_fixations=True)
+                _logger.info(f"Converting MIT1003 stimuli. Original from: {dataset_directory}, Processed to: {mit_converted_data_path}")
+                mit_converted_data_path.mkdir(parents=True, exist_ok=True)
             
-            # Use the conversion functions from src.data
-            mit_stimuli_twosize = convert_stimuli_mit(mit_stimuli_orig, mit_converted_stimuli_path, is_master, is_distributed, device, _logger)
-            # mit_scanpaths_twosize_all = convert_fixation_trains_mit(mit_stimuli_orig, mit_scanpaths_orig, is_master, _logger) # If needed for scanpath later
+            # Load original stimuli (and scanpaths, though scanpaths are reloaded later for clarity)
+            # All ranks need mit_stimuli_orig for convert_stimuli_mit
+            mit_stimuli_orig_temp, _ = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(location=str(dataset_directory), replace_initial_invalid_fixations=True)
+            mit_stimuli_orig = mit_stimuli_orig_temp
+
+            mit_stimuli_twosize = convert_stimuli_mit(
+                mit_stimuli_orig, # Pass the original stimuli
+                mit_converted_data_path,
+                is_master, is_distributed, device, _logger
+            )
             
-            if mit_stimuli_twosize is None: _logger.critical("MIT1003 stimuli conversion failed."); sys.exit(1)
+            if mit_stimuli_twosize is None:
+                _logger.critical("CRITICAL: convert_stimuli_mit returned None. Stimuli conversion failed.");
+                if is_distributed: dist.barrier(); sys.exit(1)
+
             if is_master:
+                _logger.info(f"Attempting to save converted MIT stimuli (type: {type(mit_stimuli_twosize)}) to {mit_stimuli_cache_file}")
                 try:
-                    with atomic_save(str(mit_stimuli_file_cache), text_mode=False, overwrite_part=True) as f: pickle.dump(mit_stimuli_twosize, f)
-                    # if mit_scanpaths_twosize_all:
-                    #    with atomic_save(str(mit_scanpaths_file_cache), text_mode=False, overwrite_part=True) as f: cpickle.dump(mit_scanpaths_twosize_all, f)
-                    _logger.info(f"Saved converted MIT1003 stimuli to {mit_converted_stimuli_path}")
-                except Exception as e: _logger.error(f"Failed to save converted MIT data: {e}")
+                    with atomic_save(str(mit_stimuli_cache_file), text_mode=False, overwrite_part=True) as f:
+                        cpickle.dump(mit_stimuli_twosize, f) # Use cpickle
+                    _logger.info(f"Successfully saved converted MIT1003 stimuli.")
+                    if not mit_stimuli_cache_file.exists() or mit_stimuli_cache_file.stat().st_size == 0:
+                        _logger.error("CRITICAL: Stimuli cache file was written but is missing or empty post-save!")
+                except Exception as e:
+                    _logger.error(f"Failed to save converted MIT stimuli data: {e}", exc_info=True)
+                    _logger.warning("Proceeding with in-memory mit_stimuli_twosize for this run, but cache saving failed.")
             if is_distributed: dist.barrier()
-        else: # Load from cache
-            if is_master: _logger.info(f"Loading pre-converted MIT1003 stimuli from {mit_converted_stimuli_path}")
+        else: # Load stimuli from cache
+            if is_master: _logger.info(f"Loading pre-converted MIT1003 stimuli from {mit_stimuli_cache_file}")
+            if not mit_stimuli_cache_file.exists() or mit_stimuli_cache_file.stat().st_size == 0:
+                _logger.critical(f"CRITICAL: Stimuli cache file {mit_stimuli_cache_file} is missing or empty. Previous save likely failed or file was deleted.")
+                if is_distributed: dist.barrier(); sys.exit(1)
             try:
-                with open(mit_stimuli_file_cache, "rb") as f: mit_stimuli_twosize = pickle.load(f)
-                # if mit_scanpaths_file_cache.exists(): # Optionally load scanpaths if needed later
-                #    with open(mit_scanpaths_file_cache, "rb") as f: mit_scanpaths_twosize_all = cpickle.load(f)
-            except Exception as e: _logger.critical(f"Failed to load cached converted MIT stimuli: {e}"); sys.exit(1)
+                with open(mit_stimuli_cache_file, "rb") as f:
+                    mit_stimuli_twosize = cpickle.load(f) # Use cpickle
+                if mit_stimuli_twosize is None:
+                     _logger.critical(f"CRITICAL: Loaded None from stimuli cache file {mit_stimuli_cache_file}. File might be corrupted.")
+                     if is_distributed: dist.barrier(); sys.exit(1)
+                if is_master: _logger.info(f"Successfully loaded stimuli from cache. Type: {type(mit_stimuli_twosize)}")
+            except Exception as e:
+                _logger.critical(f"CRITICAL: Failed to load cached converted MIT stimuli from {mit_stimuli_cache_file}: {e}", exc_info=True)
+                if is_distributed: dist.barrier(); sys.exit(1)
         
-        # For spatial model, we need Fixations, not FixationTrains, for CrossvalidatedBaselineModel and ImageDataset.
-        # If mit_scanpaths_twosize_all was loaded, convert. If not, need to load original scanpaths again.
-        if not 'mit_scanpaths_orig' in locals(): # If not loaded during conversion step
-            _, mit_scanpaths_orig = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(location=str(dataset_directory), replace_initial_invalid_fixations=True)
-        mit_fixations_flat_all = mit_scanpaths_orig.to_fixations() # Convert all original scanpaths to flat fixations
+        # Ensure mit_stimuli_twosize is valid before proceeding
+        if mit_stimuli_twosize is None:
+            _logger.critical("mit_stimuli_twosize is None after cache/conversion block. Critical logic error.");
+            if is_distributed: dist.barrier(); sys.exit(1)
+        if not hasattr(mit_stimuli_twosize, 'sizes'):
+            _logger.critical(f"mit_stimuli_twosize (type: {type(mit_stimuli_twosize)}) is not a valid pysaliency.Stimuli object (missing .sizes).");
+            if is_distributed: dist.barrier(); sys.exit(1)
+
+        # Load original stimuli and scanpaths again for fixation processing.
+        # mit_stimuli_orig is needed by convert_fixation_trains_mit for scaling.
+        # mit_scanpaths_orig_raw is the raw scanpath data.
+        mit_stimuli_orig_for_fix, mit_scanpaths_orig_raw = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(location=str(dataset_directory), replace_initial_invalid_fixations=True)
+        if mit_stimuli_orig is None : # If not set during conversion path (e.g. cache was hit for stimuli)
+            mit_stimuli_orig = mit_stimuli_orig_for_fix
+
+
+        try:
+            processed_scanpaths = convert_fixation_trains_mit(
+                stimuli=mit_stimuli_orig, # Use original stimuli for scaling, not mit_stimuli_twosize
+                fixations=mit_scanpaths_orig_raw,
+                is_master=is_master,
+                logger=_logger
+            )
+            if is_master:
+                _logger.info(f"Type of processed_scanpaths after convert_fixation_trains_mit: {type(processed_scanpaths)}")
+
+            mit_fixations_flat_all = processed_scanpaths # Use ScanpathFixations directly
+
+            if is_master:
+                _logger.info(f"Using processed_scanpaths (type: {type(mit_fixations_flat_all)}) for fixations.")
+
+        except AttributeError as e:
+            # This error might occur if mit_scanpaths_orig_raw is 'DeprecatedClass' and doesn't have train_xs etc.
+            # or if mit_stimuli_orig is None and convert_fixation_trains_mit tries to access its shapes.
+            error_msg = str(e).lower()
+            if "deprecatedclass" in error_msg or "no attribute 'train_xs'" in error_msg or "no attribute 'shapes'" in error_msg :
+                _logger.error(f"The object from get_mit1003_with_initial_fixation or mit_stimuli_orig is missing attributes "
+                              f"expected by convert_fixation_trains_mit. "
+                              f"Type of mit_scanpaths_orig_raw: {type(mit_scanpaths_orig_raw)}, "
+                              f"Type of mit_stimuli_orig: {type(mit_stimuli_orig)}. "
+                              f"Pysaliency version: {pysaliency.__version__ if 'pysaliency' in globals() else 'N/A'}", exc_info=True)
+            else:
+                _logger.error(f"An AttributeError occurred during scanpath processing: {e}", exc_info=True)
+            raise e # Re-raise to halt execution
+        except Exception as e_conv:
+            _logger.error(f"Error during call to convert_fixation_trains_mit or subsequent processing: {e_conv}", exc_info=True)
+            raise e_conv
+
+        # Ensure mit_fixations_flat_all is valid
+        if mit_fixations_flat_all is None:
+            _logger.critical("mit_fixations_flat_all is None after processing. Critical logic error.");
+            if is_distributed: dist.barrier(); sys.exit(1)
+
 
         if is_master: _logger.info("Initializing MIT1003 CrossvalidatedBaselineModel for centerbias...")
         MIT1003_centerbias = CrossvalidatedBaselineModel(
-            mit_stimuli_twosize, # Use converted stimuli for sizes
-            mit_fixations_flat_all, # Use flat fixations for baseline model training
+            mit_stimuli_twosize, # Use the (potentially resized) stimuli for the model
+            mit_fixations_flat_all, # This is now ScanpathFixations, which is compatible
             bandwidth=10**-1.6667673342543432, eps=10**-14.884189168516073, caching=False
         )
 
-        MIT1003_stimuli_train, mit_fixations_train_flat = train_split(mit_stimuli_twosize, mit_fixations_flat_all, crossval_folds=10, fold_no=fold)
-        MIT1003_stimuli_val, mit_fixations_val_flat = validation_split(mit_stimuli_twosize, mit_fixations_flat_all, crossval_folds=10, fold_no=fold)
+        # Split the data (mit_fixations_flat_all is ScanpathFixations, compatible with split)
+        MIT1003_stimuli_train, mit_fixations_train_split = train_split(mit_stimuli_twosize, mit_fixations_flat_all, crossval_folds=10, fold_no=fold)
+        MIT1003_stimuli_val, mit_fixations_val_split = validation_split(mit_stimuli_twosize, mit_fixations_flat_all, crossval_folds=10, fold_no=fold)
 
         train_baseline_log_likelihood, val_baseline_log_likelihood = None, None
-        if is_master: # Master computes or loads LLs for the fold
+        if is_master:
             _logger.info(f"Computing baseline LLs for MIT1003 Fold {fold}...")
             try:
-                train_baseline_log_likelihood = MIT1003_centerbias.information_gain(MIT1003_stimuli_train, mit_fixations_train_flat, verbose=False, average='image')
-                val_baseline_log_likelihood = MIT1003_centerbias.information_gain(MIT1003_stimuli_val, mit_fixations_val_flat, verbose=False, average='image')
+                # Pass the appropriate split of fixations (which are ScanpathFixations)
+                train_baseline_log_likelihood = MIT1003_centerbias.information_gain(MIT1003_stimuli_train, mit_fixations_train_split, verbose=True, average='image')
+                val_baseline_log_likelihood = MIT1003_centerbias.information_gain(MIT1003_stimuli_val, mit_fixations_val_split, verbose=True, average='image')
                 _logger.info(f"Fold {fold} Master Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
             except Exception as e:
-                _logger.critical(f"Failed to compute MIT baseline LLs: {e}"); train_baseline_log_likelihood, val_baseline_log_likelihood = np.nan, np.nan
+                _logger.critical(f"Failed to compute MIT baseline LLs: {e}", exc_info=True); train_baseline_log_likelihood, val_baseline_log_likelihood = np.nan, np.nan
         
         ll_bcast_mit = [train_baseline_log_likelihood, val_baseline_log_likelihood]
         if is_distributed:
-            if is_master and (train_baseline_log_likelihood is None or val_baseline_log_likelihood is None): ll_bcast_mit = [np.nan, np.nan]
+            if is_master and (np.isnan(train_baseline_log_likelihood) or np.isnan(val_baseline_log_likelihood)): ll_bcast_mit = [np.nan, np.nan]
             dist.broadcast_object_list(ll_bcast_mit, src=0)
         train_baseline_log_likelihood, val_baseline_log_likelihood = ll_bcast_mit
         if np.isnan(train_baseline_log_likelihood) or np.isnan(val_baseline_log_likelihood):
-            _logger.critical(f"MIT Baseline LLs invalid on rank {rank}. Exiting."); sys.exit(1)
+            _logger.critical(f"MIT Baseline LLs invalid on rank {rank}. Exiting.");
+            if is_distributed: dist.barrier(); sys.exit(1)
         _logger.info(f"Rank {rank} MIT Fold {fold} Baseline LLs - Train: {train_baseline_log_likelihood:.5f}, Val: {val_baseline_log_likelihood:.5f}")
         
         # --- Model Build & Load Checkpoint for MIT stage ---
@@ -623,24 +696,21 @@ def main(args: argparse.Namespace):
         )
         fixsel_net_mit = build_fixation_selection_network(scanpath_features=0) # Spatial only
 
-        # Build model on CPU first for checkpoint loading
         model_cpu = DinoGazeSpade(
-            features_module=dino_backbone.cpu(), # Move backbone to CPU temporarily
-            saliency_network=saliency_net_spade_dynamic_mit,
-            scanpath_network=None,
+            features_module=dino_backbone.cpu(),
+            saliency_network=saliency_net_spade_dynamic_mit, scanpath_network=None,
             fixation_selection_network=fixsel_net_mit,
             dinov2_patch_size=args.dinov2_patch_size,
             semantic_feature_layer_idx=args.dinov2_semantic_feature_layer_idx,
             num_sam_segments=args.num_total_sam_segments,
-            readout_factor=args.dinov2_patch_size,
-            initial_sigma=args.finalizer_initial_sigma
+            readout_factor=args.dinov2_patch_size, initial_sigma=args.finalizer_initial_sigma
         )
         dino_backbone.to(device) # Move backbone back to device
 
         start_checkpoint_path_mit = None
-        if args.resume_checkpoint_mit: # Specific resume for MIT stage
+        if args.resume_checkpoint_mit:
              start_checkpoint_path_mit = Path(args.resume_checkpoint_mit)
-        elif prev_stage_checkpoint_dir:
+        elif prev_stage_checkpoint_dir and prev_stage_checkpoint_dir.exists():
             chkpt_options = [prev_stage_checkpoint_dir / 'final_best_val.pth', prev_stage_checkpoint_dir / 'final.pth']
             for p_opt in chkpt_options:
                 if p_opt.exists(): start_checkpoint_path_mit = p_opt; break
@@ -655,13 +725,13 @@ def main(args: argparse.Namespace):
             if is_master:
                 if missing: _logger.warning(f"MIT Load: Missing keys: {missing}")
                 if unexpected: _logger.warning(f"MIT Load: Unexpected keys: {unexpected}")
-        elif args.stage != 'salicon_pretraining': # Don't warn if SALICON stage has no explicit resume
-            _logger.warning(f"No checkpoint found from previous stage ({prev_stage_checkpoint_dir}) or via --resume_checkpoint_mit. Starting MIT fine-tuning with fresh head weights.")
+        else:
+             _logger.warning(f"No checkpoint found from SALICON stage ({prev_stage_checkpoint_dir}) or via --resume_checkpoint_mit. Starting MIT fine-tuning with potentially random head weights.")
         
         model = model_cpu.to(device)
 
         if is_distributed:
-            model = DDP(model, device_ids=[device.index], find_unused_parameters=True) # Scanpath is None
+            model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
             if is_master: _logger.info("Wrapped MIT model with DDP.")
 
         head_params_mit = [p for p in model.parameters() if p.requires_grad]
@@ -669,41 +739,34 @@ def main(args: argparse.Namespace):
         optimizer = optim.Adam(head_params_mit, lr=current_lr)
         lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=current_milestones)
 
-        # --- Dataloaders for MIT Stage ---
-        # Assume SAM masks for MIT are organized similarly or use specific bank files for MIT.
-        # Update these paths in YAML or via CLI arguments (e.g., args.train_mask_subdir_name_mit)
-        train_mask_individual_dir_mit = segmentation_mask_root_dir / args.train_mask_subdir_name_mit if segmentation_mask_root_dir and args.train_mask_subdir_name_mit else None
-        val_mask_individual_dir_mit = segmentation_mask_root_dir / args.val_mask_subdir_name_mit if segmentation_mask_root_dir and args.val_mask_subdir_name_mit else None
-        train_fixed_memmap_mit = Path(args.train_mask_memmap_file_mit).resolve() if args.train_mask_memmap_file_mit else None
-        # ... and so on for other MIT mask bank paths ...
-        # For simplicity, let's reuse the main mask args if specific MIT ones aren't defined,
-        # but ideally, you'd have separate args for MIT SAM masks.
-        # Here, I'll assume you'll configure the YAML/CLI to point to MIT SAM masks using the existing mask args.
-        _logger.warning("Using SALICON mask configuration for MIT stage. Ensure these paths point to MIT SAM masks if different.")
-
-        dataset_kwargs_train_mit = {
+        # --- Dataloaders for MIT Stage (using corrected mask path logic) ---
+        dataset_kwargs_mit_common = {
             "transform": FixationMaskTransform(sparse=False), "average": "image",
-            "lmdb_path": str(lmdb_image_cache_dir / f'MIT1003_train_imgs_dinogaze_fold{fold}_{args.dinov2_model_name}') if args.use_lmdb_images else None,
-            "segmentation_mask_dir": train_mask_individual_dir_mit or (segmentation_mask_root_dir / args.train_mask_subdir_name if segmentation_mask_root_dir else None),
+            "segmentation_mask_dir": segmentation_mask_root_dir,
+            "segmentation_mask_subdir": args.mit_all_mask_subdir_name, # Subdir with ALL MIT masks
             "segmentation_mask_format": args.segmentation_mask_format,
-            "segmentation_mask_fixed_memmap_file": train_fixed_memmap_mit or (Path(args.train_mask_memmap_file).resolve() if args.train_mask_memmap_file else None),
-            "segmentation_mask_variable_payload_file": Path(args.train_mask_variable_payload_file_mit).resolve() if args.train_mask_variable_payload_file_mit else (Path(args.train_mask_variable_payload_file).resolve() if args.train_mask_variable_payload_file else None),
-            "segmentation_mask_variable_header_file": Path(args.train_mask_variable_header_file_mit).resolve() if args.train_mask_variable_header_file_mit else (Path(args.train_mask_variable_header_file).resolve() if args.train_mask_variable_header_file else None),
-            "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
+            "segmentation_mask_fixed_memmap_file": Path(args.mit_all_mask_memmap_file).resolve() if args.mit_all_mask_memmap_file else None,
+            "segmentation_mask_variable_payload_file": Path(args.mit_all_mask_variable_payload_file).resolve() if args.mit_all_mask_variable_payload_file else None,
+            "segmentation_mask_variable_header_file": Path(args.mit_all_mask_variable_header_file).resolve() if args.mit_all_mask_variable_header_file else None,
+            "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype,
         }
-        train_dataset_mit = ImageDatasetWithSegmentation(stimuli=MIT1003_stimuli_train, fixations=mit_fixations_train_flat, centerbias_model=MIT1003_centerbias, **dataset_kwargs_train_mit)
-        
-        dataset_kwargs_val_mit = { # Similar for validation
-             "transform": FixationMaskTransform(sparse=False), "average": "image",
-            "lmdb_path": str(lmdb_image_cache_dir / f'MIT1003_val_imgs_dinogaze_fold{fold}_{args.dinov2_model_name}') if args.use_lmdb_images else None,
-            "segmentation_mask_dir": val_mask_individual_dir_mit or (segmentation_mask_root_dir / args.val_mask_subdir_name if segmentation_mask_root_dir else None),
-            "segmentation_mask_format": args.segmentation_mask_format,
-            "segmentation_mask_fixed_memmap_file": Path(args.val_mask_memmap_file_mit).resolve() if args.val_mask_memmap_file_mit else (Path(args.val_mask_memmap_file).resolve() if args.val_mask_memmap_file else None),
-            "segmentation_mask_variable_payload_file": Path(args.val_mask_variable_payload_file_mit).resolve() if args.val_mask_variable_payload_file_mit else (Path(args.val_mask_variable_payload_file).resolve() if args.val_mask_variable_payload_file else None),
-            "segmentation_mask_variable_header_file": Path(args.val_mask_variable_header_file_mit).resolve() if args.val_mask_variable_header_file_mit else (Path(args.val_mask_variable_header_file).resolve() if args.val_mask_variable_header_file else None),
-            "segmentation_mask_bank_dtype": args.segmentation_mask_bank_dtype
-        }
-        val_dataset_mit = ImageDatasetWithSegmentation(stimuli=MIT1003_stimuli_val, fixations=mit_fixations_val_flat, centerbias_model=MIT1003_centerbias, **dataset_kwargs_val_mit)
+        if is_master:
+            _logger.info(f"MIT SAM Mask Config: IndivDirRoot='{segmentation_mask_root_dir}', IndivSubDir='{args.mit_all_mask_subdir_name}', FixedBank='{dataset_kwargs_mit_common['segmentation_mask_fixed_memmap_file']}', VarBankPayload='{dataset_kwargs_mit_common['segmentation_mask_variable_payload_file']}'")
+
+        # For ImageDatasetWithSegmentation, the 'fixations' argument should be a flat Fixations object
+        # So we use the *splits* of mit_fixations_flat_all (which is ScanpathFixations, compatible with .x, .y, .n)
+        train_dataset_mit = ImageDatasetWithSegmentation(
+            stimuli=MIT1003_stimuli_train, fixations=mit_fixations_train_split, 
+            centerbias_model=MIT1003_centerbias, 
+            lmdb_path=str(lmdb_image_cache_dir / f'MIT1003_train_imgs_dinogaze_fold{fold}_{args.dinov2_model_name}') if args.use_lmdb_images else None,
+            **dataset_kwargs_mit_common
+        )
+        val_dataset_mit = ImageDatasetWithSegmentation(
+            stimuli=MIT1003_stimuli_val, fixations=mit_fixations_val_split, 
+            centerbias_model=MIT1003_centerbias, 
+            lmdb_path=str(lmdb_image_cache_dir / f'MIT1003_val_imgs_dinogaze_fold{fold}_{args.dinov2_model_name}') if args.use_lmdb_images else None,
+            **dataset_kwargs_mit_common
+        )
 
         train_sampler_mit = (torch.utils.data.DistributedSampler(train_dataset_mit, shuffle=True, drop_last=True) if is_distributed else None)
         if train_sampler_mit and hasattr(train_sampler_mit, 'set_epoch'): train_sampler_mit.set_epoch(0)
@@ -717,7 +780,6 @@ def main(args: argparse.Namespace):
                                         persistent_workers=args.num_workers > 0)
         if is_master: 
             _logger.info(f"MIT Train Dataloader: {len(train_loader_mit)} batches. MIT Val Dataloader: {len(validation_loader_mit)} batches.")
-            # ... (sample batch inspection for MIT) ...
         
         if is_master: _logger.info(f"Experiment output for MIT stage to: {output_dir_experiment}")
         _train(
@@ -726,7 +788,7 @@ def main(args: argparse.Namespace):
             val_loader=validation_loader_mit, val_baseline_log_likelihood=val_baseline_log_likelihood,
             optimizer=optimizer, lr_scheduler=lr_scheduler,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            minimum_learning_rate=args.min_lr, # Use general min_lr
+            minimum_learning_rate=args.min_lr,
             validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'],
             validation_epochs=args.validation_epochs,
             startwith=None, # _train handles resumption from output_dir_experiment
@@ -752,8 +814,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(parents=[_pre], description="Train DinoGaze+SPADE(DynamicSAM) with torch_scatter", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # --- Stage and General Config ---
-    parser.add_argument('--stage', default='salicon_pretraining',
-                        choices=['salicon_pretraining', 'mit_spatial'], # Added MIT stage
+    parser.add_argument('--stage', default='salicon_pretraining', # Changed default to avoid _dinogaze_spade_sam
+                        choices=['salicon_pretraining', 'mit_spatial'], 
                         help='Training stage to execute.')
     parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
 
@@ -764,7 +826,7 @@ if __name__ == "__main__":
     parser.add_argument('--dinov2_semantic_feature_layer_idx', type=int, default=-1, help="Index from DINO layers for SPADE semantic features (0 to N-1, or negative from end).")
 
     # --- SAM Masks and SPADE ---
-    parser.add_argument('--segmentation_mask_dir', type=str, help='Root directory for individual SAM masks (fallback).')
+    parser.add_argument('--segmentation_mask_dir', type=str, help='Root directory for ALL individual SAM masks (if using individual file loading).')
     parser.add_argument('--segmentation_mask_format', default='png', choices=['png', 'npy'])
     parser.add_argument('--num_total_sam_segments', type=int, default=64, help="Number of distinct SAM segment IDs expected (e.g., K if K-Means was used, or max ID + 1).")
     parser.add_argument('--segmentation_mask_bank_dtype', type=str, default='uint8', choices=['uint8', 'uint16'])
@@ -781,10 +843,9 @@ if __name__ == "__main__":
 
     # --- Training Hyperparameters (MIT Fine-tuning) ---
     parser.add_argument('--fold', type=int, help='Cross-validation fold for MIT stages (0-9).', default=0)
-    parser.add_argument('--lr_mit_spatial', type=float, default=5e-5, help="LR for MIT spatial fine-tuning.") # Often lower for fine-tuning
+    parser.add_argument('--lr_mit_spatial', type=float, default=5e-5, help="LR for MIT spatial fine-tuning.")
     parser.add_argument('--lr_milestones_mit_spatial', type=int, nargs='+', default=[10, 20], help="LR milestones for MIT spatial.")
     parser.add_argument('--resume_checkpoint_mit', type=str, help='Path to checkpoint for MIT stage resumption (overrides SALICON flow).')
-
 
     # --- Dataloading & System ---
     parser.add_argument('--num_workers', type=str, default='auto')
@@ -793,9 +854,9 @@ if __name__ == "__main__":
     parser.add_argument('--lmdb_dir', type=str, default='./data/lmdb_caches_dinogaze_spade')
     parser.add_argument('--use_lmdb_images', action=argparse.BooleanOptionalAction, default=True)
 
-    # --- SAM Mask Paths (SALICON) ---
-    parser.add_argument('--train_mask_subdir_name', type=str, default='train_sam64', help="Subdir for SALICON train SAM masks (if using individual files).")
-    parser.add_argument('--val_mask_subdir_name', type=str, default='val_sam64', help="Subdir for SALICON val SAM masks.")
+    # --- SAM Mask Paths (SALICON specific - if different from a general pool) ---
+    parser.add_argument('--train_mask_subdir_name', type=str, default='train_sam64', help="Subdir under segmentation_mask_dir for SALICON train SAM masks (if using individual files).")
+    parser.add_argument('--val_mask_subdir_name', type=str, default='val_sam64', help="Subdir under segmentation_mask_dir for SALICON val SAM masks.")
     parser.add_argument('--train_mask_memmap_file', type=str, help="Fixed-size memmap bank (.npy) for TRAIN SALICON SAM masks.")
     parser.add_argument('--val_mask_memmap_file', type=str, help="Fixed-size memmap bank (.npy) for VAL SALICON SAM masks.")
     parser.add_argument('--train_mask_variable_payload_file', type=str, help="Variable-size mask PAYLOAD (.bin) for TRAIN SALICON SAM.")
@@ -803,27 +864,22 @@ if __name__ == "__main__":
     parser.add_argument('--val_mask_variable_payload_file', type=str, help="Variable-size mask PAYLOAD (.bin) for VAL SALICON SAM.")
     parser.add_argument('--val_mask_variable_header_file', type=str, help="Companion HEADER (.npy) for VAL SALICON SAM variable payload.")
 
-    # --- SAM Mask Paths (MIT) ---
-    parser.add_argument('--train_mask_subdir_name_mit', type=str, default='train_sam64_mit', help="Subdir for MIT train SAM masks.")
-    parser.add_argument('--val_mask_subdir_name_mit', type=str, default='val_sam64_mit', help="Subdir for MIT val SAM masks.")
-    parser.add_argument('--train_mask_memmap_file_mit', type=str, help="Fixed-size memmap bank for TRAIN MIT SAM masks.")
-    parser.add_argument('--val_mask_memmap_file_mit', type=str, help="Fixed-size memmap bank for VAL MIT SAM masks.")
-    parser.add_argument('--train_mask_variable_payload_file_mit', type=str, help="Variable PAYLOAD for TRAIN MIT SAM.")
-    parser.add_argument('--train_mask_variable_header_file_mit', type=str, help="Variable HEADER for TRAIN MIT SAM.")
-    parser.add_argument('--val_mask_variable_payload_file_mit', type=str, help="Variable PAYLOAD for VAL MIT SAM.")
-    parser.add_argument('--val_mask_variable_header_file_mit', type=str, help="Variable HEADER for VAL MIT SAM.")
+    # --- SAM Mask Paths (For ENTIRE MIT1003 dataset) ---
+    parser.add_argument('--mit_all_mask_subdir_name', type=str, default='mit1003_sam_all', help="Subdir under segmentation_mask_dir for ALL MIT1003 SAM masks.")
+    parser.add_argument('--mit_all_mask_memmap_file', type=str, help="Fixed-size memmap bank for ALL MIT1003 SAM masks.")
+    parser.add_argument('--mit_all_mask_variable_payload_file', type=str, help="Variable PAYLOAD for ALL MIT1003 SAM masks.")
+    parser.add_argument('--mit_all_mask_variable_header_file', type=str, help="Variable HEADER for ALL MIT1003 SAM masks.")
 
 
     if _cfg_namespace.config_file:
         try:
             with open(_cfg_namespace.config_file, 'r') as f: yaml_cfg = yaml.safe_load(f) or {}
             _module_logger.info(f"Loaded YAML config from: {_cfg_namespace.config_file}")
-            parser.set_defaults(**yaml_cfg) # YAML values become defaults
+            parser.set_defaults(**yaml_cfg)
         except Exception as e: _module_logger.warning(f"Could not read/parse YAML '{_cfg_namespace.config_file}': {e}")
 
-    final_args_ns = parser.parse_args(_remaining_cli_args) # CLI overrides YAML
+    final_args_ns = parser.parse_args(_remaining_cli_args)
 
-    # Post-processing num_workers
     ws_env = int(os.environ.get("WORLD_SIZE", 1))
     if isinstance(final_args_ns.num_workers, str) and final_args_ns.num_workers.lower() == 'auto':
         final_args_ns.num_workers = None
@@ -836,29 +892,36 @@ if __name__ == "__main__":
         try: final_args_ns.num_workers = int(final_args_ns.num_workers)
         except ValueError: _module_logger.warning(f"Invalid num_workers='{final_args_ns.num_workers}', using 0."); final_args_ns.num_workers = 0
         if final_args_ns.num_workers < 0: _module_logger.warning(f"Negative num_workers='{final_args_ns.num_workers}', using 0."); final_args_ns.num_workers = 0
-
-    # Validate mask source for the current stage
+    
+    # Validate mask source based on the current stage
     is_mit_stage = 'mit_' in final_args_ns.stage
-    current_mask_subdir_train = final_args_ns.train_mask_subdir_name_mit if is_mit_stage and final_args_ns.train_mask_subdir_name_mit else final_args_ns.train_mask_subdir_name
-    current_mask_memmap_train = final_args_ns.train_mask_memmap_file_mit if is_mit_stage and final_args_ns.train_mask_memmap_file_mit else final_args_ns.train_mask_memmap_file
-    current_mask_var_payload_train = final_args_ns.train_mask_variable_payload_file_mit if is_mit_stage and final_args_ns.train_mask_variable_payload_file_mit else final_args_ns.train_mask_variable_payload_file
-    current_mask_var_header_train = final_args_ns.train_mask_variable_header_file_mit if is_mit_stage and final_args_ns.train_mask_variable_header_file_mit else final_args_ns.train_mask_variable_header_file
     
-    has_fixed_train_bank = current_mask_memmap_train
-    has_variable_train_bank = current_mask_var_payload_train and current_mask_var_header_train
-    has_individual_masks_dir_cfg = final_args_ns.segmentation_mask_dir and current_mask_subdir_train
+    if is_mit_stage:
+        current_mask_subdir = final_args_ns.mit_all_mask_subdir_name
+        current_mask_memmap = final_args_ns.mit_all_mask_memmap_file
+        current_mask_var_payload = final_args_ns.mit_all_mask_variable_payload_file
+        current_mask_var_header = final_args_ns.mit_all_mask_variable_header_file
+    else: # SALICON stage
+        current_mask_subdir = final_args_ns.train_mask_subdir_name # For SALICON, we check train subdir
+        current_mask_memmap = final_args_ns.train_mask_memmap_file
+        current_mask_var_payload = final_args_ns.train_mask_variable_payload_file
+        current_mask_var_header = final_args_ns.train_mask_variable_header_file
     
-    if not (has_fixed_train_bank or has_variable_train_bank or has_individual_masks_dir_cfg):
-        parser.error(f"A source for SAM segmentation masks is required for stage '{final_args_ns.stage}'. Checked individual dir, fixed bank, and variable bank options.")
+    has_fixed_bank = current_mask_memmap
+    has_variable_bank = current_mask_var_payload and current_mask_var_header
+    has_individual_masks_dir_cfg = final_args_ns.segmentation_mask_dir and current_mask_subdir
+    
+    if not (has_fixed_bank or has_variable_bank or has_individual_masks_dir_cfg):
+        parser.error(f"A source for SAM segmentation masks is required for stage '{final_args_ns.stage}'.\n"
+                     f"Checked for stage: IndivDirSubdir='{current_mask_subdir}', FixedBank='{current_mask_memmap}', VarBankPayload='{current_mask_var_payload}'.\n"
+                     f"Ensure segmentation_mask_dir is also set if using individual files via subdirectories.")
 
-    # Resolve dinov2_semantic_feature_layer_idx to be positive
     num_main_path_layers = len(final_args_ns.dinov2_layers_for_main_path)
     sem_idx = final_args_ns.dinov2_semantic_feature_layer_idx
     actual_sem_idx = sem_idx if sem_idx >= 0 else num_main_path_layers + sem_idx
     if not (0 <= actual_sem_idx < num_main_path_layers):
         parser.error(f"Invalid dinov2_semantic_feature_layer_idx ({sem_idx}). Resolved to {actual_sem_idx}, but must be between 0 and {num_main_path_layers-1}.")
     final_args_ns.dinov2_semantic_feature_layer_idx = actual_sem_idx
-
 
     try:
         main(final_args_ns)
