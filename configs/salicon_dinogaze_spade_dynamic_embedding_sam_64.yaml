@@ -1,68 +1,75 @@
-# salicon_dinogaze_spade_dynamic_sam64_config.yaml
-# For use with train_dinogaze_spade_dynamic_embedding_SAM.py
+# dinogaze_spade_dynamic_sam_config.yaml
+# For use with train_dinogaze_spade_dynamic_sam_scatter.py
+# Includes configuration for both SALICON pretraining and MIT spatial fine-tuning.
 
 # --- Experiment Configuration ---
-stage: 'salicon_pretrain_dinogaze_spade_sam' # Matches the stage in the new script
-log_level: 'INFO'                            # Logging level
+# Stage to run. Choose one:
+#   'salicon_pretraining'
+#   'mit_spatial'
+stage: 'salicon_pretraining' # CHANGE THIS to 'mit_spatial' for MIT fine-tuning
+log_level: 'INFO'
 
 # --- DINOv2 Backbone Configuration ---
-dinov2_model_name: 'dinov2_vitl14'           # Or 'dinov2_vitl14', 'dinov2_vitg14'
-dinov2_patch_size: 14
-dinov2_layers_for_main_path: [-3, -2, -1]    # DINO layers for the main saliency path features
-                                             # These are indices into the list of all DINO block outputs
-dinov2_semantic_feature_layer_idx: -1        # Index (relative to dinov2_layers_for_main_path output list)
-                                             # of the DINO feature map to use for SPADE semantic painting.
-                                             # -1 means the last one from the list specified above.
+dinov2_model_name: 'dinov2_vitl14'     # Or 'dinov2_vitb14', 'dinov2_vitg14'
+dinov2_patch_size: 14                  # Must match the DINOv2 model variant
+dinov2_layers_for_main_path: [-3, -2, -1] # DINO layers for the main saliency path features
+dinov2_semantic_feature_layer_idx: -1  # Index from DINO layers for SPADE semantic features. -1 means last from above list.
 
-# --- SAM Masks & SPADE Dynamic Configuration ---
-# segmentation_mask_dir: './masks/SALICON_sam_k64_individual/' # If using individual mask files as primary source
-train_mask_subdir_name: 'train_sam64'             # Subdir under segmentation_mask_dir for train SAM masks
-val_mask_subdir_name: 'val_sam64'                 # Subdir under segmentation_mask_dir for val SAM masks
-segmentation_mask_format: 'png'                   # Format of individual SAM masks ('png' or 'npy')
-num_total_sam_segments: 64                        # Total number of SAM segment IDs (e.g., 64 for masks with IDs 0-63)
-                                                  # This is used in the _create_painted_semantic_map logic.
-                                                  # This is NOT for nn.Embedding anymore.
+# --- SAM Masks and SPADE Dynamic Configuration ---
+segmentation_mask_dir: './masks/individual_sam_masks/' # ROOT directory if using individual mask files as fallback/source
+                                                      # This root would contain subdirs like 'salicon_train_sam64', 'mit1003_sam_all', etc.
+segmentation_mask_format: 'png'        # Format of individual SAM masks ('png' or 'npy')
+num_total_sam_segments: 64             # Total number of SAM segment IDs (e.g., 64 for masks with IDs 0-63)
+segmentation_mask_bank_dtype: 'uint8'  # Dtype used for storing SAM masks in the bank(s)
 
-# --- Training Hyperparameters ---
-batch_size: 4 # DinoGaze models can be memory heavy; adjust based on GPU VRAM (e.g., 2, 4, or 8)
+# --- Training Hyperparameters (SALICON pretraining) ---
+batch_size: 1                          # Adjust based on GPU VRAM
 gradient_accumulation_steps: 2
-lr: 0.0001 # Learning rate might need careful tuning for SPADE heads on DINO features. Start lower.
-lr_milestones: [20, 40, 55] # Adjust epoch numbers based on total epochs planned
-min_lr: 0.000001 # 1e-7
+lr: 0.0001                             # Learning rate for SALICON stage
+lr_milestones: [20, 40, 55]            # Epochs for LR decay for SALICON
+min_lr: 0.0000001                      # Minimum learning rate (1e-7) for any stage
 validation_epochs: 1
-resume_checkpoint: null
-finalizer_initial_sigma: 8.0 # Initial sigma for the Gaussian blur in the Finalizer module
+resume_checkpoint: null                # Path to checkpoint for SALICON stage explicit resume
+finalizer_initial_sigma: 8.0           # Initial sigma for the Gaussian blur in the Finalizer
+
+# --- Training Hyperparameters (MIT spatial fine-tuning) ---
+fold: 0                                # MIT1003 cross-validation fold (0-9). Only active if stage is 'mit_spatial'.
+lr_mit_spatial: 0.00005                # Learning rate for MIT spatial fine-tuning (often lower than pretraining)
+lr_milestones_mit_spatial: [10, 20]    # Epochs for LR decay for MIT spatial fine-tuning
+resume_checkpoint_mit: null            # Path to checkpoint for MIT stage explicit resume (overrides SALICON->MIT flow)
 
 # --- Dataloading & System ---
-num_workers: 8 # Number of DataLoader workers per GPU
-train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14' # Experiment output directory
-dataset_dir: './data/pysaliency_datasets'       # Where SALICON, MIT1003 etc. are stored
-lmdb_dir: './data/lmdb_caches_dinogaze_spade'   # Where LMDB caches for images will be stored
-use_lmdb_images: true                           # Use LMDB for images
+num_workers: 'auto'                    # Number of DataLoader workers per GPU ('auto' or integer)
+train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14' # Base output directory for experiments
+dataset_dir: './data/pysaliency_datasets' # Where SALICON, MIT1003 etc. are stored by pysaliency
+lmdb_dir: './data/lmdb_caches/dinogaze_spade_dynamic_sam' # Where LMDB caches for images will be stored
+use_lmdb_images: true                  # Use LMDB for images
 
-# --- Segmentation Mask Bank Configuration (for SAM masks) ---
-# If you have pre-generated SAM masks stored in banks (recommended for speed).
+# ==============================================================================
+# --- SAM Mask Paths Configuration ---
+# For each dataset (SALICON, MIT1003), provide paths to either:
+#   1. Individual mask files (via segmentation_mask_dir + a specific subdir_name)
+#   2. A fixed-size memmap bank
+#   3. Variable-size mask banks (payload + header)
 # The script will prioritize banks if paths are provided.
-# Otherwise, it falls back to individual files specified by segmentation_mask_dir.
+# ==============================================================================
 
-segmentation_mask_bank_dtype: 'uint8' # Dtype used for storing SAM masks in the bank(s)
+# --- SALICON SAM Mask Paths ---
+# Option 1: Individual files for SALICON
+train_mask_subdir_name: 'salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
+val_mask_subdir_name: 'salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
+# Option 2 & 3: Banks for SALICON (Example using variable banks)
+# train_mask_memmap_file: null # or './masks/salicon/banks/sam64/salicon_train_sam_64_fixed.npy'
+# val_mask_memmap_file: null   # or './masks/salicon/banks/sam64/salicon_val_sam_64_fixed.npy'
+train_mask_variable_payload_file: './masks/salicon/banks/sam64/salicon_train_sam_64_var_payload.bin'
+train_mask_variable_header_file: './masks/salicon/banks/sam64/salicon_train_sam_64_var_header.npy'
+val_mask_variable_payload_file: './masks/salicon/banks/sam64/salicon_val_sam_64_var_payload.bin'
+val_mask_variable_header_file: './masks/salicon/banks/sam64/salicon_val_sam_64_var_header.npy'
 
-# Option 1: Fixed-size memmap bank (if all SAM masks are padded/resized to same dimensions)
-# train_mask_memmap_file: './masks/banks/sam64/salicon_train_sam_k64_fixed.npy'
-# val_mask_memmap_file: './masks/banks/sam64/salicon_val_sam_k64_fixed.npy'
-
-# Option 2: Variable-size mask banks (more flexible for SAM masks of different image sizes)
-# Ensure these paths match where your SAM mask generation script saves/saved them.
-# train_mask_variable_payload_file: './masks/banks/sam64/salicon_train_sam_k64_var_payload.bin'
-# train_mask_variable_header_file: './masks/banks/sam64/salicon_train_sam_k64_var_header.npy'
-# val_mask_variable_payload_file: './masks/banks/sam64/salicon_val_sam_k64_var_payload.bin'
-# val_mask_variable_header_file: './masks/banks/sam64/salicon_val_sam_k64_var_header.npy'
-
-# Option 3: Using individual mask files (if no banks are prepared)
-# Ensure segmentation_mask_dir, train_mask_subdir_name, val_mask_subdir_name are set correctly.
-# To force individual files, ensure bank paths above are null or commented out.
-segmentation_mask_dir: './masks/SALICON_sam_k64_individual/' # Example path if using individual files
-
-
-# --- Model Generic Arguments (Not typically used by this specific script, but can be kept for consistency) ---
-# add_sa_head: false # The SaliencyNetworkSPADEDynamic in the new script doesn't have an SA head option by default.
+# --- MIT1003 SAM Mask Paths (for the ENTIRE MIT1003 dataset) ---
+# Option 1: Individual files for ALL of MIT1003
+mit_all_mask_subdir_name: 'mit1003/all_sam64' # Subdir under segmentation_mask_dir for ALL MIT1003 images
+# Option 2 & 3: Banks for ALL of MIT1003 (Example using variable banks)
+# mit_all_mask_memmap_file: null # or './masks/mit1003/banks/sam64/mit1003_all_sam_64_fixed.npy'
+mit_all_mask_variable_payload_file: './masks/mit1003/banks/sam64/mit_sam_64_var_payload.bin'
+mit_all_mask_variable_header_file: './masks/mit1003/banks/sam64/mit_sam_64_var_header.npy'
