@@ -1,0 +1,33 @@
+\documentclass{article} % Or your university's thesis class
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{biblatex} % Or natbib with bibtex
+\addbibresource{references.bib} % Create this file for your bibliography
+
+\title{My Awesome Thesis Title}
+\author{Your Name}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This is the introduction to my thesis.
+We can cite something here~\cite{example_key}.
+
+\section{Another Section}
+More content goes here.
+Look at Figure~\ref{fig:myfigure}.
+
+\begin{figure}[htbp]
+    \centering
+    % \includegraphics[width=0.5\textwidth]{path/to/your/image.png}
+    \caption{A placeholder for a figure.}
+    \label{fig:myfigure}
+\end{figure}
+
+\printbibliography
+
+\end{document}
