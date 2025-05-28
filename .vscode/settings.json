@@ -1,0 +1,29 @@
+{
+
+    "latex-workshop.latex.tools": [
+        {
+            "name": "latexmk_via_pixi",
+            "command": "pixi", 
+            "args": [
+                "run",         
+                "latexmk",     
+                "-synctex=1",
+                "-interaction=nonstopmode",
+                "-file-line-error",
+                "-pdf",
+                "-outdir=%OUTDIR%", 
+                "%DOC%"            
+            ]
+        }
+    ],
+    "latex-workshop.latex.recipes": [
+        {
+            "name": "Pixi Default",
+            "tools": [
+                "latexmk_via_pixi" 
+            ]
+        }
+    ],
+    "latex-workshop.latex.recipe.default": "Pixi Default", 
+    "latex-workshop.latex.autoBuild.run": "onFileChange"
+}
