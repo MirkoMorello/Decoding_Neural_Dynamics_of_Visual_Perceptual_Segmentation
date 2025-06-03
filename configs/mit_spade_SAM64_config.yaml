@@ -1,0 +1,97 @@
+
+# mit_spade_SAM64_config.yaml
+# For use with train_deepgaze_Spade.py for the 'mit_spatial_densenet_spade' stage.
+# Assumes SALICON pretraining ('salicon_pretrain_densenet_spade') has been completed.
+# Configured to use VARIABLE-SIZE mask banks for MIT1003 and/or individual files.
+
+# --- Experiment Configuration ---
+stage: 'mit_spatial_densenet_spade'
+densenet_model_name: 'densenet201'   # Should match SALICON pretraining
+log_level: 'INFO'                    # Or 'DEBUG' for more verbose output
+
+# --- SPADE Specific Arguments (must match SALICON pretraining if reusing head) ---
+num_total_segments: 64                       # K for K-Means (e.g., derived from DINOv2 features)
+seg_embedding_dim: 64                        # Embedding dimension for segment IDs
+
+# --- Segmentation Mask Configuration General ---
+segmentation_mask_format: 'png'              # Format of the individual masks ('png' or 'npy') if individual files are used.
+segmentation_mask_bank_dtype: 'uint8'        # Dtype used for storing masks in the bank(s) if banks are used.
+
+# --- MIT Fine-tuning Specifics ---
+fold: 0                                      # MIT1003 cross-validation fold (0-9). CHANGE THIS FOR EACH FOLD.
+lr_mit_spatial: 0.0001                       # Learning rate for MIT spatial fine-tuning (often lower)
+lr_milestones_mit_spatial: [10, 20]          # Epochs for LR decay for MIT spatial fine-tuning
+max_epochs_mit: 30                           # Max epochs for MIT fine-tuning stage.
+
+# Path to the SALICON pretrained model checkpoint.
+# If null, the script will try to auto-detect from default SALICON output dir.
+salicon_checkpoint_path: './experiments/densenet_spade_sam_64/salicon_pretrain_densenet_spade/step-0009.pth'
+
+# --- Training Hyperparameters (some may be overridden by MIT-specific ones) ---
+batch_size: 1
+gradient_accumulation_steps: 1
+# 'lr' and 'lr_milestones' below are general defaults, primarily for SALICON stage.
+# mit-specific ones above take precedence for this MIT stage.
+lr: 0.0005
+lr_milestones: [20, 35, 50, 75] # Default milestones (e.g., for SALICON stage)
+max_epochs_salicon: 60      # Max epochs for SALICON stage (not directly used if running MIT stage)
+min_lr: 0.000001 # 1e-6
+validation_epochs: 1
+# 'resume_checkpoint' is for resuming *this current MIT stage* if it was interrupted.
+# It's different from 'salicon_checkpoint_path' which loads the *previous* stage's weights.
+resume_checkpoint: null # Example: './experiments/densenet_spade_dino_16/mit_spatial_densenet_spade_fold0_.../latest.pth'
+finalizer_initial_sigma: 8.0                 # Initial sigma for the Finalizer
+finalizer_learn_sigma: true                  # Whether sigma in Finalizer is learnable
+
+# --- Dataloading & System ---
+num_workers: 8                               # Number of DataLoader workers per GPU (can be 'auto')
+train_dir: './experiments/densenet_spade_sam_64' # Base output directory for experiments
+dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored by pysaliency
+lmdb_dir: './data/lmdb_cache_densenet'      # Where LMDB caches for images will be stored
+use_lmdb_images: true                       # Use LMDB for images
+
+# --- Model Generic Arguments (should match SALICON pretraining if loading full model) ---
+add_sa_head: false
+
+# ==============================================================================
+# --- Segmentation Mask Paths ---
+# The script now uses direct paths for individual mask folders OR bank files.
+#
+# For MIT stage ('mit_spatial_densenet_spade'):
+#   - mit_all_mask_dir: Path to a folder containing individual mask files for ALL MIT1003 images.
+#   - OR mit_mask_fixed_memmap_file: Path to a fixed-size bank for ALL MIT1003 masks.
+#   - OR mit_mask_variable_payload_file AND mit_mask_variable_header_file: Paths for variable-size bank.
+# The dataset loader will prioritize banks if provided, then individual files. One source is required.
+#
+# For SALICON stage ('salicon_pretrain_densenet_spade'):
+#   - salicon_train_mask_dir: Path to folder of individual masks for SALICON train.
+#   - salicon_val_mask_dir: Path to folder of individual masks for SALICON val.
+#   - OR corresponding bank files (train_mask_*, val_mask_*).
+# ==============================================================================
+
+# --- MIT1003 Mask Source (for the 'mit_spatial_densenet_spade' stage) ---
+# Option 1: DIRECTORY for individual mask files for ALL MIT1003 images
+# If using this, ensure the folder contains masks like 'i1.png', 'i2.png', etc.
+# matching the basenames of your MIT1003 stimuli.
+mit_all_mask_dir: './masks/mit1003/sam_vitl_k64_mit/' # Example path
+
+# Option 2: FIXED-SIZE Bank for ALL MIT1003 masks (comment out if using individual or variable)
+# mit_mask_fixed_memmap_file: null # or './masks/mit1003/banks/dinok16/mit_k16_fixed.bin'
+
+# Option 3: VARIABLE-SIZE Bank for ALL MIT1003 masks (comment out if using individual or fixed)
+# These paths are used if mit_all_mask_dir and mit_mask_fixed_memmap_file are null or invalid.
+mit_mask_variable_payload_file: './masks/mit1003/banks/sam64/mit_sam_64_var_payload.bin'
+mit_mask_variable_header_file: './masks/mit1003/banks/sam64/mit_sam_64_var_header.npy'
+
+
+# --- SALICON Mask Sources (NOT directly used by 'mit_spatial_densenet_spade' stage, but kept for completeness if you run SALICON stage with this config base) ---
+# Option 1: DIRECTORIES for individual mask files for SALICON
+salicon_train_mask_dir: './masks/salicon/sam_vitb_k64_salicon_train/'
+salicon_val_mask_dir: './masks/salicon/sam_vitb_k64_salicon_val/'
+
+# Option 2 & 3: Bank files for SALICON (comment out if using individual files for SALICON)
+
+train_mask_variable_payload_file: './masks/banks/sam64/salicon_train_sam_64_var_payload.bin'
+train_mask_variable_header_file: './masks/banks/sam64/salicon_train_sam_64_var_header.npy'
+val_mask_variable_payload_file: './masks/banks/sam64/salicon_val_sam_64_var_payload.bin'
+val_mask_variable_header_file: './masks/banks/sam64/salicon_val_sam_64_var_header.npy'
