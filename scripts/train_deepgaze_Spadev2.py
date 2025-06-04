@@ -53,7 +53,7 @@ try:
     )
     # Metrics and Training loop
     from src.metrics import log_likelihood, nss, auc as auc_cpu_fn
-    from src.training import (_train) # Your _train function (needs modification for seg_mask)
+    from src.training import (_train, restore_from_checkpoint) 
 
 except ImportError as e:
     actual_error_message = str(e)
@@ -696,7 +696,7 @@ def main(args: argparse.Namespace):
         scanpath_net_mit = None
         fixsel_net_mit = build_fixation_selection_network(scanpath_features=0) 
 
-        model = DeepGazeIIISpade(
+        model_cpu = DeepGazeIIISpade(
             features=features_module, 
             saliency_network=saliency_net_spade_mit, 
             scanpath_network=scanpath_net_mit,
@@ -709,37 +709,40 @@ def main(args: argparse.Namespace):
         ).to(device) 
 
         if salicon_checkpoint_path_actual and salicon_checkpoint_path_actual.exists():
-            if is_master: _logger.info(f"Loading SALICON checkpoint from {salicon_checkpoint_path_actual} for MIT model head.")
-            # Ensure map_location handles device placement correctly, especially if resuming DDP model on non-DDP or vice-versa
-            state_dict = torch.load(salicon_checkpoint_path_actual, map_location='cpu', weights_only=False) 
-            if 'model_state_dict' in state_dict: state_dict = state_dict['model_state_dict'] 
-
-            clean_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                name = k[7:] if k.startswith('module.') else k
-                clean_state_dict[name] = v
-            
-            missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
             if is_master:
-                # Filter out feature keys from missing_keys as they are frozen and not expected to load if different
-                missing_head_keys = [k for k in missing_keys if not k.startswith('features.')]
-                if missing_head_keys:
-                     _logger.warning(f"MIT Load: Missing HEAD keys: {missing_head_keys}")
-                
-                # Unexpected keys might indicate a mismatch if the SALICON model had more/different parts
-                # than the current model structure (excluding features).
-                unexpected_head_keys = [k for k in unexpected_keys if not k.startswith('features.')]
-                if unexpected_head_keys: 
-                     _logger.warning(f"MIT Load: Unexpected HEAD keys: {unexpected_head_keys}")
-                _logger.info("SALICON head weights loaded into MIT model (or attempted).")
+                _logger.info(f"Loading SALICON model weights from {salicon_checkpoint_path_actual} into MIT model (on CPU).")
+
+            # Call the robust restore function, but ONLY for the model.
+            # Pass None for optimizer, scheduler, scaler to prevent their state from being loaded/modified.
+            # The `restore_from_checkpoint` will still return step, loss, sched_restored, but we ignore them here
+            # as they pertain to the SALICON checkpoint's full state, not what we want for MIT init.
+            _, _, _ = restore_from_checkpoint( # Use the function from training.py
+                model=model_cpu,         # Load into the CPU model
+                optimizer=None,          # Don't affect MIT optimizer
+                scheduler=None,          # Don't affect MIT scheduler
+                scaler=None,             # Don't affect MIT scaler
+                path=str(salicon_checkpoint_path_actual),
+                device=torch.device('cpu'), # Load to CPU
+                is_distributed=False,      # Treat as non-DDP for this isolated load
+                logger=_logger
+            )
+            # At this point, model_cpu should have the SALICON weights loaded if compatible.
+            # The log messages from restore_from_checkpoint will indicate success/issues.
+            if is_master:
+                _logger.info("SALICON weights loading attempt complete for MIT model head.")
         else:
-            if is_master: _logger.warning("SALICON checkpoint not found. MIT head starts with its default initialization.")
+            if is_master:
+                _logger.warning("SALICON checkpoint not found or specified. MIT head will be randomly initialized.")
+
+        model = model_cpu.to(device) # Now move the potentially populated model to the target device
+        features_module.to(device) # Ensure backbone is back on device if it was moved
 
         if is_master: _logger.info(f"DeepGazeIII SPADE model for MIT Fold {fold} prepared.")
         if is_distributed:
             model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
             if is_master: _logger.info("Wrapped MIT model with DDP.")
 
+        # Initialize MIT optimizer and scheduler AFTER model is on device and DDP wrapped
         head_params_mit = [p for p in model.parameters() if p.requires_grad]
         if not head_params_mit: _logger.critical("No trainable parameters found for MIT stage!"); sys.exit(1)
         optimizer = optim.Adam(head_params_mit, lr=current_lr)
