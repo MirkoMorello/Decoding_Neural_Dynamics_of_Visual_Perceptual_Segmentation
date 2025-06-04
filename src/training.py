@@ -501,89 +501,184 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
     return epoch_avg_loss_local
 
 
-# --- restore_from_checkpoint and save_training_state (largely the same, ensure logger is passed) ---
-def restore_from_checkpoint(model, optimizer, scheduler, scaler, path, device,
-                            is_distributed=False, logger=None):
-    if logger is None: logger = logging.getLogger(__name__)
-    # ... (Your existing restore_from_checkpoint code, ensuring logger is used) ...
-    # No changes needed here for segmentation_mask specifically.
-    if not os.path.exists(path):
-        logger.error(f"Checkpoint path not found: {path}. Cannot restore.")
-        return 0, np.nan, False
+def _extract_model_state_dict_from_checkpoint(checkpoint_content, logger):
+    """
+    Attempts to extract the model's state_dict from various common checkpoint structures.
+    Args:
+        checkpoint_content: The loaded content from a .pth file.
+        logger: Logger instance.
+    Returns:
+        An OrderedDict if a model state_dict is found, otherwise None.
+    """
+    if not isinstance(checkpoint_content, dict):
+        logger.info("Checkpoint content is not a dictionary. Assuming it IS the model state_dict directly.")
+        # Check if it "looks" like a state_dict (all values are tensors or specific structures)
+        if checkpoint_content is not None and hasattr(checkpoint_content, 'keys') and \
+           all(isinstance(v, torch.Tensor) or (isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v))
+               for v in checkpoint_content.values()):
+            return checkpoint_content if isinstance(checkpoint_content, OrderedDict) else OrderedDict(checkpoint_content)
+        else:
+            logger.error("Checkpoint content is not a dict and does not appear to be a valid state_dict.")
+            return None
 
-    logger.info(f"Restoring checkpoint from: {path} (Distributed: {is_distributed})")
+    # Common top-level keys for the model's state_dict
+    # Order can matter if multiple could be present, though unlikely for distinct meanings.
+    potential_model_keys = ['model', 'state_dict', 'model_state_dict', 'state_dict_model', 'net', 'weights']
+
+    for key in potential_model_keys:
+        if key in checkpoint_content:
+            candidate = checkpoint_content[key]
+            if isinstance(candidate, dict) and \
+               all(isinstance(v, torch.Tensor) or (isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v))
+                   for v in candidate.values()): # Basic check: are values tensors?
+                logger.info(f"Found model state_dict under top-level key: '{key}'")
+                return candidate if isinstance(candidate, OrderedDict) else OrderedDict(candidate)
+            elif isinstance(candidate, dict):
+                # Check for common nested structures, e.g., checkpoint['model']['state_dict']
+                logger.debug(f"Key '{key}' is a dict, checking for nested state_dict...")
+                nested_potential_keys = ['state_dict', 'model_state_dict']
+                for nested_key in nested_potential_keys:
+                    if nested_key in candidate and isinstance(candidate[nested_key], dict) and \
+                       all(isinstance(v, torch.Tensor) or (isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v))
+                           for v in candidate[nested_key].values()):
+                        logger.info(f"Found model state_dict under nested key: '{key}.{nested_key}'")
+                        return candidate[nested_key] if isinstance(candidate[nested_key], OrderedDict) else OrderedDict(candidate[nested_key])
+
+    # If no specific key worked, but the top-level checkpoint_content itself looks like a state_dict
+    if all(isinstance(v, torch.Tensor) or (isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v))
+           for v in checkpoint_content.values()):
+        logger.info("No common model state_dict key found, but the top-level checkpoint content appears to be a state_dict itself.")
+        return checkpoint_content if isinstance(checkpoint_content, OrderedDict) else OrderedDict(checkpoint_content)
+
+    logger.error("Could not automatically extract a valid model state_dict from the checkpoint content.")
+    return None
+
+
+def restore_from_checkpoint(model: torch.nn.Module,
+                            optimizer: torch.optim.Optimizer = None,
+                            scheduler: torch.optim.lr_scheduler._LRScheduler = None, # type: ignore
+                            scaler: torch.cuda.amp.GradScaler = None, # type: ignore
+                            path: str = None,
+                            device: torch.device = None,
+                            is_distributed: bool = False, # Kept for consistency, DDP handled via model instance
+                            logger: logging.Logger = None):
+    """
+    Restores training state (model, optimizer, scheduler, scaler, step, loss) from a checkpoint.
+    Args:
+        model: The PyTorch model instance (can be DDP wrapped).
+        optimizer: The optimizer instance.
+        scheduler: The LR scheduler instance.
+        scaler: The GradScaler instance for AMP.
+        path: Path to the checkpoint file.
+        device: The device to load onto (e.g., torch.device('cuda:0')).
+        is_distributed: (Deprecated here) Flag indicating if DDP is used. DDP status is inferred from `model`.
+        logger: Logger instance.
+    Returns:
+        tuple: (step (int), loss (float), scheduler_restored (bool))
+    """
+    if logger is None: logger = _logger_restore # Use the module-level logger as fallback
+    
+    if not path or not os.path.exists(path):
+        logger.error(f"Checkpoint path '{path}' not found or not specified. Cannot restore.")
+        return 0, np.nan, False # step, loss, scheduler_restored
+
+    logger.info(f"Attempting to restore checkpoint from: {path}")
     try:
-        data = torch.load(path, map_location=device, weights_only=False)
-        model_state_dict = data.get('model') if isinstance(data, dict) else data
-        if model_state_dict is None and isinstance(data, dict): # If 'model' key is missing but it's a dict
-             model_state_dict = data # Assume the dict itself is the state_dict (older format)
-
+        # Load the entire checkpoint file first
+        checkpoint_content = torch.load(path, map_location=device, weights_only=False)
     except Exception as e:
-        logger.exception(f"Failed to load checkpoint file {path}")
+        logger.error(f"Failed to load checkpoint file '{path}'. Error: {e}", exc_info=True)
         return 0, np.nan, False
 
-    # Model State
-    if model_state_dict:
-        adjusted_state_dict = OrderedDict()
-        is_ddp_checkpoint = any(k.startswith('module.') for k in model_state_dict.keys())
-        current_model_is_ddp = isinstance(model, DDP)
+    # --- 1. Restore Model State ---
+    model_state_dict_raw = _extract_model_state_dict_from_checkpoint(checkpoint_content, logger)
 
-        if current_model_is_ddp and not is_ddp_checkpoint:
-            logger.warning("Current model is DDP, checkpoint is not. Adding 'module.' prefix.")
-            for k, v in model_state_dict.items(): adjusted_state_dict[f'module.{k}'] = v
-        elif not current_model_is_ddp and is_ddp_checkpoint:
-            logger.warning("Current model is not DDP, checkpoint is. Removing 'module.' prefix.")
-            for k, v in model_state_dict.items():
-                if k.startswith('module.'): adjusted_state_dict[k[len('module.'):]] = v
-                else: adjusted_state_dict[k] = v # Should not happen if is_ddp_checkpoint is true
-        else: # Both DDP or both not DDP (or one is DDP and has correct prefix)
-            adjusted_state_dict = model_state_dict
+    if model_state_dict_raw:
+        target_model_for_loading = model.module if isinstance(model, DDP) else model
+        
+        # Clean the state_dict: ensure no 'module.' prefix if loading into model.module or non-DDP model
+        _clean_state_dict = OrderedDict()
+        # Check if the raw state_dict (extracted from checkpoint) has 'module.' prefixes
+        raw_dict_has_module_prefix = any(key.startswith('module.') for key in model_state_dict_raw.keys())
+
+        if raw_dict_has_module_prefix:
+            logger.info("Raw model state_dict from checkpoint has 'module.' prefix. Stripping for loading into target model.")
+            for k, v in model_state_dict_raw.items():
+                if k.startswith('module.'):
+                    _clean_state_dict[k[len('module.'):]] = v
+                else:
+                    _clean_state_dict[k] = v # Should not happen if raw_dict_has_module_prefix is true, but keep for safety
+        else:
+            # Raw state_dict does not have 'module.' prefix, which is expected if saved from model.module.state_dict()
+            _clean_state_dict = model_state_dict_raw
         
         try:
-            missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
-            if missing_keys: logger.warning(f"Missing keys in model state: {missing_keys}")
-            if unexpected_keys: logger.warning(f"Unexpected keys in model state: {unexpected_keys}")
+            missing_keys, unexpected_keys = target_model_for_loading.load_state_dict(_clean_state_dict, strict=False)
+            
+            if missing_keys: logger.warning(f"Model Load: Missing parameter keys: {missing_keys}")
+            if unexpected_keys: logger.warning(f"Model Load: Unexpected parameter keys: {unexpected_keys}")
+            logger.info("Model state successfully loaded into target model (model.module or model itself).")
+
         except Exception as e:
-            logger.error("Error loading model state_dict.", exc_info=True)
-            # Decide if to return failure or continue with potentially partial load
-            return 0, np.nan, False # Fail on model load error
+            logger.error(f"Error during model.load_state_dict: {e}", exc_info=True)
+            return 0, np.nan, False # Critical error if model weights can't be loaded
     else:
-        logger.error("No 'model' state_dict found in checkpoint.")
-        return 0, np.nan, False
+        logger.error("No model state_dict could be extracted from the checkpoint. Model not restored.")
+        return 0, np.nan, False # Critical if no model weights
 
-
-    # Optimizer, Scheduler, Scaler (only if data is a dict from your save_training_state)
-    scheduler_restored = False
-    if isinstance(data, dict):
-        if 'optimizer' in data and optimizer is not None:
+    # --- 2. Restore Optimizer, Scheduler, Scaler (if checkpoint_content is a dict and they exist) ---
+    scheduler_restored_flag = False
+    if isinstance(checkpoint_content, dict): # These are only present if saved by save_training_state
+        if 'optimizer' in checkpoint_content and optimizer is not None:
             try:
-                optimizer.load_state_dict(data['optimizer'])
+                optimizer.load_state_dict(checkpoint_content['optimizer'])
                 logger.info("Optimizer state restored.")
-                for state in optimizer.state.values(): # Move optimizer state to device
-                    for k, v_opt in state.items():
-                        if isinstance(v_opt, torch.Tensor): state[k] = v_opt.to(device)
-            except Exception as e: logger.warning(f"Could not restore optimizer state: {e}. Fresh optimizer.", exc_info=True)
-        
-        if 'scheduler' in data and scheduler is not None:
+                # Move optimizer state tensors to the correct device
+                for state in optimizer.state.values(): 
+                    for k_opt, v_opt in state.items():
+                        if isinstance(v_opt, torch.Tensor):
+                            state[k_opt] = v_opt.to(device)
+            except Exception as e:
+                logger.warning(f"Could not restore optimizer state: {e}. Optimizer starts fresh.", exc_info=False)
+        elif optimizer is not None:
+            logger.info("Optimizer state not found in checkpoint. Optimizer starts fresh.")
+
+        if 'scheduler' in checkpoint_content and scheduler is not None:
             try:
-                scheduler.load_state_dict(data['scheduler'])
+                scheduler.load_state_dict(checkpoint_content['scheduler'])
                 logger.info("Scheduler state restored.")
-                scheduler_restored = True
-            except Exception as e: logger.warning(f"Could not restore scheduler state: {e}. Fresh scheduler.", exc_info=True)
+                scheduler_restored_flag = True
+            except Exception as e:
+                logger.warning(f"Could not restore scheduler state: {e}. Scheduler starts fresh.", exc_info=False)
+        elif scheduler is not None:
+            logger.info("Scheduler state not found in checkpoint. Scheduler starts fresh.")
 
-        if 'grad_scaler' in data and scaler is not None:
+        if 'grad_scaler' in checkpoint_content and scaler is not None and device.type == 'cuda':
             try:
-                scaler.load_state_dict(data['grad_scaler'])
+                scaler.load_state_dict(checkpoint_content['grad_scaler'])
                 logger.info("GradScaler state restored.")
-            except Exception as e: logger.warning(f"Could not restore GradScaler state: {e}. Fresh scaler.", exc_info=True)
+            except Exception as e:
+                logger.warning(f"Could not restore GradScaler state: {e}. Scaler starts fresh.", exc_info=False)
+        elif scaler is not None and device.type == 'cuda':
+            logger.info("GradScaler state not found in checkpoint. Scaler starts fresh.")
+    else: # Checkpoint was likely just a model state_dict
+        logger.info("Checkpoint content is not a dictionary (likely just model weights). Skipping optimizer/scheduler/scaler restore.")
 
-    step = data.get('step', 0) if isinstance(data, dict) else 0
-    loss_val = data.get('loss', np.nan) if isinstance(data, dict) else np.nan # Renamed to avoid conflict
+    # --- 3. Restore Step/Epoch and Loss ---
+    restored_step = 0
+    restored_loss = np.nan
+
+    if isinstance(checkpoint_content, dict):
+        restored_step = checkpoint_content.get('step', 0) # 'step' often means epoch in this context
+        restored_loss = checkpoint_content.get('loss', np.nan) 
     
-    if step > 0 : logger.info(f"Restored to step {step} with loss {loss_val:.5f}")
-    else: logger.info("No previous step/loss found in checkpoint data or checkpoint was just a model state_dict.")
+    if restored_step > 0:
+        logger.info(f"Restored to step/epoch {restored_step}. Last recorded loss: {restored_loss if not np.isnan(restored_loss) else 'N/A'}.")
+    else:
+        logger.info("No previous step/loss found in checkpoint, or checkpoint was model weights only.")
     
-    return step, loss_val, scheduler_restored
+    logger.info(f"Checkpoint restoration from '{path}' complete.")
+    return restored_step, restored_loss, scheduler_restored_flag
 
 
 def save_training_state(model, optimizer, scheduler, scaler, step, loss, path,
