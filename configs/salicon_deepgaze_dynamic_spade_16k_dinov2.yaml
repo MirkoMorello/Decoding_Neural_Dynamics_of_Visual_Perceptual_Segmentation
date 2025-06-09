@@ -1,0 +1,73 @@
+# deepgaze_dynamic_config.yaml
+# For use with train_deepgaze_dynamic_embedding.py
+
+# --- Experiment Configuration ---
+# Stage to run. Choose one:
+#   'salicon_pretrain_densenet_dynamic'
+#   'mit_spatial_densenet_dynamic'
+stage: 'salicon_pretrain_densenet_dynamic'
+log_level: 'INFO'
+
+# --- DeepGaze (DenseNet) Backbone Configuration ---
+densenet_model_name: 'densenet201'
+densenet_semantic_feature_layer_idx: -1  # Index from the 3 hardcoded DenseNet layers for SPADE features.
+                                         # -1 means the last one (deepest). Valid options are 0, 1, 2, or -1, -2, -3.
+
+# --- SPADE & Mask Configuration ---
+num_total_segments: 16                        # Total number of segment IDs (e.g., 16 for masks with IDs 0-15)
+segmentation_mask_format: 'png'             # Format of individual masks if used ('png' or 'npy')
+segmentation_mask_bank_dtype: 'uint8'       # Dtype for mask banks
+
+# --- Training Hyperparameters (SALICON pretraining) ---
+batch_size: 4                               # Adjust based on GPU VRAM; DenseNet can be memory-intensive
+gradient_accumulation_steps: 2
+lr: 0.0001
+lr_milestones: [20, 40, 55]
+min_lr: 0.000001                            # 1e-6
+validation_epochs: 1
+resume_checkpoint: null                     # Path to checkpoint for SALICON stage explicit resume
+finalizer_initial_sigma: 8.0
+finalizer_learn_sigma: true
+
+# --- Training Hyperparameters (MIT spatial fine-tuning) ---
+fold: 0                                     # MIT1003 cross-validation fold (0-9).
+lr_mit_spatial: 0.0001                      # Learning rate for MIT fine-tuning
+lr_milestones_mit_spatial: [10, 20, 30, 40]
+salicon_checkpoint_path: null               # Path to SALICON checkpoint to load for MIT stage.
+                                            # If null, script will try to find it automatically.
+
+# --- Dataloading & System ---
+num_workers: 'auto'                         # 'auto' or integer
+train_dir: './experiments/densenet_spade_dynamic_dino_16' # Base output directory for experiments
+dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored
+lmdb_dir: './data/lmdb_caches_deepgaze_dynamic' # Where LMDB caches for images will be stored
+use_lmdb_images: true
+
+# ==============================================================================
+# --- MASK PATHS CONFIGURATION ---
+# The script prioritizes banks if paths are provided. To use individual file
+# directories, ensure all bank file paths for that dataset are set to null.
+# ==============================================================================
+
+# --- SALICON Mask Paths ---
+# To use individual files, uncomment the first two lines and set all bank paths below to null.
+salicon_train_mask_dir: './masks/salicon/dinov2_kmeans_k16_salicon_train/'
+salicon_val_mask_dir: './masks/salicon/dinov2_kmeans_k16_salicon_val/'
+
+# To use banks, provide paths here and comment out/nullify the individual dirs above.
+train_mask_memmap_file: null
+val_mask_memmap_file: null
+train_mask_variable_payload_file: './masks/salicon/banks/dinok16/SALICON_train_k16_dinov2l14_var_payload.bin'
+train_mask_variable_header_file: './masks/salicon/banks/dinok16/SALICON_train_k16_dinov2l14_var_header.npy'
+val_mask_variable_payload_file: './masks/salicon/banks/dinok16/SALICON_val_k16_dinov2l14_var_payload.bin'
+val_mask_variable_header_file: './masks/salicon/banks/dinok16/SALICON_val_k16_dinov2l14_var_header.npy'
+
+
+# --- MIT1003 Mask Paths (for the ENTIRE dataset) ---
+# To use individual files, uncomment the first line and set all bank paths below to null.
+mit_all_mask_dir: './masks/mit1003/dinov2_kmeans_k16_mit/'
+
+# To use banks, provide paths here and comment out/nullify the individual dir above.
+mit_mask_fixed_memmap_file: null
+mit_mask_variable_payload_file: null # e.g., './masks/mit1003/banks/sam16/mit1003_sam_16_var_payload.bin'
+mit_mask_variable_header_file: null  # e.g., './masks/mit1003/banks/sam16/mit1003_sam_16_var_header.npy'
