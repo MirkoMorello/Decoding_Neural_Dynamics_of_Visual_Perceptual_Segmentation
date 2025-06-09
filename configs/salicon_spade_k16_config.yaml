@@ -70,7 +70,7 @@ add_sa_head: false
 # Option 1: DIRECTORY for individual mask files for ALL MIT1003 images
 # If using this, ensure the folder contains masks like 'i1.png', 'i2.png', etc.
 # matching the basenames of your MIT1003 stimuli.
-mit_all_mask_dir: './masks/mit1003/sam_vitl_k16_mit/' 
+mit_all_mask_dir: './masks/mit1003/dinov2_kmeans_k16_mit/' 
 
 mit_mask_variable_payload_file: './masks/mit1003/banks/dinok16/mit_k16_dinov2_l14_var_payload.bin'
 mit_mask_variable_header_file: './masks/mit1003/banks/dinok16/mit_k16_dinov2_l14_var_header.npy'
