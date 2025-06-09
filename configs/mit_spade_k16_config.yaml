@@ -24,7 +24,7 @@ max_epochs_mit: 30                           # Max epochs for MIT fine-tuning st
 
 # Path to the SALICON pretrained model checkpoint.
 # If null, the script will try to auto-detect from default SALICON output dir.
-salicon_checkpoint_path: './experiments/densenet_spadev2_dino_16/salicon_pretrain_densenet_spade/step-0009.pth'
+salicon_checkpoint_path: './experiments/densenet_spade_dino_16/salicon_pretrain_densenet_spade/step-0009.pth'
 
 # --- Training Hyperparameters (some may be overridden by MIT-specific ones) ---
 batch_size: 1
@@ -44,7 +44,7 @@ finalizer_learn_sigma: true                  # Whether sigma in Finalizer is lea
 
 # --- Dataloading & System ---
 num_workers: 8                               # Number of DataLoader workers per GPU (can be 'auto')
-train_dir: './experiments/densenet_spadev2_dino_16' # Base output directory for experiments
+train_dir: './experiments/densenet_spade_dino_16' # Base output directory for experiments
 dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored by pysaliency
 lmdb_dir: './data/lmdb_cache_densenet'      # Where LMDB caches for images will be stored
 use_lmdb_images: true                       # Use LMDB for images
