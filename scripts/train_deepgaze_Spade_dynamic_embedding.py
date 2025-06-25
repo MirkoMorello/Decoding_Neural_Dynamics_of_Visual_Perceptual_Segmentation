@@ -61,7 +61,6 @@ except ImportError as e:
 
 _logger = logging.getLogger("train_deepgaze_dynamic_embedding")
 
-# ... [init_distributed, cleanup_distributed, and all model classes are identical to previous responses, no changes needed] ...
 def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -259,6 +258,7 @@ def main(args: argparse.Namespace):
         fixsel_net = build_fixation_selection_network(scanpath_features=0)
         model = DeepGazeIIIDynamicEmbedding(features_module, saliency_net, fixsel_net, args.densenet_semantic_feature_layer_idx, args.num_total_segments, args.finalizer_learn_sigma, args.finalizer_initial_sigma).to(device)
         if is_distributed: model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
+        model = torch.compile(model)
         optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
         lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones)
         
