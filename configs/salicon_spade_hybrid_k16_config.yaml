@@ -1,0 +1,74 @@
+# hybrid_gaze_spade_config.yaml
+# Configuration for the hybrid DenseNet+DINOv2 SPADE model.
+# For use with train_hybrid_gaze_spade.py
+
+# --- Experiment Configuration ---
+# Stage to run. Choose one:
+#   'salicon_pretrain_hybrid': Pre-train the head on SALICON.
+#   'mit_spatial_hybrid': Fine-tune a pre-trained model on MIT1003.
+stage: 'salicon_pretraining'
+log_level: 'INFO'
+
+# --- Main Path Backbone (DenseNet) ---
+densenet_model_name: 'densenet201'
+
+# --- Semantic Guidance Backbone (DINOv2) ---
+dinov2_model_name: 'dinov2_vitb14'      # ViT-Base. Good balance of speed and performance.
+dinov2_patch_size: 14                   # Must match the model name (e.g., vitb14 -> 14)
+dinov2_layers_for_guidance: [-1]        # Extract only the last layer's features from DINOv2.
+dinov2_semantic_feature_layer_idx: -1   # Use the last (and only) layer from the list above.
+
+# --- SPADE & Mask Configuration ---
+num_total_segments: 16                  # Number of segment IDs (e.g., 16 for masks with IDs 0-15)
+# Note: mask paths are now more specific, pointing to DINOv2-based masks
+# The script will prioritize memory-mapped banks if paths are provided.
+# To use individual files, ensure bank paths are null.
+
+# --- Training Hyperparameters (SALICON pretraining) ---
+batch_size: 8                           # Larger batch size is better for stability.
+gradient_accumulation_steps: 2          # Effective batch size = 8 * 2 = 16
+lr: 0.0005                              # A solid starting LR for Adam with a fresh head.
+lr_milestones: [20, 40, 55]
+min_lr: 0.000001                        # 1e-6
+validation_epochs: 1
+resume_checkpoint: null                 # Path to a checkpoint to resume SALICON pre-training from.
+
+# --- Training Hyperparameters (MIT spatial fine-tuning) ---
+fold: 0                                 # MIT1003 cross-validation fold (0-9).
+lr_mit_spatial: 0.00002                 # CRITICAL: Use a low LR for fine-tuning. 2e-5 is a safe start.
+lr_milestones_mit_spatial: [15, 30]
+# Path to the SALICON checkpoint to load for fine-tuning on MIT.
+# This should point to the output of the 'salicon_pretrain_hybrid' stage.
+salicon_checkpoint_path: './experiments_hybrid_gaze_spade/salicon_pretrain_hybrid_dinov2_vitb14_lr0.0005/final_best_val.pth'
+
+# --- Dataloading & System ---
+num_workers: 'auto'                     # 'auto' or integer
+train_dir: './experiments/experiments_hybrid_gaze_spade' # Base output directory for experiments
+dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored
+lmdb_dir: './data/lmdb_caches_hybrid'       # Where LMDB caches for images will be stored
+finalizer_initial_sigma: 8.0
+finalizer_learn_sigma: true
+use_torch_compile: true                 # Highly recommended if using PyTorch 2.0+
+
+# ==============================================================================
+# --- MASK PATHS CONFIGURATION ---
+# The script prioritizes banks if paths are provided. To use individual file
+# directories, ensure all bank file paths for that dataset are set to null.
+# ==============================================================================
+
+# --- SALICON Mask Paths (using DINOv2-based k-means masks) ---
+# To use individual files:
+salicon_train_mask_dir: './data/masks/salicon/dinov2_kmeans_k16_salicon_train/'
+salicon_val_mask_dir: './data/masks/salicon/dinov2_kmeans_k16_salicon_val/'
+
+# To use memory-mapped banks for performance:
+# train_mask_memmap_file: './data/masks/salicon/banks/dinok16/SALICON_train_k16.npy'
+# val_mask_memmap_file: './data/masks/salicon/banks/dinok16/SALICON_val_k16.npy'
+
+
+# --- MIT1003 Mask Paths (using DINOv2-based k-means masks) ---
+# To use individual files:
+mit_all_mask_dir: './data/masks/mit1003/dinov2_kmeans_k16_mit/'
+
+# To use memory-mapped banks for performance:
+# mit_mask_fixed_memmap_file: './data/masks/mit1003/banks/dinok16/MIT1003_k16.npy'
