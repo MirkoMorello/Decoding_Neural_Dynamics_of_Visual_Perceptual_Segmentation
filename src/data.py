@@ -322,111 +322,103 @@ class ImageDatasetWithSegmentation(ImageDataset):
 
 
     def __getitem__(self, key: int):
-        # 1. Get base item (image, centerbias, fixations, weight) from parent ImageDataset
-        # This will be a dictionary of NumPy arrays (or tensors if parent transform was applied)
-        original_item_from_parent = super().__getitem__(key)
-
-        # 2. Prepare final_item dictionary.
-        # Ensure all relevant data from parent is in final_item.
-        # If parent already returned tensors, use them. If numpy, convert.
-        final_item = {}
-        for k_orig, v_orig in original_item_from_parent.items():
-            if isinstance(v_orig, np.ndarray):
-                final_item[k_orig] = torch.from_numpy(v_orig.copy()) # Ensure copy if it's numpy
-            elif isinstance(v_orig, torch.Tensor):
-                final_item[k_orig] = v_orig # Pass tensor directly
-            else: # For other types like float (weight)
-                 final_item[k_orig] = v_orig
-        
-        # Ensure 'weight' is a tensor if it was a float
-        if 'weight' in final_item and not isinstance(final_item['weight'], torch.Tensor):
-            final_item['weight'] = torch.tensor(final_item['weight'], dtype=torch.float32)
-        elif 'weight' not in final_item: # Add default weight if missing
-            final_item['weight'] = torch.tensor(1.0, dtype=torch.float32)
-
-
-        # 3. Load Segmentation Mask based on determined strategy
-        mask_tensor_to_add = None
-
-        if self.mask_loading_strategy == "fixed_bank":
+            """
+            Retrieves a complete data sample. This version uses the public .filenames
+            attribute from the FileStimuli object to reliably get the stimulus ID.
+            """
+            # 1. Get base data from parent. This loads the resized image from the cache path.
             try:
-                mask_np_view = self.mask_fixed_mmap_bank[key]
-                mask_np_copy = np.array(mask_np_view) 
-                mask_tensor_to_add = torch.from_numpy(mask_np_copy.astype(np.int64)) 
-            except IndexError: logger.error(f"Index {key} out of bounds for fixed mask bank. Using dummy mask.")
-            except Exception as e: logger.error(f"Error reading from fixed mask bank for key {key}: {e}. Using dummy mask.")
-
-        elif self.mask_loading_strategy == "variable_bank":
-            try:
-                offset, H, W = self.mask_variable_header_data[key]
-                if H <= 0 or W <= 0: 
-                    logger.debug(f"Skipping variable mask for key {key} due to zero/negative H/W in header (H={H}, W={W}).")
-                else:
-                    num_elements = H * W
-                    if offset + num_elements > self.mask_variable_payload_mmap.size:
-                        raise ValueError(f"Slice [{offset}:{offset+num_elements}] (H={H},W={W}) "
-                                         f"exceeds payload size {self.mask_variable_payload_mmap.size} for key {key}.")
-                    
-                    mask_1d_view = self.mask_variable_payload_mmap[offset : offset + num_elements]
-                    mask_np_array = np.array(mask_1d_view).reshape(H, W) 
-                    mask_tensor_to_add = torch.from_numpy(mask_np_array.astype(np.int64))
-            except IndexError: logger.error(f"Index {key} out of bounds for variable mask header. Using dummy mask.")
-            except ValueError as ve: 
-                 logger.error(f"ValueError for variable mask bank for key {key}: {ve}. Using dummy mask.")
-            except Exception as e: logger.error(f"Error reading from variable mask bank for key {key}: {e}. Using dummy mask.")
-
-        elif self.mask_loading_strategy == "individual_files":
-            try:
-                if not (isinstance(self.stimuli, pysaliency.FileStimuli) and \
-                        hasattr(self.stimuli, 'filenames') and \
-                        self.stimuli.filenames is not None and \
-                        key < len(self.stimuli.filenames)):
-                    raise AttributeError("Dataset's stimuli object is not FileStimuli, or filenames are missing/invalid, "
-                                         "cannot load individual masks by filename.")
-                
-                stimulus_filepath_obj = Path(self.stimuli.filenames[key])
-                img_basename = stimulus_filepath_obj.stem
-                mask_fname = f"{img_basename}.{self.segmentation_mask_format}"
-                
-                # self.individual_mask_files_dir is the direct path to the masks for this dataset
-                mask_path_full = self.individual_mask_files_dir / mask_fname
-
-                if mask_path_full.exists():
-                    if self.segmentation_mask_format == "png":
-                        mask_pil = Image.open(mask_path_full)
-                        if mask_pil.mode not in ['L', 'I', 'P', '1']: 
-                            logger.debug(f"Mask {mask_path_full} mode {mask_pil.mode}, converting to L.")
-                            mask_pil = mask_pil.convert('L')
-                        mask_arr = np.array(mask_pil)
-                    elif self.segmentation_mask_format == "npy":
-                        mask_arr = np.load(mask_path_full)
-                    else:
-                        raise ValueError(f"Unsupported individual mask format: {self.segmentation_mask_format}")
-                    mask_tensor_to_add = torch.from_numpy(mask_arr.astype(np.int64))
-                else:
-                   logger.debug(f"Individual mask file not found: {mask_path_full} (Key: {key}, Stimulus: {stimulus_filepath_obj.name})")
+                original_item_from_parent = super().__getitem__(key)
             except IndexError:
-                logger.error(f"Index {key} out of bounds for stimuli.filenames. Using dummy mask.")
-            except AttributeError as ae:
-                 logger.error(f"Error accessing stimuli filenames for individual mask loading: {ae}. Using dummy mask.")
-            except Exception as e_indiv:
-                mask_path_str = str(mask_path_full) if 'mask_path_full' in locals() else 'N/A'
-                logger.warning(f"Error loading individual mask for key {key} from {mask_path_str}: {e_indiv}. Using dummy mask.")
-        
-        # --- If All Else Fails or strategy is "dummy", Create Dummy Mask ---
-        if mask_tensor_to_add is None:
-            # Image tensor should already be in final_item from parent
-            logger.error(f"Segmentation mask for key {key} could not be loaded from any source. Creating dummy mask.")
-            if 'image' not in final_item or not isinstance(final_item['image'], torch.Tensor):
-                 logger.error(f"Image tensor missing or not a tensor in final_item for key {key} when creating dummy mask. This is unexpected.")
-                 # Fallback to a default size if image tensor is problematic, though this shouldn't happen.
-                 img_h_final, img_w_final = 256, 256 
-            else:
-                 img_h_final, img_w_final = final_item['image'].shape[1], final_item['image'].shape[2]
-            mask_tensor_to_add = torch.zeros((img_h_final, img_w_final), dtype=torch.long)
+                logger.error(f"Index {key} out of bounds in parent ImageDataset. Skipping.")
+                return {
+                    'image': torch.zeros(3, 224, 224, dtype=torch.float),
+                    'centerbias': torch.zeros(224, 224, dtype=torch.float),
+                    'fixations': torch.zeros(0, 2, dtype=torch.float),
+                    'weight': torch.tensor(1.0, dtype=torch.float32),
+                    'segmentation_mask': torch.zeros(224, 224, dtype=torch.long)
+                }
 
-        final_item['segmentation_mask'] = mask_tensor_to_add
-        return final_item
+            # 2. Prepare the final dictionary, converting numpy arrays to tensors.
+            final_item = {}
+            for k_orig, v_orig in original_item_from_parent.items():
+                if isinstance(v_orig, np.ndarray):
+                    final_item[k_orig] = torch.from_numpy(v_orig.copy())
+                else:
+                    final_item[k_orig] = v_orig
+
+            if 'weight' in final_item and not isinstance(final_item['weight'], torch.Tensor):
+                final_item['weight'] = torch.tensor(final_item['weight'], dtype=torch.float32)
+            elif 'weight' not in final_item:
+                final_item['weight'] = torch.tensor(1.0, dtype=torch.float32)
+
+            # 3. Load the corresponding segmentation mask.
+            mask_tensor_to_add = None
+            stimulus_id_str = f"key:{key}" # Default for logging
+
+            if self.mask_loading_strategy == "individual_files":
+                try:
+                    # --- THIS IS THE FINAL FIX ---
+                    # Since self.stimuli is a pysaliency.FileStimuli object, it has a
+                    # .filenames attribute, which is a list of the full paths to the cached images.
+                    cached_image_filename = self.stimuli.filenames[key]
+                    # We get the base name without the extension (e.g., 'i12345').
+                    stimulus_id_str = Path(cached_image_filename).stem
+                    # -----------------------------
+
+                    mask_fname = f"{stimulus_id_str}.{self.segmentation_mask_format}"
+                    mask_path_full = self.individual_mask_files_dir / mask_fname
+
+                    if mask_path_full.exists():
+                        if self.segmentation_mask_format == "png":
+                            with Image.open(mask_path_full) as mask_pil:
+                                if mask_pil.mode not in ['L', 'I', 'P', '1']:
+                                    mask_pil = mask_pil.convert('L')
+                                mask_arr = np.array(mask_pil)
+                        elif self.segmentation_mask_format == "npy":
+                            mask_arr = np.load(mask_path_full)
+                        else:
+                            raise ValueError(f"Unsupported mask format: {self.segmentation_mask_format}")
+                        mask_tensor_to_add = torch.from_numpy(mask_arr.astype(np.int64))
+                    else:
+                        logger.debug(f"Individual mask file not found: {mask_path_full}")
+                except (AttributeError, IndexError) as e:
+                    logger.error(f"Failed to get mask filename for key {key}: {e}. Ensure self.stimuli is a FileStimuli object. Using dummy mask.")
+                except Exception as e:
+                    logger.error(f"General error loading mask for key {key}: {e}. Using dummy mask.")
+
+            # ... (bank loading logic remains the same) ...
+            elif self.mask_loading_strategy in ["fixed_bank", "variable_bank"]:
+                try:
+                    # This part is fine, as it uses the integer key
+                    if self.mask_loading_strategy == "fixed_bank":
+                        mask_np_view = self.mask_fixed_mmap_bank[key]
+                        mask_tensor_to_add = torch.from_numpy(np.array(mask_np_view).astype(np.int64))
+                    else: # variable_bank
+                        offset, H, W = self.mask_variable_header_data[key]
+                        if H > 0 and W > 0:
+                            num_elements = H * W
+                            mask_1d_view = self.mask_variable_payload_mmap[offset : offset + num_elements]
+                            mask_tensor_to_add = torch.from_numpy(np.array(mask_1d_view).reshape(H, W).astype(np.int64))
+                except Exception as e:
+                    logger.error(f"Error reading from mask bank for key {key}: {e}. Using dummy mask.")
+
+            # 4. Fallback to dummy mask.
+            if mask_tensor_to_add is None:
+                if self.mask_loading_strategy != 'dummy':
+                    logger.error(f"Mask for {stimulus_id_str} failed to load via '{self.mask_loading_strategy}' strategy. Creating dummy mask.")
+                
+                if 'image' in final_item and isinstance(final_item['image'], torch.Tensor):
+                    img_h, img_w = final_item['image'].shape[1], final_item['image'].shape[2]
+                else:
+                    img_h, img_w = 224, 224
+                    logger.critical(f"Image tensor missing for key {key} when creating dummy mask!")
+                
+                mask_tensor_to_add = torch.zeros((img_h, img_w), dtype=torch.long)
+
+            # 5. Add the final mask and return.
+            final_item['segmentation_mask'] = mask_tensor_to_add
+            return final_item
 
 
 class FixationDataset(torch.utils.data.Dataset):

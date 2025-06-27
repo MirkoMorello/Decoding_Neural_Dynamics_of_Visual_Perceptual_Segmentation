@@ -61,14 +61,18 @@ except ImportError as e:
 
 _logger = logging.getLogger("train_deepgaze_dynamic_embedding")
 
+import datetime
+
 def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_distributed = world_size > 1
     if is_distributed:
+        timeout = datetime.timedelta(hours=2)
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
+        
         device = torch.device(f"cuda:{local_rank}")
         is_master = rank == 0
     else:

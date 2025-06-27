@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 """
-Multi-GPU-ready training script for DeepGaze with a DenseNet backbone,
-SPADE normalization, and DYNAMIC semantic embeddings derived from a DINOv2
-backbone. This creates a hybrid model where the main features are from
-DenseNet, but the semantic context for SPADE modulation comes from DINOv2.
-(Version includes fixes for distributed deadlock and device placement).
+Multi-GPU-ready training script for a hybrid DenseNet+DINO model using SPADE.
+This version uses a self-contained model class and robust DDP setup to ensure
+stability and prevent deadlocks, inspired by a proven working implementation.
 """
 import os
 import sys
@@ -19,6 +17,7 @@ import yaml
 import argparse
 import logging
 from pathlib import Path
+import pickle  # <<< FIX: Import pickle for its exception type
 
 import torch
 import torch.nn as nn
@@ -53,7 +52,6 @@ try:
     from src.dinov2_backbone import DinoV2Backbone
     from src.modules import FeatureExtractor, Finalizer, build_fixation_selection_network
     from src.layers import Bias
-    from src.metrics import log_likelihood, nss, auc as auc_cpu_fn
     from src.training import _train, restore_from_checkpoint
 except ImportError as e:
     print(f"PYTHON IMPORT ERROR: {e}\n(sys.path: {sys.path})")
@@ -61,20 +59,28 @@ except ImportError as e:
 
 _logger = logging.getLogger("train_hybrid_gaze_spade")
 
+
+import datetime
+
 def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_distributed = world_size > 1
     if is_distributed:
+        # Set a generous timeout to accommodate the long baseline calculation on rank 0
+        timeout = datetime.timedelta(hours=2) # 2 hours
+        
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout) # <--- THIS LINE IS MODIFIED
+        
         device = torch.device(f"cuda:{local_rank}")
         is_master = rank == 0
     else:
         rank = 0; world_size = 1; is_master = True
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return device, rank, world_size, is_master, is_distributed
+
 
 def cleanup_distributed():
     if dist.is_initialized():
@@ -126,72 +132,61 @@ class SaliencyNetworkSPADEDynamic(nn.Module):
         h = self.conv2(h); h = self.bias2(h); h = self.softplus2(h)
         return h
 
-class DeepGazeIIIDynamicDinoEmbedding(nn.Module):
-    def __init__(self, features_module: FeatureExtractor, dino_features_module: DinoV2Backbone,
-                 saliency_network: SaliencyNetworkSPADEDynamic, fixation_selection_network,
-                 num_total_segments: int, finalizer_learn_sigma: bool, initial_sigma=8.0,
-                 scanpath_network=None, downsample_input_to_backbone=1, readout_factor=4, saliency_map_factor_finalizer=4):
+class HybridSpadeSaliencyModel(nn.Module):
+    def __init__(self, features_module, dino_features_module, saliency_network, fixation_selection_network,
+                 finalizer, num_total_segments, downsample=1, readout_factor=4):
         super().__init__()
         self.features = features_module
         self.dino_features = dino_features_module
         self.saliency_network = saliency_network
-        self.scanpath_network = scanpath_network
         self.fixation_selection_network = fixation_selection_network
+        self.finalizer = finalizer
         self.num_total_segments = num_total_segments
-        self.downsample_input_to_backbone = downsample_input_to_backbone
+        self.downsample = downsample
         self.readout_factor = readout_factor
-        self.finalizer = Finalizer(sigma=initial_sigma, learn_sigma=finalizer_learn_sigma, saliency_map_factor=saliency_map_factor_finalizer)
 
-        if hasattr(self.dino_features, 'parameters'):
-            for param in self.dino_features.parameters(): param.requires_grad = False
-        if hasattr(self.dino_features, 'eval'): self.dino_features.eval()
+        for p in self.features.parameters(): p.requires_grad = False
+        for p in self.dino_features.parameters(): p.requires_grad = False
+        self.features.eval()
+        self.dino_features.eval()
 
-    def _create_painted_semantic_map(self, F_dino_patches, raw_sam_pixel_segmap):
+    def _create_painted_semantic_map_vectorized(self, F_dino_patches, raw_sam_pixel_segmap):
         B, C_dino, H_p, W_p = F_dino_patches.shape
         _, H_img, W_img = raw_sam_pixel_segmap.shape
-        device = F_dino_patches.device; dtype = F_dino_patches.dtype
-        painted_map_batch = torch.zeros(B, C_dino, H_img, W_img, device=device, dtype=dtype)
-        for b_idx in range(B):
-            img_patch_features = F_dino_patches[b_idx]
-            img_sam_pixel_segmap = raw_sam_pixel_segmap[b_idx]
-            segmap_at_patch_res = F.interpolate(img_sam_pixel_segmap.unsqueeze(0).unsqueeze(0).float(), size=(H_p, W_p), mode='nearest').squeeze(0).squeeze(0).long()
-            flat_patch_features = img_patch_features.permute(1, 2, 0).reshape(H_p * W_p, C_dino)
-            flat_patch_sam_ids = torch.clamp(segmap_at_patch_res.reshape(H_p * W_p), 0, self.num_total_segments - 1)
-            segment_avg_dino_features = scatter_mean(src=flat_patch_features, index=flat_patch_sam_ids, dim=0, dim_size=self.num_total_segments)
-            segment_avg_dino_features = torch.nan_to_num(segment_avg_dino_features, nan=0.0)
-            clamped_pixel_sam_ids = torch.clamp(img_sam_pixel_segmap.long(), 0, self.num_total_segments - 1)
-            painted_map_batch[b_idx] = segment_avg_dino_features[clamped_pixel_sam_ids].permute(2, 0, 1)
-        return painted_map_batch
-
+        device = F_dino_patches.device
+        segmap_at_feat_res = F.interpolate(raw_sam_pixel_segmap.unsqueeze(1).float(), size=(H_p, W_p), mode='nearest').long()
+        flat_features = F_dino_patches.permute(0, 2, 3, 1).reshape(-1, C_dino)
+        flat_segmap_at_feat_res = segmap_at_feat_res.view(-1)
+        batch_idx_tensor = torch.arange(B, device=device, dtype=torch.long).view(B, 1).expand(-1, H_p * W_p).reshape(-1)
+        global_segment_ids = batch_idx_tensor * self.num_total_segments + torch.clamp(flat_segmap_at_feat_res, 0, self.num_total_segments - 1)
+        total_segments_in_batch = B * self.num_total_segments
+        segment_avg_features = scatter_mean(src=flat_features, index=global_segment_ids, dim=0, dim_size=total_segments_in_batch)
+        segment_avg_features = torch.nan_to_num(segment_avg_features, nan=0.0)
+        flat_pixel_segmap = raw_sam_pixel_segmap.view(B, -1)
+        batch_idx_pixel_tensor = torch.arange(B, device=device, dtype=torch.long).view(B, 1).expand(-1, H_img * W_img)
+        global_pixel_ids = batch_idx_pixel_tensor.reshape(-1) * self.num_total_segments + torch.clamp(flat_pixel_segmap.view(-1), 0, self.num_total_segments - 1)
+        painted_flat = segment_avg_features[global_pixel_ids]
+        return painted_flat.view(B, H_img, W_img, C_dino).permute(0, 3, 1, 2)
+    
     def forward(self, image, centerbias, segmentation_mask, **kwargs):
         if segmentation_mask is None: raise ValueError(f"{self.__class__.__name__} requires 'segmentation_mask'.")
-        
         img_for_features = image
-        if self.downsample_input_to_backbone != 1:
-            img_for_features = F.interpolate(image, scale_factor=1.0 / self.downsample_input_to_backbone, mode='bilinear', align_corners=False)
-
+        if self.downsample != 1:
+            img_for_features = F.interpolate(image, scale_factor=1.0 / self.downsample, mode='bilinear', align_corners=False)
         with torch.no_grad():
             dino_feature_maps = self.dino_features(img_for_features)
             semantic_dino_patches = dino_feature_maps[0]
-        
-        painted_map = self._create_painted_semantic_map(semantic_dino_patches, segmentation_mask)
-        extracted_feature_maps = self.features(img_for_features)
-        readout_h = math.ceil(image.shape[2] / self.downsample_input_to_backbone / self.readout_factor)
-        readout_w = math.ceil(image.shape[3] / self.downsample_input_to_backbone / self.readout_factor)
-        
+            extracted_feature_maps = self.features(img_for_features)
+        painted_map = self._create_painted_semantic_map_vectorized(semantic_dino_patches, segmentation_mask)
+        readout_h = math.ceil(image.shape[2] / self.downsample / self.readout_factor)
+        readout_w = math.ceil(image.shape[3] / self.downsample / self.readout_factor)
         processed_features_list = [F.interpolate(f, size=(readout_h, readout_w), mode='bilinear', align_corners=False) for f in extracted_feature_maps]
         concatenated_features = torch.cat(processed_features_list, dim=1)
-        
         saliency_output = self.saliency_network(concatenated_features, painted_map)
         final_readout = self.fixation_selection_network((saliency_output, None))
         log_density = self.finalizer(final_readout, centerbias)
         return log_density
 
-    def train(self, mode=True):
-        if hasattr(self.features, 'eval'): self.features.eval()
-        if hasattr(self.dino_features, 'eval'): self.dino_features.eval()
-        self.saliency_network.train(mode); self.fixation_selection_network.train(mode); self.finalizer.train(mode)
-        super().train(mode)
 
 def salicon_pretrain(args, device, is_master, is_distributed, model):
     if is_master: _logger.info("--- Preparing SALICON Pretraining ---")
@@ -200,27 +195,54 @@ def salicon_pretrain(args, device, is_master, is_distributed, model):
     if is_master:
         if not (salicon_loc/'stimuli'/'train').exists(): pysaliency.get_SALICON_train(location=str(salicon_loc.parent))
         if not (salicon_loc/'stimuli'/'val').exists(): pysaliency.get_SALICON_val(location=str(salicon_loc.parent))
-    if is_distributed: dist.barrier()
+    if is_distributed: dist.barrier() # Barrier to ensure data is downloaded
     
     train_stim, train_fix = pysaliency.get_SALICON_train(location=str(salicon_loc.parent))
     val_stim, val_fix = pysaliency.get_SALICON_val(location=str(salicon_loc.parent))
-    centerbias = BaselineModel(train_stim, train_fix, bandwidth=0.0217, eps=2e-13, caching=False)
-
-    train_ll, val_ll = None, None
-    if is_master:
-        _logger.info("Master computing baseline LLs... (this may take a while)")
-        train_ll = centerbias.information_gain(train_stim, train_fix, verbose=True, average='image')
-        val_ll = centerbias.information_gain(val_stim, val_fix, verbose=True, average='image')
-        _logger.info(f"Master LLs computed: Train={train_ll:.4f}, Val={val_ll:.4f}")
-
-    if is_distributed: dist.barrier()
     
-    ll_bcast = [train_ll, val_ll]
-    if is_distributed: dist.broadcast_object_list(ll_bcast, src=0)
-    train_ll, val_ll = ll_bcast
-    if train_ll is None or val_ll is None: _logger.critical("NaN LLs received."); sys.exit(1)
+    # These variables will be populated on rank 0, and remain None on other ranks
+    train_ll, val_ll = None, None
 
-    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+    if is_master:
+        centerbias = BaselineModel(train_stim, train_fix, bandwidth=0.0217, eps=2e-13, caching=False)
+        train_ll_cache = args.train_dir / 'salicon_baseline_train_ll.pkl'
+        val_ll_cache = args.train_dir / 'salicon_baseline_val_ll.pkl'
+        
+        _logger.info("Master processing baseline LLs...")
+        try:
+            train_ll = cpickle.load(open(train_ll_cache, 'rb'))
+            _logger.info(f"Loaded train LL from cache: {train_ll_cache}")
+        except Exception:
+            _logger.info(f"Cache not found or invalid for train LL. Computing...")
+            train_ll = centerbias.information_gain(train_stim, train_fix, verbose=True, average='image')
+            with open(train_ll_cache, 'wb') as f: cpickle.dump(train_ll, f)
+
+        try:
+            val_ll = cpickle.load(open(val_ll_cache, 'rb'))
+            _logger.info(f"Loaded val LL from cache: {val_ll_cache}")
+        except Exception:
+            _logger.info(f"Cache not found or invalid for val LL. Computing...")
+            val_ll = centerbias.information_gain(val_stim, val_fix, verbose=True, average='image')
+            with open(val_ll_cache, 'wb') as f: cpickle.dump(val_ll, f)
+        _logger.info(f"Final LLs on master: Train={train_ll:.4f}, Val={val_ll:.4f}")
+
+    if is_distributed:
+        # Master sends the data it just computed/loaded.
+        # Workers receive the data. They wait here until the master is done.
+        ll_bcast = [train_ll, val_ll] 
+        dist.broadcast_object_list(ll_bcast, src=0)
+        train_ll, val_ll = ll_bcast
+    
+    # After this point, all processes have the correct values for train_ll and val_ll.
+    if train_ll is None or val_ll is None:
+        _logger.critical(f"Rank {dist.get_rank() if is_distributed else 0} has invalid LL values. Exiting.")
+        sys.exit(1)
+
+    # Re-create the centerbias object for the dataloader on all processes
+    centerbias = BaselineModel(train_stim, train_fix, bandwidth=0.0217, eps=2e-13, caching=False)
+    
+    # ... The rest of the function for creating optimizer, datasets, etc. ...
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones)
     
     ds_kwargs_train = {"transform": FixationMaskTransform(sparse=False), "average": "image", "segmentation_mask_dir": args.salicon_train_mask_dir, "segmentation_mask_format": args.segmentation_mask_format}
@@ -235,13 +257,33 @@ def salicon_pretrain(args, device, is_master, is_distributed, model):
     experiment_name = f"{args.stage}_{args.densenet_model_name}_dino_{args.dino_model_name}_lr{args.lr}"
     output_dir = args.train_dir / experiment_name
     
-    _train(str(output_dir), model, train_loader, train_ll, validation_loader, val_ll, optimizer, lr_scheduler, args.gradient_accumulation_steps, args.min_lr, ['LL', 'IG', 'NSS', 'AUC_CPU'], args.validation_epochs, args.resume_checkpoint, device, is_distributed, is_master, _logger)
+    _train(
+    this_directory=str(output_dir), 
+    model=model, 
+    train_loader=train_loader, 
+    train_baseline_log_likelihood=train_ll, 
+    val_loader=validation_loader, 
+    val_baseline_log_likelihood=val_ll, 
+    optimizer=optimizer, 
+    lr_scheduler=lr_scheduler, 
+    gradient_accumulation_steps=args.gradient_accumulation_steps, 
+    minimum_learning_rate=args.min_lr, 
+    validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'], 
+    validation_epochs=args.validation_epochs, 
+    startwith=args.resume_checkpoint, 
+    device=device, 
+    is_distributed=is_distributed, 
+    is_master=is_master, 
+    logger=_logger
+)
+
 
 def mit_finetune(args, device, is_master, is_distributed, model_cpu):
+    # Apply the same logic to mit_finetune
     fold = args.fold
     if fold is None or not (0 <= fold < 10): _logger.critical("--fold (0-9) required for MIT stages."); sys.exit(1)
     if is_master: _logger.info(f"--- Preparing MIT Stage: {args.stage} (Fold {fold}) ---")
-        
+    
     mit_converted_data_path = args.train_dir / "MIT1003_converted_hybrid_gaze"
     mit_stimuli_cache_file = mit_converted_data_path / "stimuli.pkl"
     mit_stimuli_all, mit_fixations_all = None, None
@@ -264,17 +306,35 @@ def mit_finetune(args, device, is_master, is_distributed, model_cpu):
     val_stim, val_fix = validation_split(mit_stimuli_all, mit_fixations_all, crossval_folds=10, fold_no=fold)
     centerbias = CrossvalidatedBaselineModel(mit_stimuli_all, mit_fixations_all, bandwidth=10**-1.6667673342543432, eps=10**-14.884189168516073, caching=False)
 
+    train_ll_cache = args.train_dir / f'mit_baseline_train_ll_fold{fold}.pkl'
+    val_ll_cache = args.train_dir / f'mit_baseline_val_ll_fold{fold}.pkl'
     train_ll, val_ll = None, None
+
     if is_master:
-        _logger.info(f"Master computing baseline LLs for Fold {fold}...")
-        train_ll = centerbias.information_gain(train_stim, train_fix, verbose=True, average='image')
-        val_ll = centerbias.information_gain(val_stim, val_fix, verbose=True, average='image')
+        _logger.info(f"Master processing baseline LLs for fold {fold}...")
+        try:
+            train_ll = cpickle.load(open(train_ll_cache, 'rb'))
+            _logger.info(f"Loaded train LL from cache: {train_ll_cache}")
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError): # <<< FIX: Corrected exception type
+            _logger.info(f"Cache not found or invalid for train LL (fold {fold}). Computing...")
+            train_ll = centerbias.information_gain(train_stim, train_fix, verbose=True, average='image')
+            with open(train_ll_cache, 'wb') as f: cpickle.dump(train_ll, f)
+        
+        try:
+            val_ll = cpickle.load(open(val_ll_cache, 'rb'))
+            _logger.info(f"Loaded val LL from cache: {val_ll_cache}")
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError): # <<< FIX: Corrected exception type
+            _logger.info(f"Cache not found or invalid for val LL (fold {fold}). Computing...")
+            val_ll = centerbias.information_gain(val_stim, val_fix, verbose=True, average='image')
+            with open(val_ll_cache, 'wb') as f: cpickle.dump(val_ll, f)
+        
+        _logger.info(f"Final LLs on master for fold {fold}: Train={train_ll:.4f}, Val={val_ll:.4f}")
     
-    if is_distributed: dist.barrier()
-    
-    ll_bcast = [train_ll, val_ll]
-    if is_distributed: dist.broadcast_object_list(ll_bcast, src=0)
-    train_ll, val_ll = ll_bcast
+    if is_distributed:
+        ll_bcast = [train_ll, val_ll]
+        dist.broadcast_object_list(ll_bcast, src=0)
+        train_ll, val_ll = ll_bcast
+
     if train_ll is None or val_ll is None: _logger.critical("MIT Baseline LLs invalid."); sys.exit(1)
 
     if args.salicon_checkpoint_path and args.salicon_checkpoint_path.exists():
@@ -287,7 +347,7 @@ def mit_finetune(args, device, is_master, is_distributed, model_cpu):
     if is_distributed: model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
     if args.use_torch_compile: model = torch.compile(model)
 
-    optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr_mit_spatial)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_mit_spatial)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones_mit_spatial)
 
     mit_ds_kwargs = {"transform": FixationMaskTransform(sparse=False), "average": "image", "segmentation_mask_dir": args.mit_all_mask_dir, "segmentation_mask_format": args.segmentation_mask_format}
@@ -302,7 +362,26 @@ def mit_finetune(args, device, is_master, is_distributed, model_cpu):
     experiment_name = f"{args.stage}_fold{fold}_{args.densenet_model_name}_dino_{args.dino_model_name}_k{args.num_total_segments}_lr{args.lr_mit_spatial}"
     output_dir = args.train_dir / experiment_name
     
-    _train(str(output_dir), model, train_loader, train_ll, validation_loader, val_ll, optimizer, lr_scheduler, args.gradient_accumulation_steps, args.min_lr, ['LL', 'IG', 'NSS', 'AUC_CPU'], args.validation_epochs, None, device, is_distributed, is_master, _logger)
+    _train(
+    this_directory=str(output_dir), 
+    model=model, 
+    train_loader=train_loader, 
+    train_baseline_log_likelihood=train_ll, 
+    val_loader=validation_loader, 
+    val_baseline_log_likelihood=val_ll, 
+    optimizer=optimizer, 
+    lr_scheduler=lr_scheduler, 
+    gradient_accumulation_steps=args.gradient_accumulation_steps, 
+    minimum_learning_rate=args.min_lr, 
+    validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'], 
+    validation_epochs=args.validation_epochs, 
+    startwith=args.resume_checkpoint, 
+    device=device, 
+    is_distributed=is_distributed, 
+    is_master=is_master, 
+    logger=_logger
+)
+
 
 def main(args):
     device, rank, world, is_master, is_distributed = init_distributed()
@@ -314,7 +393,8 @@ def main(args):
 
     if is_master:
         _logger.info("================== Effective Configuration ==================")
-        for name, value in sorted(vars(args).items()): _logger.info(f"  {name}: {value}")
+        cleaned_args = {k: v for k, v in vars(args).items() if not (k.startswith('dinov2_') or k == 'config_file')}
+        for name, value in sorted(cleaned_args.items()): _logger.info(f"  {name}: {value}")
         _logger.info(f"  DDP Info: Rank {rank}/{world}, Master: {is_master}, Distributed: {is_distributed}, Device: {device}")
         _logger.info("===========================================================")
 
@@ -322,52 +402,72 @@ def main(args):
         if is_master and p: p.mkdir(parents=True, exist_ok=True)
     if is_distributed: dist.barrier()
 
-    if is_master: _logger.info(f"Initializing {args.densenet_model_name} backbone for main saliency path...")
+    if is_master: _logger.info(f"Initializing {args.densenet_model_name} backbone...")
     densenet_base = RGBDenseNet201()
     densenet_feature_nodes = ['1.features.denseblock4.denselayer32.norm1', '1.features.denseblock4.denselayer32.conv1', '1.features.denseblock4.denselayer31.conv2']
     features_module = FeatureExtractor(densenet_base, densenet_feature_nodes)
-    for param in features_module.parameters(): param.requires_grad = False
-    features_module.to(device).eval()
-
-    if is_master: _logger.info(f"Initializing {args.dino_model_name} backbone for semantic embeddings...")
+    
+    if is_master: _logger.info(f"Initializing {args.dino_model_name} backbone...")
     dino_semantic_backbone = DinoV2Backbone(
-        layers=[args.dino_semantic_layer_idx],
-        model_name=args.dino_model_name,
-        patch_size=args.dino_patch_size,
-        freeze=True
+        layers=[args.dino_semantic_layer_idx], model_name=args.dino_model_name,
+        patch_size=args.dino_patch_size, freeze=True
     )
-    dino_semantic_backbone.to(device).eval()
-
+    
+    features_module.to(device)
+    dino_semantic_backbone.to(device)
     with torch.no_grad():
-        # THE FIX: Move dummy_input to the correct device
         dummy_input = torch.randn(1, 3, 256, 256).to(device)
-        dummy_out_densenet = features_module(dummy_input)
-        main_path_channels = sum(f.shape[1] for f in dummy_out_densenet)
-        dummy_out_dino = dino_semantic_backbone(dummy_input)
-        semantic_path_channels = dummy_out_dino[0].shape[1]
+        main_path_channels = sum(f.shape[1] for f in features_module(dummy_input))
+        semantic_path_channels = dino_semantic_backbone(dummy_input)[0].shape[1]
+    
     if is_master:
         _logger.info(f"Main path (DenseNet) concatenated channels: {main_path_channels}")
         _logger.info(f"Dynamic semantic path (DINO) channels: {semantic_path_channels}")
 
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
     fixsel_net = build_fixation_selection_network(scanpath_features=0)
+    finalizer = Finalizer(sigma=args.finalizer_initial_sigma, learn_sigma=args.finalizer_learn_sigma, saliency_map_factor=4)
     
-    model_cpu = DeepGazeIIIDynamicDinoEmbedding(
-        features_module.cpu(), dino_semantic_backbone.cpu(), saliency_net, fixsel_net, 
-        args.num_total_segments, args.finalizer_learn_sigma, args.finalizer_initial_sigma
+    model_cpu = HybridSpadeSaliencyModel(
+        features_module=features_module.cpu(),
+        dino_features_module=dino_semantic_backbone.cpu(),
+        saliency_network=saliency_net,
+        fixation_selection_network=fixsel_net,
+        finalizer=finalizer,
+        num_total_segments=args.num_total_segments
     )
 
-    if args.stage.startswith('salicon_pretrain'):
+    stage = args.stage
+    if 'salicon_pretrain' in stage or 'salicon_pretraining' in stage:
         model = model_cpu.to(device)
-        if is_distributed: model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
-        if args.use_torch_compile: model = torch.compile(model)
+        if is_distributed:
+            model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
+        if args.use_torch_compile: 
+            if is_master: _logger.info("Enabling torch.compile.")
+            model = torch.compile(model)
         salicon_pretrain(args, device, is_master, is_distributed, model)
-    elif args.stage.startswith('mit_spatial'):
+    elif 'mit_spatial' in stage:
         mit_finetune(args, device, is_master, is_distributed, model_cpu)
     else:
-        _logger.critical(f"Unknown or unsupported stage: {args.stage}"); sys.exit(1)
+        _logger.critical(f"Unknown or unsupported stage: {stage}"); sys.exit(1)
+        
+    if is_master: _logger.info("Main training function finished. Cleaning up...")
     
+    # 1. Explicitly delete large objects that might hold GPU tensors
+    del features_module, dino_semantic_backbone, saliency_net, fixsel_net, finalizer, model_cpu
+    
+    # 2. Synchronize all processes before cleanup
+    if is_distributed:
+        dist.barrier()
+        
+    # 3. Empty the CUDA cache on all devices
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 4. Now, perform the final cleanup
     cleanup_distributed()
+    if is_master: _logger.info("Cleanup complete. Script should now exit.")
+
 
 if __name__ == "__main__":
     _pre = argparse.ArgumentParser(add_help=False)
@@ -377,11 +477,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(parents=[_pre], description="Train Hybrid DenseNet+DINO SPADE model.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('--stage', choices=['salicon_pretrain_hybrid', 'mit_spatial_hybrid'], help='Training stage to execute.')
-    parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
+    parser.add_argument('--log_level', type=str, default='INFO')
     parser.add_argument('--densenet_model_name', default='densenet201', choices=['densenet201'])
     parser.add_argument('--dino_model_name', default='dinov2_vitb14', choices=['dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'])
     parser.add_argument('--dino_patch_size', type=int, default=14)
-    parser.add_argument('--dino_semantic_layer_idx', type=int, default=-1, help="Index of the DINOv2 layer to use for semantic features.")
+    parser.add_argument('--dino_semantic_layer_idx', type=int, default=-1)
     parser.add_argument('--num_total_segments', type=int, default=16)
     parser.add_argument('--segmentation_mask_format', default='png', choices=['png', 'npy'])
     parser.add_argument('--salicon_train_mask_dir', type=str)
@@ -393,7 +493,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr_milestones', type=int, nargs='+', default=[20, 40, 55])
     parser.add_argument('--min_lr', type=float, default=1e-6)
     parser.add_argument('--validation_epochs', type=int, default=1)
-    parser.add_argument('--use_torch_compile', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--use_torch_compile', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--finalizer_initial_sigma', type=float, default=8.0)
     parser.add_argument('--finalizer_learn_sigma', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--num_workers', type=str, default='auto')
@@ -410,7 +510,9 @@ if __name__ == "__main__":
         try:
             with open(_cfg_ns.config_file, 'r') as f: yaml_cfg = yaml.safe_load(f) or {}
             parser.set_defaults(**yaml_cfg)
-        except Exception as e: _logger.error(f"Could not read/parse YAML: {e}")
+        except Exception as e:
+            logging.basicConfig()
+            logging.getLogger().error(f"Could not read/parse YAML: {e}")
 
     final_args_ns = parser.parse_args(_rem_args)
     
