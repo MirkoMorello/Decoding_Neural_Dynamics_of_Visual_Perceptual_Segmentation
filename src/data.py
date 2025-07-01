@@ -52,6 +52,23 @@ def x_y_to_sparse_indices(xs, ys):
     return np.array([y_inds, x_inds]), values
 
 
+def decode_and_prepare_image(path_or_bytes: str | Path | bytes) -> np.ndarray:
+    """
+    Carica un'immagine, la converte in RGB e la restituisce come array uint8 [0, 255]
+    nel formato (C, H, W).
+
+    Returns:
+        np.ndarray: L'immagine come array NumPy (C, H, W) di tipo uint8.
+    """
+    if isinstance(path_or_bytes, (str, Path)):
+        img_pil = Image.open(path_or_bytes)
+    else:
+        img_pil = Image.open(io.BytesIO(path_or_bytes))
+
+    img_pil = img_pil.convert("RGB")
+    img_arr_uint8 = np.array(img_pil)
+    return img_arr_uint8.transpose(2, 0, 1)
+
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -165,8 +182,6 @@ class ImageDataset(torch.utils.data.Dataset):
             self._xs_cache, self._ys_cache = None, None
             logger.info("ImageDataset: Fixation coordinate RAM caching DISABLED.")
 
-    # ... (rest of ImageDataset: get_shapes, _get_stimulus_as_array, _get_image_data, __getitem__, __len__) ...
-    # (These methods from your previous full data.py are fine)
     def get_shapes(self):
         return list(self.stimuli.sizes) # [(H, W), ...] or [(H, W, C), ...]
 
@@ -184,21 +199,20 @@ class ImageDataset(torch.utils.data.Dataset):
 
 
     def _get_image_data(self, n_idx: int) -> tuple[np.ndarray, np.ndarray | None]:
-        if self.lmdb_env:
-            return _get_image_data_from_lmdb(self.lmdb_env, n_idx) # Returns (image_chw_f32, cb_hw_f32)
-        else:
-            image_arr_orig_channels = self._get_stimulus_as_array(n_idx)
-            centerbias_prediction = None
-            if self.centerbias_model:
-                centerbias_prediction = self.centerbias_model.log_density(image_arr_orig_channels)
-            else: # Create a dummy zero centerbias if model is None
-                h, w = image_arr_orig_channels.shape[:2]
-                centerbias_prediction = np.zeros((h,w), dtype=np.float32)
+            if self.lmdb_env:
+                return _get_image_data_from_lmdb(self.lmdb_env, n_idx)
+            else:
+                stimulus_path = self.stimuli.filenames[n_idx]
+                image_chw_uint8 = decode_and_prepare_image(stimulus_path)
+                centerbias_prediction = None
+                if self.centerbias_model:
+                    image_for_cb = np.array(Image.open(stimulus_path).convert('RGB'))
+                    centerbias_prediction = self.centerbias_model.log_density(image_for_cb)
+                else: 
+                    h, w = image_chw_uint8.shape[1:]
+                    centerbias_prediction = np.zeros((h, w), dtype=np.float32)
 
-
-            image_rgb = ensure_color_image(image_arr_orig_channels).astype(np.float32)
-            image_chw = image_rgb.transpose(2, 0, 1) # HWC to CHW
-            return image_chw, centerbias_prediction
+                return image_chw_uint8, centerbias_prediction.astype(np.float32)
 
     def __getitem__(self, key: int):
         if not self.cached or key not in self._cache:
@@ -243,18 +257,16 @@ class ImageDataset(torch.utils.data.Dataset):
 
 class ImageDatasetWithSegmentation(ImageDataset):
     def __init__(self, *args, # Args for parent ImageDataset (stimuli, fixations, etc.)
-                 segmentation_mask_dir: str | Path | None = None, # DIRECT path to folder of mask files FOR THIS DATASET
+                 segmentation_mask_dir: str | Path | None = None,
                  segmentation_mask_format: str = "png",
-                 segmentation_mask_fixed_memmap_file: str | Path | None = None, # Bank specific to this dataset
-                 segmentation_mask_variable_payload_file: str | Path | None = None, # Bank specific to this dataset
-                 segmentation_mask_variable_header_file: str | Path | None = None, # Bank specific to this dataset
+                 segmentation_mask_fixed_memmap_file: str | Path | None = None,
+                 segmentation_mask_variable_payload_file: str | Path | None = None,
+                 segmentation_mask_variable_header_file: str | Path | None = None,
                  segmentation_mask_bank_dtype: str = "uint8",
                  **kwargs): # Kwargs for parent ImageDataset
 
         super().__init__(*args, **kwargs) # Call parent init
 
-        # This is the DIRECT path to the folder containing mask image files for THIS specific dataset.
-        # (e.g., "./masks/salicon/train_masks/" or "./masks/mit1003/all_masks/")
         self.individual_mask_files_dir = Path(segmentation_mask_dir).resolve() if segmentation_mask_dir else None
         
         self.segmentation_mask_format = segmentation_mask_format.lower()
@@ -358,14 +370,8 @@ class ImageDatasetWithSegmentation(ImageDataset):
 
             if self.mask_loading_strategy == "individual_files":
                 try:
-                    # --- THIS IS THE FINAL FIX ---
-                    # Since self.stimuli is a pysaliency.FileStimuli object, it has a
-                    # .filenames attribute, which is a list of the full paths to the cached images.
                     cached_image_filename = self.stimuli.filenames[key]
-                    # We get the base name without the extension (e.g., 'i12345').
                     stimulus_id_str = Path(cached_image_filename).stem
-                    # -----------------------------
-
                     mask_fname = f"{stimulus_id_str}.{self.segmentation_mask_format}"
                     mask_path_full = self.individual_mask_files_dir / mask_fname
 
@@ -387,7 +393,6 @@ class ImageDatasetWithSegmentation(ImageDataset):
                 except Exception as e:
                     logger.error(f"General error loading mask for key {key}: {e}. Using dummy mask.")
 
-            # ... (bank loading logic remains the same) ...
             elif self.mask_loading_strategy in ["fixed_bank", "variable_bank"]:
                 try:
                     # This part is fine, as it uses the integer key
@@ -479,16 +484,22 @@ class FixationDataset(torch.utils.data.Dataset):
 
         return self._shapes
 
-    def _get_image_data(self, n):
-        if self.lmdb_path:
-            return _get_image_data_from_lmdb(self.lmdb_env, n)
-        image = np.array(self.stimuli.stimuli[n])
-        centerbias_prediction = self.centerbias_model.log_density(image)
+    def _get_image_data(self, n_idx: int) -> tuple[np.ndarray, np.ndarray | None]:
+        if self.lmdb_env:
+            return _get_image_data_from_lmdb(self.lmdb_env, n_idx)
+        else:
 
-        image = ensure_color_image(image).astype(np.float32)
-        image = image.transpose(2, 0, 1)
+            stimulus_path = self.stimuli.filenames[n_idx]
+            image_chw_f32 = decode_and_prepare_image(stimulus_path)
+            centerbias_prediction = None
+            if self.centerbias_model:
+                image_for_cb = np.array(Image.open(stimulus_path).convert('RGB'))
+                centerbias_prediction = self.centerbias_model.log_density(image_for_cb)
+            else:
+                h, w = image_chw_f32.shape[1:]
+                centerbias_prediction = np.zeros((h, w), dtype=np.float32)
 
-        return image, centerbias_prediction
+            return image_chw_f32, centerbias_prediction.astype(np.float32)
 
     def __getitem__(self, key):
         n = self.fixations.n[key]
@@ -786,27 +797,32 @@ def _export_dataset_to_lmdb(stimuli: pysaliency.FileStimuli, centerbias_model: p
 
 
 def _encode_filestimulus_item(filename, centerbias):
-    with open(filename, 'rb') as f:
-        image_bytes = f.read()
+    """Codifica l'immagine PRE-ELABORATA e il centerbias."""
+    # Usa la nostra nuova funzione canonica per ottenere l'array corretto
+    image_chw_f32 = decode_and_prepare_image(filename)
 
-    buffer = io.BytesIO()
-    pickle.dump({'image': image_bytes, 'centerbias': centerbias}, buffer)
-    buffer.seek(0)
-    return buffer.read()
+    # Serializza l'array NumPy e il centerbias
+    # Pickle è semplice e funziona bene qui.
+    payload = pickle.dumps({
+        'image': image_chw_f32,
+        'centerbias': centerbias.astype(np.float32) # Assicura che anche il CB sia float32
+    })
+    return payload
 
 
 def _get_image_data_from_lmdb(lmdb_env, n):
+    """Legge l'immagine e il centerbias PRE-ELABORATI da LMDB."""
     key = '{}'.format(n).encode('ascii')
     with lmdb_env.begin(write=False) as txn:
         byteflow = txn.get(key)
+    
     data = pickle.loads(byteflow)
-    buffer = io.BytesIO(data['image'])
-    buffer.seek(0)
-    image = np.array(Image.open(buffer).convert('RGB'))
-    centerbias_prediction = data['centerbias']
-    image = image.transpose(2, 0, 1)
-
-    return image, centerbias_prediction
+    
+    # Non c'è più bisogno di decodificare o convertire, è già pronto
+    image_chw_f32 = data['image']
+    centerbias_hw_f32 = data['centerbias']
+    
+    return image_chw_f32, centerbias_hw_f32
 
 
 
