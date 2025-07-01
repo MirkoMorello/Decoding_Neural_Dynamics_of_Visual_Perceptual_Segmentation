@@ -245,15 +245,37 @@ def salicon_pretrain(args, device, is_master, is_distributed, model):
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones)
     
-    ds_kwargs_train = {"transform": FixationMaskTransform(sparse=False), "average": "image", "segmentation_mask_dir": args.salicon_train_mask_dir, "segmentation_mask_format": args.segmentation_mask_format}
-    ds_kwargs_val = {"transform": FixationMaskTransform(sparse=False), "average": "image", "segmentation_mask_dir": args.salicon_val_mask_dir, "segmentation_mask_format": args.segmentation_mask_format}
-    train_dataset = ImageDatasetWithSegmentation(train_stim, train_fix, centerbias, **ds_kwargs_train)
-    val_dataset = ImageDatasetWithSegmentation(val_stim, val_fix, centerbias, **ds_kwargs_val)
-    train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True, persistent_workers=args.num_workers > 0)
-    val_sampler = (torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None)
-    validation_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, sampler=val_sampler, persistent_workers=args.num_workers > 0)
+    lmdb_path_train = args.train_dir / f'salicon_train_imgs_{args.dino_model_name}' if args.use_lmdb_images else None
+    lmdb_path_val = args.train_dir / f'salicon_val_imgs_{args.dino_model_name}' if args.use_lmdb_images else None
+
+    train_dataset = ImageDatasetWithSegmentation(
+        train_stim, train_fix, centerbias,
+        lmdb_path=lmdb_path_train, # <--- PASS THE ARGUMENT
+        segmentation_mask_dir=args.salicon_train_mask_dir,
+        transform=FixationMaskTransform(sparse=False),
+        segmentation_mask_format='png',
+        average="image"
+    )
+    val_dataset = ImageDatasetWithSegmentation(
+        val_stim, val_fix, centerbias,
+        lmdb_path=lmdb_path_val, # <--- PASS THE ARGUMENT
+        segmentation_mask_dir=args.salicon_val_mask_dir,
+        transform=FixationMaskTransform(sparse=False),
+        segmentation_mask_format='png',
+        average="image"
+    )
     
+    train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        sampler=train_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True
+    )
+    val_sampler = torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None
+    validation_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        sampler=val_sampler, num_workers=args.num_workers, pin_memory=True
+    )
+        
     experiment_name = f"{args.stage}_{args.densenet_model_name}_dino_{args.dino_model_name}_lr{args.lr}"
     output_dir = args.train_dir / experiment_name
     
@@ -350,15 +372,36 @@ def mit_finetune(args, device, is_master, is_distributed, model_cpu):
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_mit_spatial)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_milestones_mit_spatial)
 
-    mit_ds_kwargs = {"transform": FixationMaskTransform(sparse=False), "average": "image", "segmentation_mask_dir": args.mit_all_mask_dir, "segmentation_mask_format": args.segmentation_mask_format}
-    train_dataset = ImageDatasetWithSegmentation(train_stim, train_fix, centerbias, **mit_ds_kwargs)
-    val_dataset = ImageDatasetWithSegmentation(val_stim, val_fix, centerbias, **mit_ds_kwargs)
+    lmdb_path_train = args.train_dir / f'MIT1003_train_imgs_fold{fold}_{args.dino_model_name}' if args.use_lmdb_images else None
+    lmdb_path_val = args.train_dir / f'MIT1003_val_imgs_fold{fold}_{args.dino_model_name}' if args.use_lmdb_images else None
     
-    train_sampler = (torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers, pin_memory=True, sampler=train_sampler, drop_last=True, persistent_workers=args.num_workers > 0)
-    val_sampler = (torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None)
-    validation_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, sampler=val_sampler, persistent_workers=args.num_workers > 0)
-
+    train_dataset = ImageDatasetWithSegmentation(
+        train_stim, train_fix, centerbias,
+        lmdb_path=lmdb_path_train, # <--- PASS THE ARGUMENT
+        segmentation_mask_dir=args.mit_all_mask_dir,
+        transform=FixationMaskTransform(sparse=False),
+        segmentation_mask_format='png',
+        average="image"
+    )
+    val_dataset = ImageDatasetWithSegmentation(
+        val_stim, val_fix, centerbias,
+        lmdb_path=lmdb_path_val, # <--- PASS THE ARGUMENT
+        segmentation_mask_dir=args.mit_all_mask_dir,
+        transform=FixationMaskTransform(sparse=False),
+        segmentation_mask_format='png',
+        average="image"
+    )
+    
+    train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        sampler=train_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True
+    )
+    val_sampler = torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None
+    validation_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        sampler=val_sampler, num_workers=args.num_workers, pin_memory=True
+    )
     experiment_name = f"{args.stage}_fold{fold}_{args.densenet_model_name}_dino_{args.dino_model_name}_k{args.num_total_segments}_lr{args.lr_mit_spatial}"
     output_dir = args.train_dir / experiment_name
     
@@ -505,6 +548,7 @@ if __name__ == "__main__":
     parser.add_argument('--salicon_checkpoint_path', type=str)
     parser.add_argument('--lr_mit_spatial', type=float, default=1e-4)
     parser.add_argument('--lr_milestones_mit_spatial', type=int, nargs='+', default=[10, 20])
+    parser.add_argument('--use_lmdb_images', action=argparse.BooleanOptionalAction, default=True)
 
     if _cfg_ns.config_file:
         try:
