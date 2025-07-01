@@ -714,18 +714,18 @@ def _train(this_directory, model,
            gradient_accumulation_steps,
            minimum_learning_rate,
            validation_metric='IG',
-           validation_metrics=None, # Allow None, default inside
+           validation_metrics=None,
            validation_epochs=1,
-           startwith=None, # Path to a specific checkpoint to start/resume from
+           startwith=None,
            device=None,
            is_distributed=False, is_master=True,
-           logger=None): # Pass logger instance
+           logger=None,
+           train_sampler=None): # <-- UNICA MODIFICA ALLA FIRMA
     """ Main training loop. Now uses logger passed from the main script. """
 
-    if logger is None: # Fallback if not passed, though it should be
+    if logger is None:
         logger = logging.getLogger("train_loop")
         logger.setLevel(logging.INFO if is_master else logging.WARNING)
-        # Add a basic handler if no handlers are configured for this logger
         if not logger.hasHandlers():
             handler = logging.StreamHandler(sys.stdout)
             formatter = logging.Formatter(f"%(asctime)s Rank{dist.get_rank() if is_distributed and dist.is_initialized() else 0} %(levelname)s %(name)s: %(message)s")
@@ -733,14 +733,13 @@ def _train(this_directory, model,
             logger.addHandler(handler)
 
     if validation_metrics is None:
-        validation_metrics = ['IG', 'LL', 'AUC_CPU', 'NSS'] # Default from your script
+        validation_metrics = ['IG', 'LL', 'AUC_CPU', 'NSS']
 
     output_dir_path = Path(this_directory)
     if is_master:
         logger.info(f"Output directory for this run: {output_dir_path}")
-        output_dir_path.mkdir(parents=True, exist_ok=True) # Master creates dir
+        output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Check if already finished
     final_checkpoint_path = output_dir_path / 'final.pth'
     finished_training_flag_val = 0
     if is_master and final_checkpoint_path.exists():
@@ -749,39 +748,33 @@ def _train(this_directory, model,
     
     finished_flag_tensor = torch.tensor([finished_training_flag_val], device=device, dtype=torch.int)
     if is_distributed:
-        dist.broadcast(finished_flag_tensor, src=0) # Master informs others
+        dist.broadcast(finished_flag_tensor, src=0)
     
     if finished_flag_tensor.item() == 1:
         current_rank_str = f"Rank {dist.get_rank()}" if is_distributed and dist.is_initialized() else "SingleOp"
         logger.info(f"{current_rank_str} exiting: Training already marked as finished in {this_directory}.")
         return
 
-    if device is None: # Should be set by main script
+    if device is None:
         logger.error("Device not specified to _train function. This is required.")
         raise ValueError("Device must be specified for _train.")
     
     current_rank_str = f"Rank {dist.get_rank()}" if is_distributed and dist.is_initialized() else "SingleOp"
     logger.info(f"{current_rank_str} using device: {device}")
 
-    # GradScaler for Automatic Mixed Precision (AMP)
-    # Enabled only for CUDA devices.
     scaler = amp.GradScaler(enabled=(device.type == 'cuda'))
     if is_master and device.type == 'cuda': logger.info("AMP GradScaler initialized for CUDA.")
     elif is_master: logger.info("AMP GradScaler disabled (not using CUDA or not master).")
 
-
-    # --- State for tracking progress ---
-    val_metrics_history = defaultdict(list) # Stores lists of metric values over epochs
-    # Columns for the progress log CSV
+    val_metrics_history = defaultdict(list)
     progress_log_columns = ['epoch', 'timestamp', 'learning_rate', 'train_loss'] + \
                            [f'validation_{m}' for m in validation_metrics]
     progress_df = pd.DataFrame(columns=progress_log_columns)
     
-    current_epoch_step = 0 # Tracks the epoch number
-    last_avg_train_loss_epoch = np.nan # Avg loss of the last completed training epoch
-    scheduler_state_restored = False # Flag if LR scheduler state was loaded
+    current_epoch_step = 0
+    last_avg_train_loss_epoch = np.nan
+    scheduler_state_restored = False
 
-    # TensorBoard Writer (master only)
     tb_writer = None
     if is_master:
         tb_log_dir = output_dir_path / 'tensorboard_logs'
@@ -792,14 +785,11 @@ def _train(this_directory, model,
         except Exception as e:
             logger.error(f"Failed to create TensorBoard SummaryWriter at {tb_log_dir}: {e}. TB logging disabled.", exc_info=True)
 
-    # --- Checkpoint Restoration ---
     checkpoint_path_to_attempt_restore = None
-    if startwith and Path(startwith).exists(): # If a specific checkpoint is provided
+    if startwith and Path(startwith).exists():
         checkpoint_path_to_attempt_restore = startwith
         if is_master: logger.info(f"Attempting to restore from specified checkpoint: {startwith}")
-    else: # Try to find the latest 'step-*.pth' in the experiment directory
-        # This glob pattern needs to be correct for your checkpoint naming
-        # e.g., if checkpoints are step-0001.pth, step-0002.pth etc.
+    else:
         intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
         if intermediate_checkpoints:
             checkpoint_path_to_attempt_restore = intermediate_checkpoints[-1]
@@ -813,51 +803,42 @@ def _train(this_directory, model,
         if is_master: logger.info(
             f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
             f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}")
-    elif startwith: # Specified checkpoint not found
+    elif startwith:
         logger.warning(f"'startwith' checkpoint {startwith} not found. Starting fresh.")
-    else: # No checkpoint found at all
+    else:
         if is_master: logger.info("No checkpoint found in output directory. Starting training from scratch (epoch 0).")
 
-    # Load progress from log.csv if it exists
     log_csv_path = output_dir_path / 'progress_log.csv'
     if is_master and log_csv_path.exists():
         try:
-            # Load, ensuring 'epoch' is the index or a column
             loaded_progress_df = pd.read_csv(log_csv_path)
             if 'epoch' in loaded_progress_df.columns:
-                 loaded_progress_df.set_index('epoch', inplace=True, drop=False) # Keep epoch as col
+                 loaded_progress_df.set_index('epoch', inplace=True, drop=False)
             elif loaded_progress_df.index.name == 'epoch':
-                 loaded_progress_df['epoch'] = loaded_progress_df.index # Ensure epoch is a column
+                 loaded_progress_df['epoch'] = loaded_progress_df.index
             
-            # Filter to include only epochs up to the restored current_epoch_step
             if current_epoch_step > 0 :
                 progress_df = loaded_progress_df[loaded_progress_df['epoch'] <= current_epoch_step].copy()
-            else: # if current_epoch_step is 0 (fresh start or error in restore)
-                progress_df = pd.DataFrame(columns=progress_log_columns) # Start fresh DF
+            else:
+                progress_df = pd.DataFrame(columns=progress_log_columns)
 
-            # Repopulate val_metrics_history from loaded progress_df
             for metric_key in validation_metrics:
                 col_name = f'validation_{metric_key}'
                 if col_name in progress_df.columns:
-                    # Convert to numeric, coerce errors to NaN, then drop NaNs before list conversion
                     metric_values = pd.to_numeric(progress_df[col_name], errors='coerce').dropna().tolist()
-                    if metric_values: # Only if list is not empty
+                    if metric_values:
                         val_metrics_history[metric_key] = metric_values
             logger.info(f"Loaded training progress from {log_csv_path} up to epoch {current_epoch_step}.")
         except Exception as e:
             logger.warning(f"Could not load or parse {log_csv_path}: {e}. Starting progress log fresh.", exc_info=True)
-            progress_df = pd.DataFrame(columns=progress_log_columns) # Reset on error
-            val_metrics_history = defaultdict(list) # Reset on error
+            progress_df = pd.DataFrame(columns=progress_log_columns)
+            val_metrics_history = defaultdict(list)
 
-    # --- Inner function for saving state and logging metrics for an epoch ---
     def _run_val_and_log_epoch_state(epoch_num_completed, avg_train_loss_this_epoch):
-        nonlocal progress_df, val_metrics_history # Allow modification of outer scope vars
+        nonlocal progress_df, val_metrics_history
 
-        # --- Validation ---
-        current_val_metrics = {} # Metrics for this specific validation run
-        # Run validation only on master or if validation_epochs criteria met
-        # DDP eval_epoch handles aggregation, so all ranks call it, but only master logs verbosely
-        should_run_validation = (epoch_num_completed % validation_epochs == 0) or (epoch_num_completed == 0 and not val_metrics_history) # Also run on epoch 0 if no history
+        current_val_metrics = {}
+        should_run_validation = (epoch_num_completed % validation_epochs == 0) or (epoch_num_completed == 0 and not val_metrics_history)
 
         if should_run_validation:
             if is_master: logger.info(f"--- Running Validation for Epoch {epoch_num_completed} ---")
@@ -870,24 +851,19 @@ def _train(this_directory, model,
                 log_str = f"Validation Epoch {epoch_num_completed} Results: "
                 for k_metric, v_metric in current_val_metrics.items(): log_str += f"{k_metric}: {v_metric:.4f} | "
                 logger.info(log_str.strip(" | "))
-                # Append to history for finding best later (only if not NaN)
                 for k_metric, v_metric in current_val_metrics.items():
                     if not np.isnan(v_metric): val_metrics_history[k_metric].append(v_metric)
-        else: # Not a validation epoch, fill with NaNs for logging
+        else:
             if is_master: logger.info(f"Skipping validation for epoch {epoch_num_completed} (validation_epochs={validation_epochs}).")
             for m_key in validation_metrics: current_val_metrics[m_key] = np.nan
 
-        # --- Logging and Checkpointing (Master Only) ---
         if is_master:
-            # TensorBoard Logging
             if tb_writer:
                 try:
                     if not np.isnan(avg_train_loss_this_epoch): tb_writer.add_scalar('Loss/Train_Epoch_Avg', avg_train_loss_this_epoch, epoch_num_completed)
                     current_lr_tb = optimizer.param_groups[0]['lr']
                     tb_writer.add_scalar('Meta/Learning_Rate', current_lr_tb, epoch_num_completed)
                     
-                    # Log model-specific parameters like sigma, center_bias_weight
-                    # This requires model to be the unwrapped one for DDP
                     unwrapped_model_tb = model.module if is_distributed else model
                     if hasattr(unwrapped_model_tb, 'finalizer') and unwrapped_model_tb.finalizer is not None:
                         finalizer_tb = unwrapped_model_tb.finalizer
@@ -895,19 +871,12 @@ def _train(this_directory, model,
                             tb_writer.add_scalar('Params/Finalizer_Sigma', finalizer_tb.gauss.sigma.item(), epoch_num_completed)
                         if hasattr(finalizer_tb, 'center_bias_weight'):
                             tb_writer.add_scalar('Params/Finalizer_CenterBiasWeight', finalizer_tb.center_bias_weight.item(), epoch_num_completed)
-                    
-                    # Log SPADE MLP parameters (e.g., norm of weights/biases) - more advanced
-                    # Example: if hasattr(unwrapped_model_tb, 'saliency_network'):
-                    #   if hasattr(unwrapped_model_tb.saliency_network, 'spade_ln0'):
-                    #     tb_writer.add_scalar('Params/SPADE_LN0_gamma_mlp_bias_norm', unwrapped_model_tb.saliency_network.spade_ln0.mlp_gamma.bias.norm().item(), epoch_num_completed)
-
 
                     for k_metric, v_metric in current_val_metrics.items():
                         if not np.isnan(v_metric): tb_writer.add_scalar(f'Validation/{k_metric}', v_metric, epoch_num_completed)
                 except Exception as e_tb:
                     logger.error(f"Error writing to TensorBoard for epoch {epoch_num_completed}: {e_tb}", exc_info=True)
 
-            # Pandas DataFrame Log
             new_log_row_dict = {'epoch': epoch_num_completed,
                                 'timestamp': datetime.utcnow().isoformat(),
                                 'learning_rate': optimizer.param_groups[0]['lr'],
@@ -915,9 +884,7 @@ def _train(this_directory, model,
             for k_metric, v_metric in current_val_metrics.items():
                 new_log_row_dict[f'validation_{k_metric}'] = v_metric
             
-            # Append or update row in DataFrame
-            # Avoid duplicate epoch entries if resuming and re-evaluating
-            progress_df = progress_df[progress_df['epoch'] != epoch_num_completed] # Remove old entry if exists
+            progress_df = progress_df[progress_df['epoch'] != epoch_num_completed]
             new_row_df_entry = pd.DataFrame([new_log_row_dict])
             progress_df = pd.concat([progress_df, new_row_df_entry], ignore_index=True).sort_values(by='epoch')
             
@@ -930,18 +897,14 @@ def _train(this_directory, model,
 
             logger.info(f"Epoch {epoch_num_completed} Summary (master):\n{progress_df[progress_df['epoch'] == epoch_num_completed].to_string()}")
 
-            # --- Checkpoint Saving ---
-            # Save checkpoint for the current epoch
             current_epoch_ckpt_path = output_dir_path / f'step-{epoch_num_completed:04d}.pth'
             save_training_state(model, optimizer, lr_scheduler, scaler,
                                 epoch_num_completed, avg_train_loss_this_epoch,
                                 str(current_epoch_ckpt_path), is_distributed, is_master, logger)
 
-            # Determine best validation epoch so far
             best_val_epoch_num = -1
-            if validation_metric_col_name := f'validation_{validation_metric}': # Python 3.8+
+            if validation_metric_col_name := f'validation_{validation_metric}':
                 if validation_metric_col_name in progress_df.columns and not progress_df[validation_metric_col_name].dropna().empty:
-                    # Decide if higher is better (common for IG, NSS, AUC) or lower (LL)
                     higher_is_better = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU', 'AUC_GPU']
                     valid_scores_series = pd.to_numeric(progress_df[validation_metric_col_name], errors='coerce').dropna()
                     
@@ -951,13 +914,11 @@ def _train(this_directory, model,
                         else:
                             best_score_so_far = valid_scores_series.min()
                         
-                        # Get epoch corresponding to the first occurrence of the best score
                         best_epoch_candidates = progress_df.loc[pd.to_numeric(progress_df[validation_metric_col_name], errors='coerce') == best_score_so_far, 'epoch']
                         if not best_epoch_candidates.empty:
                             best_val_epoch_num = int(best_epoch_candidates.iloc[0])
                             logger.info(f"Best validation score ({validation_metric}: {best_score_so_far:.4f}) so far was at epoch {best_val_epoch_num}.")
             
-            # Clean up old checkpoints, keeping current and best validation one
             all_intermediate_ckpts = sorted(output_dir_path.glob('step-*.pth'))
             for ckpt_p in all_intermediate_ckpts:
                 try:
@@ -967,20 +928,12 @@ def _train(this_directory, model,
                         logger.debug(f"Removed old intermediate checkpoint: {ckpt_p}")
                 except (ValueError, IndexError, OSError) as e_rm:
                     logger.warning(f"Could not parse or remove old checkpoint {ckpt_p}: {e_rm}")
-        # --- End Master Only Block ---
-        
-        # All ranks need to have the same val_metrics_history if it's used for LR scheduler decisions based on val performance
-        # However, typically lr_scheduler.step() is called without direct val metric input (e.g. MultiStepLR)
-        # If using ReduceLROnPlateau, then val metric needs to be synced. For now, assume not.
 
-    # --- Initial Evaluation if Resuming or Starting Fresh ---
-    # If current_epoch_step is 0 (fresh start) or if the loaded progress_df doesn't have this epoch.
     needs_initial_evaluation_flag = False
     if is_master:
-        # Run initial validation if epoch 0 or if this epoch's data isn't in the loaded log
         if current_epoch_step == 0 or \
            (not progress_df.empty and current_epoch_step not in progress_df['epoch'].values) or \
-           (progress_df.empty and current_epoch_step > 0) : # Resumed but log was empty/corrupt
+           (progress_df.empty and current_epoch_step > 0) :
             logger.info(f"Running initial evaluation/log for (restored) epoch {current_epoch_step}.")
             needs_initial_evaluation_flag = True
             
@@ -990,41 +943,26 @@ def _train(this_directory, model,
         needs_initial_evaluation_flag = bool(initial_eval_tensor.item())
 
     if needs_initial_evaluation_flag:
-        # last_avg_train_loss_epoch would be from checkpoint, or NaN if fresh start
         _run_val_and_log_epoch_state(current_epoch_step, last_avg_train_loss_epoch)
 
 
-    # Adjust LR scheduler if state was restored and it's not a fresh start
     if current_epoch_step > 0 and scheduler_state_restored:
-        # If MultiStepLR, loading state_dict correctly sets its last_epoch.
-        # No explicit step needed here; it will step correctly after the *next* completed epoch.
         if is_master: logger.info(f"LR scheduler state was restored. Current LR: {optimizer.param_groups[0]['lr']:.2e}")
     elif current_epoch_step > 0 and not scheduler_state_restored:
-        # If resumed but scheduler wasn't restored, "fast-forward" the scheduler
-        # This is tricky and depends on scheduler type. For MultiStepLR, could call step() multiple times.
-        # Simpler: warn and let it run from its fresh state.
         if is_master: logger.warning(f"Resumed from epoch {current_epoch_step} but scheduler state NOT restored. Scheduler starts fresh.")
 
-
-    # --- Main Training Loop ---
     if is_master: logger.info(f"--- Starting Training Loop from Epoch {current_epoch_step + 1} ---")
     
-    # Loop continues as long as LR is above minimum
-    # current_epoch_step is the number of *completed* epochs. So loop starts with next one.
     epoch_to_run = current_epoch_step + 1
 
     while optimizer.param_groups[0]['lr'] >= minimum_learning_rate:
         if is_master: logger.info(f"--- Beginning Epoch {epoch_to_run} (LR: {optimizer.param_groups[0]['lr']:.2e}) ---")
         
-        # Set epoch for DistributedSampler (important for shuffling)
-        if is_distributed and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch_to_run)
-            if hasattr(val_loader, 'sampler') and hasattr(val_loader.sampler, 'set_epoch'):
-                val_loader.sampler.set_epoch(epoch_to_run) # Also for validation sampler if used
+        if is_distributed and train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch_to_run)
 
         epoch_start_time_actual = datetime.now()
         
-        # Train one epoch
         avg_train_loss_this_epoch = train_epoch(
             model, train_loader, optimizer, device, scaler,
             gradient_accumulation_steps, is_distributed, is_master, logger
@@ -1037,30 +975,20 @@ def _train(this_directory, model,
             else:
                 logger.info(f"Epoch {epoch_to_run} training finished. Avg Train Loss (Rank 0): {avg_train_loss_this_epoch:.5f}. Duration: {epoch_duration_actual}")
 
-        # Save state, run validation, log metrics for the completed epoch
         _run_val_and_log_epoch_state(epoch_to_run, avg_train_loss_this_epoch)
         
-        # Step the LR scheduler *after* completing an epoch and logging its state
-        # Only step if the epoch was successfully processed (e.g., loss wasn't NaN causing early exit for this iter)
-        if not np.isnan(avg_train_loss_this_epoch): # Or some other flag indicating successful epoch
+        if not np.isnan(avg_train_loss_this_epoch):
             try:
-                # For schedulers like ReduceLROnPlateau, you'd pass a validation metric here.
-                # e.g., if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                #     val_metric_for_scheduler = current_val_metrics.get(validation_metric, float('inf')) # or -float('inf')
-                #     lr_scheduler.step(val_metric_for_scheduler)
-                # else: # For MultiStepLR, CosineAnnealingLR, etc.
                 lr_scheduler.step()
             except Exception as e_lr_step:
                 logger.error(f"Error stepping LR scheduler at end of epoch {epoch_to_run}: {e_lr_step}", exc_info=True)
         else:
             if is_master: logger.warning(f"Skipping LR scheduler step for epoch {epoch_to_run} due to invalid training loss.")
 
-        epoch_to_run += 1 # Increment for the next iteration
-    # --- End Training Loop ---
+        epoch_to_run += 1
 
     if is_master:
         logger.info("Training loop finished (LR below minimum or other condition).")
-        # Final save of the model (usually the one from the last step, not necessarily best val)
         final_model_path = output_dir_path / 'final_model_at_lr_cutoff.pth'
         try:
             model_to_save_final = model.module if is_distributed else model
@@ -1069,9 +997,6 @@ def _train(this_directory, model,
         except Exception as e_final_save:
             logger.error(f"Failed to save final model state_dict: {e_final_save}", exc_info=True)
 
-        # Find and copy/link the best validation checkpoint as 'final_best_val.pth'
-        # This logic is already inside _run_val_and_log_epoch_state for cleaning up,
-        # but we can re-run it here to ensure the best one is explicitly saved/copied.
         best_val_epoch_num_final = -1
         best_val_score_final = np.nan
         validation_metric_col_name_final = f'validation_{validation_metric}'
@@ -1083,19 +1008,18 @@ def _train(this_directory, model,
                 best_epoch_candidates_final = progress_df.loc[pd.to_numeric(progress_df[validation_metric_col_name_final], errors='coerce') == best_score_final, 'epoch']
                 if not best_epoch_candidates_final.empty:
                     best_val_epoch_num_final = int(best_epoch_candidates_final.iloc[0])
-                    best_val_score_final = best_score_final # Store the actual score
+                    best_val_score_final = best_score_final
 
         if best_val_epoch_num_final > 0:
             best_epoch_ckpt_path_final = output_dir_path / f'step-{best_val_epoch_num_final:04d}.pth'
             if best_epoch_ckpt_path_final.exists():
                 final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
                 try:
-                    # Load the model state_dict from the best checkpoint
-                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu', weights_only=False) # Load to CPU
+                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu', weights_only=False)
                     if 'model' in best_ckpt_data:
                         torch.save(best_ckpt_data['model'], str(final_best_val_model_path))
                         logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}) to {final_best_val_model_path}")
-                    else: # If checkpoint is just a state_dict
+                    else:
                         torch.save(best_ckpt_data, str(final_best_val_model_path))
                         logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}, from raw state_dict) to {final_best_val_model_path}")
 
@@ -1106,15 +1030,12 @@ def _train(this_directory, model,
         else:
             logger.warning(f"No best validation epoch found in progress log for metric '{validation_metric}'.")
 
-
-        # Close TensorBoard writer
         if tb_writer:
             try:
                 tb_writer.close()
             except Exception as e_tb_close:
                 logger.error(f"Error closing TensorBoard writer: {e_tb_close}")
     
-    # Final barrier for DDP if used
     if is_distributed:
         dist.barrier()
     logger.info(f"{current_rank_str} finished _train function.")
