@@ -13,7 +13,7 @@ log_level: 'INFO'
 densenet_model_name: 'densenet201'
 
 # --- Semantic Guidance Backbone (DINOv2) ---
-dino_model_name: 'dinov2_vitb14'      # ViT-Base. Good balance of speed and performance.
+dino_model_name: 'dinov2_vitl14'      # ViT-Base. Good balance of speed and performance.
 dino_patch_size: 14                   # Must match the model name (e.g., vitb14 -> 14)
 dino_layers_for_guidance: [-1]        # Extract only the last layer's features from DINOv2.
 dino_semantic_feature_layer_idx: -1   # Use the last (and only) layer from the list above.
