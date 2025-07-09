@@ -42,6 +42,12 @@ import cloudpickle as cpickle
 from tqdm import tqdm
 from boltons.fileutils import atomic_save
 import datetime
+import pickle
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from typing import Optional, Tuple
+
 
 
 try:
@@ -57,11 +63,12 @@ try:
         ImageDatasetWithSegmentation,
         FixationDataset, # Needed for scanpath stage
         FixationMaskTransform,
+        FixationDatasetWithSegmentation,
         convert_stimuli as convert_stimuli_mit,
         convert_fixation_trains as convert_fixation_trains_mit
     )
     from src.dinov2_backbone import DinoV2Backbone
-    from src.modules import Finalizer, build_fixation_selection_network, build_scanpath_network
+    from src.modules import Finalizer, build_fixation_selection_network, build_scanpath_network, encode_scanpath_features 
     from src.layers import Bias
     from src.training import _train, restore_from_checkpoint
 except ImportError as e:
@@ -196,13 +203,20 @@ class DinoGazeSpade(nn.Module):
         painted_flat = segment_avg_features[global_pixel_ids]
         return painted_flat.view(B, H_img, W_img, C_dino).permute(0, 3, 1, 2)
 
-    def forward(self, image, centerbias, x_hist=None, y_hist=None, durations=None,
-                segmentation_mask=None, **kwargs):
+    def forward(self, image, centerbias, scanpath_features=None, x_hist=None, y_hist=None, durations=None, **kwargs):
+        """
+        Processes an input image and scanpath history to produce a saliency log-density map.
+        This version uses the "shim" approach to be compatible with the old network logic.
+        """
+        segmentation_mask = kwargs.get('segmentation_mask', None)
         if segmentation_mask is None:
-            raise ValueError(f"{self.__class__.__name__} requires 'segmentation_mask'.")
+            raise ValueError(f"{self.__class__.__name__} requires 'segmentation_mask' in its input.")
 
         orig_img_shape_hw = image.shape[2:]
-        extracted_feature_maps = self.features(image)
+
+        with torch.no_grad():
+            extracted_feature_maps = self.features(image)
+
         readout_h = math.ceil(orig_img_shape_hw[0] / self.readout_factor)
         readout_w = math.ceil(orig_img_shape_hw[1] / self.readout_factor)
         readout_spatial_shape = (readout_h, readout_w)
@@ -218,23 +232,41 @@ class DinoGazeSpade(nn.Module):
 
         saliency_path_output = self.saliency_network(concatenated_backbone_features, S_painted_map_full_res)
         
-        scanpath_path_output = None
+        # --- Start of Scanpath Logic ---
+        scanpath_path_output = None # Initialize
+        
         if self.scanpath_network is not None:
-            scanpath_features = self.scanpath_network(x_hist, y_hist, durations)
-            scanpath_path_output = F.interpolate(scanpath_features, size=saliency_path_output.shape[2:], mode='bilinear', align_corners=False)
+            if x_hist is not None and y_hist is not None and x_hist.numel() > 0:
+                # History exists: process it normally
+                scanpath_input_tensor = encode_scanpath_features(
+                    x_hist, y_hist,
+                    size=orig_img_shape_hw,
+                    device=image.device
+                )
+                scanpath_input_tensor = F.interpolate(
+                    scanpath_input_tensor, 
+                    size=saliency_path_output.shape[2:],
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                scanpath_path_output = self.scanpath_network(scanpath_input_tensor)
+            else:
+                # --- THIS IS THE SHIM ---
+                # History is empty (first fixation). Create a zero-tensor with the expected shape.
+                # The scanpath_network outputs 16 channels.
+                B, _, H, W = saliency_path_output.shape
+                scanpath_output_channels = 16 # Based on build_scanpath_network
+                scanpath_path_output = torch.zeros(B, scanpath_output_channels, H, W, device=image.device)
+        
+        # --- End of Scanpath Logic ---
 
+        # The input is now always a tuple of two tensors, (tensor, zero_tensor), never (tensor, None)
         combined_input_for_fixsel = (saliency_path_output, scanpath_path_output)
         final_readout_before_finalizer = self.fixation_selection_network(combined_input_for_fixsel)
+        
         saliency_log_density = self.finalizer(final_readout_before_finalizer, centerbias)
+        
         return saliency_log_density
-
-    def train(self, mode=True):
-        self.features.eval() # Backbone is always in eval mode
-        self.saliency_network.train(mode)
-        if self.scanpath_network is not None: self.scanpath_network.train(mode)
-        self.fixation_selection_network.train(mode)
-        self.finalizer.train(mode)
-        return self
 
 #==================================
 # SALICON PRE-TRAINING
@@ -454,7 +486,7 @@ def mit_spatial_dinogaze(args, device, is_master, is_distributed, dino_backbone_
     stim_val, fix_val = validation_split(stimuli_resized, fixations_processed, crossval_folds=10, fold_no=fold)
     
     centerbias = CrossvalidatedBaselineModel(stimuli_resized, fixations_processed, bandwidth=10**-1.6667673342543432, eps=10**-14.884189168516073, caching=False)
-    train_ll, val_ll = calculate_mit_baseline_ll(stim_train, fix_train, stim_val, fix_val, centerbias, is_master, is_distributed, fold)
+    train_ll, val_ll = calculate_mit_baseline_ll(stim_train, fix_train, stim_val, fix_val, centerbias, is_master, is_distributed, fold, args)
     
     # 3. Build Model
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
@@ -577,7 +609,7 @@ def mit_scanpath_dinogaze(args, device, is_master, is_distributed, dino_backbone
     stim_train, scanpaths_train = train_split(stimuli_resized, fixations_processed, crossval_folds=10, fold_no=fold)
     stim_val, scanpaths_val = validation_split(stimuli_resized, fixations_processed, crossval_folds=10, fold_no=fold)
     centerbias = CrossvalidatedBaselineModel(stimuli_resized, fixations_processed, bandwidth=10**-1.6667673342543432, eps=10**-14.884189168516073, caching=False)
-    train_ll, val_ll = calculate_mit_baseline_ll(stim_train, scanpaths_train, stim_val, scanpaths_val, centerbias, is_master, is_distributed, fold)
+    train_ll, val_ll = calculate_mit_baseline_ll(stim_train, scanpaths_train, stim_val, scanpaths_val, centerbias, is_master, is_distributed, fold, args)
     
     # 3. Build model
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
@@ -608,22 +640,57 @@ def mit_scanpath_dinogaze(args, device, is_master, is_distributed, dino_backbone
     optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=stage_lr)
     lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=stage_milestones)
 
-    # 5. Create datasets. FixationDataset correctly handles scanpath data.
-    ds_kwargs = {
-        "transform": FixationMaskTransform(sparse=False), "average": "image",
-        "segmentation_mask_dir": args.segmentation_mask_dir,
-        "segmentation_mask_subdir": args.mit_all_mask_subdir_name,
-        "segmentation_mask_format": 'png',
-    }
-    train_dataset = FixationDataset(stim_train, scanpaths_train, centerbias, **ds_kwargs)
-    val_dataset = FixationDataset(stim_val, scanpaths_val, centerbias, **ds_kwargs)
-    
-    train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers, sampler=train_sampler, drop_last=True)
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None
-    validation_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, sampler=val_sampler)
+    # 5. Create datasets. FixationDataset correctly handles scanpath data and segmentation.
+    train_dataset = FixationDatasetWithSegmentation(
+        stim_train, scanpaths_train, centerbias,
+        included_fixations=[-1, -2, -3, -4],          # ← important
+        allow_missing_fixations=True,
+        transform=FixationMaskTransform(sparse=False),
+        average="image",
+        segmentation_mask_dir=args.mit_all_mask_dir,
+        segmentation_mask_format='png'
+    )
 
-    # 6. Train
+    val_dataset = FixationDatasetWithSegmentation(
+        stim_val, scanpaths_val, centerbias,
+        included_fixations=[-1, -2, -3, -4],          # ← important
+        transform=FixationMaskTransform(sparse=False),
+        average="image",
+        allow_missing_fixations=True,
+        segmentation_mask_dir=args.mit_all_mask_dir,
+        segmentation_mask_format='png'
+    )
+
+    # 6. Create Dataloaders with shape-aware batching for efficiency
+    train_sampler = None
+    if is_distributed:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
+        # Create a subset of the dataset for the current rank to use with ImageDatasetSampler
+        rank_subset_indices = list(iter(train_sampler))
+        rank_train_dataset = Subset(train_dataset, rank_subset_indices)
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            data_source=rank_train_dataset, batch_size=args.batch_size, shuffle=True
+        )
+        train_loader = DataLoader(
+            rank_train_dataset, batch_sampler=shape_aware_batch_sampler,
+            num_workers=args.num_workers, pin_memory=True
+        )
+    else:
+        shape_aware_batch_sampler = ImageDatasetSampler(
+            train_dataset, batch_size=args.batch_size, shuffle=True
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_sampler=shape_aware_batch_sampler,
+            num_workers=args.num_workers, pin_memory=True
+        )
+
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None
+    validation_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, sampler=val_sampler, pin_memory=True
+    )
+
+    # 7. Train
     experiment_name = f"{args.stage.replace('_dinogaze_dynamic', '')}_fold{fold}_{args.dino_model_name}_k{args.num_total_segments}_lr{stage_lr}"
     output_dir = args.train_dir / experiment_name
     _train(
@@ -632,27 +699,67 @@ def mit_scanpath_dinogaze(args, device, is_master, is_distributed, dino_backbone
         val_baseline_log_likelihood=val_ll, optimizer=optimizer, lr_scheduler=lr_scheduler,
         gradient_accumulation_steps=args.gradient_accumulation_steps, minimum_learning_rate=args.min_lr,
         validation_metrics=['LL', 'IG', 'NSS', 'AUC_CPU'], validation_epochs=args.validation_epochs,
-        startwith=None, device=device, is_distributed=is_distributed, is_master=is_master, logger=_logger
+        startwith=None, device=device, is_distributed=is_distributed, is_master=is_master, logger=_logger,
+        train_sampler=train_sampler
     )
 
 #==================================
 # Helper Functions
 #==================================
-def calculate_mit_baseline_ll(stim_train, fix_train, stim_val, fix_val, centerbias_model, is_master, is_distributed, fold):
-    """Calculates baseline log-likelihoods for a given MIT fold."""
+def calculate_mit_baseline_ll(stim_train, fix_train, stim_val, fix_val, centerbias_model, is_master, is_distributed, fold, args):
+    """
+    Calculates baseline log-likelihoods for a given MIT fold, with caching.
+    The results are computed on the master rank and then broadcast to all other ranks.
+    """
     train_ll, val_ll = None, None
+
     if is_master:
-        _logger.info(f"Computing baseline LLs for MIT Fold {fold}...")
-        train_ll = centerbias_model.information_gain(stim_train, fix_train, verbose=False, average='image')
-        val_ll = centerbias_model.information_gain(stim_val, fix_val, verbose=False, average='image')
-        _logger.info(f"Fold {fold} Master Baseline LLs - Train: {train_ll:.4f}, Val: {val_ll:.4f}")
-    
+        # Define a dedicated directory for these cache files
+        cache_dir = args.train_dir / 'baseline_ll_cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create fold-specific cache file paths
+        train_ll_cache = cache_dir / f'mit_train_ll_fold{fold}.pkl'
+        val_ll_cache = cache_dir / f'mit_val_ll_fold{fold}.pkl'
+
+        _logger.info(f"Master processing baseline LLs for fold {fold}...")
+
+        # --- Try to load or compute training LL ---
+        try:
+            with open(train_ll_cache, 'rb') as f:
+                train_ll = cpickle.load(f)
+            _logger.info(f"Loaded train LL from cache: {train_ll_cache}")
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+            _logger.info(f"Cache not found or invalid for train LL (fold {fold}). Computing...")
+            train_ll = centerbias_model.information_gain(stim_train, fix_train, verbose=True, average='image')
+            with open(train_ll_cache, 'wb') as f:
+                cpickle.dump(train_ll, f)
+            _logger.info(f"Saved computed train LL to cache: {train_ll_cache}")
+        
+        # --- Try to load or compute validation LL ---
+        try:
+            with open(val_ll_cache, 'rb') as f:
+                val_ll = cpickle.load(f)
+            _logger.info(f"Loaded val LL from cache: {val_ll_cache}")
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+            _logger.info(f"Cache not found or invalid for val LL (fold {fold}). Computing...")
+            val_ll = centerbias_model.information_gain(stim_val, fix_val, verbose=True, average='image')
+            with open(val_ll_cache, 'wb') as f:
+                cpickle.dump(val_ll, f)
+            _logger.info(f"Saved computed val LL to cache: {val_ll_cache}")
+        
+        _logger.info(f"Final LLs on master for fold {fold}: Train={train_ll:.4f}, Val={val_ll:.4f}")
+
+    # Broadcast the results from master to all other processes
     ll_bcast = [train_ll, val_ll]
-    if is_distributed: dist.broadcast_object_list(ll_bcast, src=0)
+    if is_distributed:
+        dist.broadcast_object_list(ll_bcast, src=0)
     train_ll, val_ll = ll_bcast
     
+    # Final check on all processes
     if train_ll is None or val_ll is None:
         _logger.critical(f"MIT Baseline LLs invalid on rank {dist.get_rank()}. Exiting."); sys.exit(1)
+        
     return train_ll, val_ll
 
 def load_previous_stage_checkpoint(args, model_cpu, is_master, prev_stage_prefix, fold=None):
@@ -670,10 +777,13 @@ def load_previous_stage_checkpoint(args, model_cpu, is_master, prev_stage_prefix
         
         prev_dir_name = None
         if prev_stage_prefix == 'salicon_pretrain':
-            prev_dir_name = f"salicon_pretrain_dinogaze_dynamic_{args.dino_model_name}_lr{args.lr}"
+            prev_dir_name = f"salicon_pretrain_dinogaze_dynamic_dino_{args.dino_model_name}_lr{args.lr}"
         elif prev_stage_prefix == 'mit_spatial':
             prev_lr = args.lr_mit_spatial
             prev_dir_name = f"mit_spatial_fold{fold}_{args.dino_model_name}_k{args.num_total_segments}_lr{prev_lr}"
+        elif prev_stage_prefix == 'mit_scanpath_frozen':
+            prev_lr = args.lr_mit_scanpath_frozen
+            prev_dir_name = f"mit_scanpath_frozen_fold{fold}_{args.dino_model_name}_k{args.num_total_segments}_lr{prev_lr}"
         
         if prev_dir_name:
             prev_dir = args.train_dir / prev_dir_name
@@ -682,16 +792,21 @@ def load_previous_stage_checkpoint(args, model_cpu, is_master, prev_stage_prefix
                 if p_opt.exists(): checkpoint_path = p_opt; break
     
     if not checkpoint_path or not checkpoint_path.exists():
-        _logger.critical(f"CRITICAL: Could not find checkpoint for fine-tuning. Training would start from random weights.")
-        _logger.critical("Provide a valid path via --finetune_checkpoint_path. Exiting.")
-        cleanup_distributed()
-        sys.exit(1)
+        # For the scanpath stage, we must have a checkpoint.
+        if prev_stage_prefix != 'salicon_pretrain': # It's okay to not have one for the very first fine-tuning stage if starting from scratch
+            _logger.critical(f"CRITICAL: Could not find checkpoint for fine-tuning stage '{prev_stage_prefix}'. Training would start from random weights.")
+            _logger.critical("Provide a valid path via --finetune_checkpoint_path. Exiting.")
+            cleanup_distributed()
+            sys.exit(1)
+        else:
+             _logger.warning(f"No checkpoint found for '{prev_stage_prefix}'. Starting with random head weights.")
+             return # Just return without loading anything
 
     if is_master:
         _logger.info(f"Loading checkpoint weights into model_cpu from: {checkpoint_path}")
+    
+    # Assuming `restore_from_checkpoint` is defined in your src.training
     restore_from_checkpoint(model=model_cpu, optimizer=None, scheduler=None, scaler=None, path=str(checkpoint_path), device='cpu', is_distributed=False, logger=_logger)
-
-
 
 #==================================
 # MAIN DISPATCHER
@@ -782,7 +897,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr_milestones', type=int, nargs='+', default=[20, 40, 55])
     parser.add_argument('--lr_mit_spatial', type=float, default=5e-5)
     parser.add_argument('--lr_milestones_mit_spatial', type=int, nargs='+', default=[10, 20])
-    parser.add_argument('--lr_mit_scanpath_frozen', type=float, default=5e-5)
+    parser.add_argument('--lr_mit_scanpath_frozen', type=float, default=5e-4)
     parser.add_argument('--lr_milestones_mit_scanpath_frozen', type=int, nargs='+', default=[10, 20])
     parser.add_argument('--lr_mit_scanpath_full', type=float, default=1e-5)
     parser.add_argument('--lr_milestones_mit_scanpath_full', type=int, nargs='+', default=[10, 20])
@@ -791,6 +906,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=str, default='auto')
     parser.add_argument('--train_dir', type=str, default='./experiments_dinogaze_dynamic')
     parser.add_argument('--dataset_dir', type=str, default='./data/pysaliency_datasets')
+    parser.add_argument('--lmdb_dir', type=str, default=None, help="Directory for LMDB image caches. Set to None to disable.")
+
     
     # MIT Fine-tuning Specifics
     parser.add_argument('--fold', type=int)
