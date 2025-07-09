@@ -11,44 +11,54 @@ from .layers import GaussianFilterNd, Bias, LayerNorm, LayerNormMultiInput, Conv
 from collections import OrderedDict
 
 
-def encode_scanpath_features(x_hist, y_hist, size, device=None, include_x=True, include_y=True, include_duration=False):
-    assert include_x
-    assert include_y
-    assert not include_duration
+def encode_scanpath_features(
+    x_hist: torch.Tensor,
+    y_hist: torch.Tensor,
+    *,
+    size: tuple[int, int],                 # (H, W)
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    Returns a tensor (B, 3·N_fix, H, W) with
+        dx, dy, distance  for each of the N_fix history entries.
 
-    height = size[0]
-    width = size[1]
+    Any slot whose (x_hist, y_hist) is NaN is interpreted as “no fixation yet”
+    and its three channels are set to **0**.
+    """
+    if device is None:
+        device = x_hist.device
 
-    xs = torch.arange(width, dtype=torch.float32).to(device)
-    ys = torch.arange(height, dtype=torch.float32).to(device)
-    YS, XS = torch.meshgrid(ys, xs, indexing='ij')
+    B, N_fix = x_hist.shape
+    H, W     = size
 
-    XS = torch.repeat_interleave(
-        torch.repeat_interleave(
-            XS[np.newaxis, np.newaxis, :, :],
-            repeats=x_hist.shape[0],
-            dim=0,
-        ),
-        repeats=x_hist.shape[1],
-        dim=1,
-    )
+    # --------- 1. handle NaNs (= missing fixations) ----------
+    valid = (~torch.isnan(x_hist)) & (~torch.isnan(y_hist))          # (B, N_fix)
+    #   replace NaNs with zeros so arithmetic below is finite
+    x_hist_f = torch.where(valid, x_hist, torch.zeros_like(x_hist))
+    y_hist_f = torch.where(valid, y_hist, torch.zeros_like(y_hist))
 
-    YS = torch.repeat_interleave(
-        torch.repeat_interleave(
-            YS[np.newaxis, np.newaxis, :, :],
-            repeats=y_hist.shape[0],
-            dim=0,
-        ),
-        repeats=y_hist.shape[1],
-        dim=1,
-    )
+    # --------- 2. build coordinate grids ---------------------
+    xs = torch.arange(W, device=device, dtype=torch.float32)
+    ys = torch.arange(H, device=device, dtype=torch.float32)
+    YS, XS = torch.meshgrid(ys, xs, indexing='ij')                   # (H, W)
 
-    XS -= x_hist.unsqueeze(2).unsqueeze(3)
-    YS -= y_hist.unsqueeze(2).unsqueeze(3)
+    XS = XS.expand(B, N_fix, H, W).clone()
+    YS = YS.expand(B, N_fix, H, W).clone()
 
-    distances = torch.sqrt(XS**2 + YS**2)
+    XS -= x_hist_f.unsqueeze(-1).unsqueeze(-1)
+    YS -= y_hist_f.unsqueeze(-1).unsqueeze(-1)
+    DIST = torch.sqrt(XS**2 + YS**2)
 
-    return torch.cat((XS, YS, distances), axis=1)
+    # --------- 3. apply the valid-mask ------------------------
+    #         invalid slots → 0 in all three channels
+    mask = valid.unsqueeze(-1).unsqueeze(-1)                         # (B,N_fix,1,1)
+    XS   = XS   * mask
+    YS   = YS   * mask
+    DIST = DIST * mask
+
+    # --------- 4. interleave dx,dy,dist exactly as before -----
+    out = torch.cat((XS, YS, DIST), dim=1)                           # (B,3N_fix,H,W)
+    return out
 
 def build_saliency_network(input_channels, add_sa_head=False):
     """ Builds the saliency prediction head network. """
