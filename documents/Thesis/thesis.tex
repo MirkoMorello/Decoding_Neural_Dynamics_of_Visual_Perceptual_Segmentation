@@ -1,0 +1,88 @@
+\documentclass{styles/tthesis}
+
+\newcommand{\dspic}{dsPIC$^{\text{\textregistered}}$ DSC}
+\newcommand{\dcbus}{DC-BUS\texttrademark }
+
+% change the reference to the desired frontpage
+\renewcommand{\frontpagefile}{frontpages/frontpage-ai4st.inc}
+
+\title{Decoding Neural Dynamics of Visual Perceptual Segmentation}
+\author{Mirko Morello}
+\renewcommand{\regnumber}{920601}
+\graduation{Master Degree in Computer Engineering}
+\academicyear{2024/2025}
+\supervisor{
+Prof. Paolo Napoletano \\
+Co-supervisor: \\
+Dr. Ruben Coen-Cagli \\
+}
+
+%-------------------------------------------------------------------
+\begin{document}
+%-------------------------------------------------------------------
+
+%-------------------------------------------------------------------
+% Frontpage
+%-------------------------------------------------------------------
+
+% All "variable" data in the frontpage are set using the above commands.
+\printfrontpage
+
+%-------------------------------------------------------------------
+% Abstract
+%-------------------------------------------------------------------
+
+\input{abstract.inc}
+
+\chapter*{\mbox{}}
+
+\begin{flushright}
+\thispagestyle{empty}
+\null\vspace*{\stretch{1}}
+{\it Here you can write whatever you want
+
+\vspace{10pt}
+and here too.
+}
+\vspace{\stretch{2}}\null
+\end{flushright}
+%
+\thispagestyle{empty}
+\mbox{}
+\newpage
+
+%-------------------------------------------------------------------
+% Acknowledgments
+%-------------------------------------------------------------------
+
+\input{acknowledgments.inc}
+
+%-------------------------------------------------------------------
+% Indexes
+%-------------------------------------------------------------------
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\mainmatter
+
+\input{chapter_acronyms.inc}
+\input{chapter_intro.inc}
+\input{chapter_sota.inc}
+\input{chapter_tools.inc}
+\input{chapter_implementation.inc}
+\input{chapter_results.inc}
+\input{chapter_conclusions.inc}
+
+%\backmatter
+
+%-------------------------------------------------------------------
+% Bibliography
+%-------------------------------------------------------------------
+
+\label{Bibliography}
+\bibliographystyle{plain}
+\bibliography{biblio}
+
+\end{document}
