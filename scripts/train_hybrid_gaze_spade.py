@@ -69,7 +69,7 @@ def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
     is_distributed = world_size > 1
     if is_distributed:
         # Set a generous timeout to accommodate the long baseline calculation on rank 0
-        timeout = datetime.timedelta(hours=2) # 2 hours
+        timeout = datetime.timedelta(hours=3) # 3 hours
         
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout) # <--- THIS LINE IS MODIFIED
