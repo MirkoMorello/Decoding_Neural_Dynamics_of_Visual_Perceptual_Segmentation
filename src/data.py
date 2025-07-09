@@ -552,8 +552,192 @@ class FixationDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.fixations)
+    
+    
 
 
+
+class FixationDatasetWithSegmentation(FixationDataset):
+    """
+    Extends FixationDataset to add support for loading segmentation masks.
+
+    This class inherits all scanpath functionality from its parent and adds
+    the mask-loading logic, mirroring the design of ImageDatasetWithSegmentation.
+    """
+    def __init__(
+        self,
+        *args, # Pass positional args (stimuli, fixations, etc.) to the parent
+        segmentation_mask_dir: str | Path,
+        segmentation_mask_format: str = "png",
+        **kwargs # Pass keyword args to the parent
+    ):
+        # Call the parent's __init__ method with all the original arguments
+        super().__init__(*args, **kwargs)
+
+        # Now, set up the new segmentation-specific attributes
+        self.individual_mask_files_dir = Path(segmentation_mask_dir).resolve()
+        self.segmentation_mask_format = segmentation_mask_format.lower()
+        
+        self.use_segmentation_masks = False
+        if self.individual_mask_files_dir.exists() and self.individual_mask_files_dir.is_dir():
+            self.use_segmentation_masks = True
+            logger.info(f"FixationDatasetWithSegmentation: Mask loading ENABLED from {self.individual_mask_files_dir}.")
+        else:
+            # Raise an error because if this class is used, masks are expected.
+            raise FileNotFoundError(f"Segmentation mask directory not found or is not a directory: {self.individual_mask_files_dir}")
+
+    def __getitem__(self, key: int):
+        # 1. Get the complete data dictionary from the parent class.
+        # This will include 'image', 'x_hist', 'y_hist', 'centerbias', etc.
+        data = super().__getitem__(key)
+
+        # The parent may have already applied a transform. We need to handle this.
+        # The ideal place to add the mask is *before* the transform.
+        # A small refactor of the parent could help, but we can work around it.
+        # Let's assume the parent doesn't return tensors yet, or we convert back.
+        # Your current parent `FixationDataset` returns a dict of numpy arrays
+        # before the transform, so this is fine.
+
+        # 2. Load and add the segmentation mask
+        mask_tensor_to_add = None
+        stimulus_idx = self.fixations.n[key]
+
+        try:
+            stimulus_filename_stem = Path(self.stimuli.filenames[stimulus_idx]).stem
+            mask_fname = f"{stimulus_filename_stem}.{self.segmentation_mask_format}"
+            mask_path_full = self.individual_mask_files_dir / mask_fname
+
+            if mask_path_full.exists():
+                if self.segmentation_mask_format == "png":
+                    mask_pil = Image.open(mask_path_full).convert('L')
+                    mask_arr = np.array(mask_pil)
+                elif self.segmentation_mask_format == "npy":
+                    mask_arr = np.load(mask_path_full)
+                # No need for torch.from_numpy here, the final transform will handle it
+                mask_tensor_to_add = mask_arr.astype(np.int64)
+            else:
+                logger.warning(f"Mask file not found for stimulus {stimulus_filename_stem}, creating dummy mask. Path: {mask_path_full}")
+
+        except Exception as e:
+            logger.error(f"Error loading mask for stimulus index {stimulus_idx}: {e}")
+
+        if mask_tensor_to_add is None:
+            # Create a dummy numpy array if loading failed
+            img_h, img_w = data['image'].shape[1], data['image'].shape[2]
+            mask_tensor_to_add = np.zeros((img_h, img_w), dtype=np.int64)
+        
+        data['segmentation_mask'] = mask_tensor_to_add
+
+        # 3. The parent class's __getitem__ already handles the transform at the end,
+        # so we don't need to call it again. Our job is just to add the mask
+        # to the dictionary before it's returned.
+        # Wait, the parent already calls the transform. This is a problem.
+        # We need to re-structure slightly.
+
+        # Let's try a better approach that doesn't break the transform logic.
+        return self._get_item_with_mask(key)
+
+
+    def _create_scanpath_tensor(self, x_hist, y_hist, durations,
+                                target_shape_hw, device=torch.device('cpu')):
+
+        B, num_hist_fix = 1, x_hist.shape[0]     # dataset still returns one sample
+        H, W = target_shape_hw
+
+        xs_grid = torch.linspace(0, W - 1, W, device=device)
+        ys_grid = torch.linspace(0, H - 1, H, device=device)
+        grid_y, grid_x = torch.meshgrid(ys_grid, xs_grid, indexing='ij')
+
+        grid_x = grid_x.expand(num_hist_fix, H, W)
+        grid_y = grid_y.expand(num_hist_fix, H, W)
+
+        dx = grid_x - torch.from_numpy(x_hist).view(num_hist_fix, 1, 1).to(device)
+        dy = grid_y - torch.from_numpy(y_hist).view(num_hist_fix, 1, 1).to(device)
+        dist = torch.sqrt(dx ** 2 + dy ** 2)     # <── new third channel
+        # (duration is *not* used by the current head)
+
+        stacked = torch.stack([dx, dy, dist], dim=1)   # (N, 3, H, W)
+        return stacked.view(num_hist_fix * 3, H, W).float()
+    
+    def _load_or_dummy_mask(
+        self,
+        stimulus_idx: int,
+        img_shape_hw: tuple[int, int],   # (H, W) – for fallback shape
+    ) -> np.ndarray:
+        """
+        Returns the segmentation mask for `stimulus_idx` as a **numpy int64
+        array** (H, W).  If the file is missing or corrupt, a zero mask with the
+        requested image size is returned.
+        """
+        if not self.use_segmentation_masks:
+            return np.zeros(img_shape_hw, dtype=np.int64)
+
+        try:
+            # e.g.  "train_23.jpg" → "train_23.png"
+            stem = Path(self.stimuli.filenames[stimulus_idx]).stem
+            mask_path = self.individual_mask_files_dir / f"{stem}.{self.segmentation_mask_format}"
+
+            if mask_path.exists():
+                if self.segmentation_mask_format == "png":
+                    mask = np.array(Image.open(mask_path).convert("L"), dtype=np.int64)
+                elif self.segmentation_mask_format == "npy":
+                    mask = np.load(mask_path).astype(np.int64)
+                else:
+                    raise ValueError(f"Unsupported mask format '{self.segmentation_mask_format}'")
+                return mask
+
+            logger.warning(f"Mask file not found: {mask_path}")
+
+        except Exception as e:
+            logger.error(f"Error reading mask for stimulus {stimulus_idx}: {e}")
+
+        # Fallback – all zeros, same size as image
+        return np.zeros(img_shape_hw, dtype=np.int64)
+
+    def _get_item_with_mask(self, key: int):
+        stim_idx = self.fixations.n[key]
+
+        # ---------- A. image & center-bias ----------
+        image, centerbias = self._get_image_data(stim_idx)         # (3,H,W) / (H,W)
+
+        # ---------- B. raw histories (length = 4) ----------
+        x_hist_raw = remove_trailing_nans(self.fixations.x_hist[key])
+        y_hist_raw = remove_trailing_nans(self.fixations.y_hist[key])
+        dur_raw    = np.nan_to_num(remove_trailing_nans(self.fixations.t_hist[key]),
+                                   nan=0.0)
+
+        x_hist, y_hist, durations = [], [], []
+        for i in self.included_fixations:          # [-1,-2,-3,-4]
+            if i < -len(x_hist_raw):
+                x_hist.append(np.nan);  y_hist.append(np.nan); durations.append(0.0)
+            else:
+                x_hist.append(x_hist_raw[i]); y_hist.append(y_hist_raw[i]); durations.append(dur_raw[i])
+
+        x_hist = np.asarray(x_hist, dtype=np.float32)
+        y_hist = np.asarray(y_hist, dtype=np.float32)
+
+        # ---------- C. segmentation mask ----------
+        mask_np = self._load_or_dummy_mask(stim_idx, image.shape[1:])   # helper below
+
+        # ---------- D. package ----------
+        sample = dict(
+            image            = image,                                   # (3,H,W)  float32
+            x                = np.asarray([self.fixations.x_int[key]], dtype=np.int32),
+            y                = np.asarray([self.fixations.y_int[key]], dtype=np.int32),
+            x_hist           = x_hist,                                  # 4-vector  float32
+            y_hist           = y_hist,                                  # 4-vector  float32
+            centerbias       = centerbias,                              # (H,W)    float32
+            segmentation_mask= mask_np,                                 # (H,W)    int64
+            weight           = (1.0 / self.fixation_counts[stim_idx]
+                                if self.average == "image" else 1.0)
+        )
+
+        if self.transform is not None:
+            sample = self.transform(sample)        # keeps x_hist / y_hist untouched
+        return sample
+    
+    
+    
 class FixationMaskTransform(object):
     def __init__(self, sparse=True):
         super().__init__()
