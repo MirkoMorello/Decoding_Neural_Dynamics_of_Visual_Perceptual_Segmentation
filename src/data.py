@@ -7,9 +7,10 @@ import random
 import shutil
 from pathlib import Path
 from boltons.iterutils import chunked
+from typing   import Optional, Tuple, List
 import lmdb
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 import pysaliency
 from pysaliency.utils import remove_trailing_nans
 import torch
@@ -19,12 +20,15 @@ from imageio.v3 import imread, imwrite
 from torch.utils.data import Sampler, RandomSampler, BatchSampler
 import numpy as np
 import torch
+from boltons.fileutils import atomic_save
 import cloudpickle as cpickle
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 
+Image.MAX_IMAGE_PIXELS = None        # avoid DecompressionBomb warnings
+ImageFile.LOAD_TRUNCATED_IMAGES = True   # skip truncated-file errors
 
 def ensure_color_image(image):
     if len(image.shape) == 2:
@@ -68,6 +72,36 @@ def decode_and_prepare_image(path_or_bytes: str | Path | bytes) -> np.ndarray:
     img_pil = img_pil.convert("RGB")
     img_arr_uint8 = np.array(img_pil)
     return img_arr_uint8.transpose(2, 0, 1)
+
+def safe_precompute_sizes(stimuli: pysaliency.FileStimuli) -> None:
+    """
+    Touch every stimulus once so that `stimuli.sizes` is fully populated.
+    If some files are unreadable we log them, and—when the installed
+    pysaliency exposes `keep_only`—we drop them to avoid crashes later.
+    On older versions we just warn.
+    """
+    bad_items = []
+    for i, fname in enumerate(stimuli.filenames):
+        try:
+            _ = stimuli.sizes[i]          # forces a lazy read
+        except Exception as e:
+            print(f"[WARN] could not read {fname}: {e}")
+            bad_items.append(i)
+
+    if not bad_items:
+        return                            # nothing to do
+
+    keep = [j for j in range(len(stimuli)) if j not in bad_items]
+
+    if hasattr(stimuli, "keep_only"):
+        stimuli.keep_only(keep)           # newest pysaliency
+        print(f"[INFO] removed {len(bad_items)} corrupted stimuli")
+    else:
+        print(
+            f"[INFO] pysaliency < 0.3: cannot drop {len(bad_items)} bad images "
+            "(no keep_only); they will stay in the list – be aware that any "
+            "access to them (e.g. during batching) will still raise."
+        )
 
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
@@ -1205,74 +1239,122 @@ def convert_stimulus(input_image):
     )
 
 
-def convert_stimuli(stimuli, new_location: Path, is_master: bool, is_distributed: bool, device: torch.device, logger = None):
-    """ Converts all stimuli in a FileStimuli object to standard sizes and saves them. """
-    assert isinstance(stimuli, pysaliency.FileStimuli)
-    new_stimuli_location = new_location / 'stimuli'
+def _target_size(h_orig: int, w_orig: int) -> Tuple[int, int]:
+    if h_orig < w_orig:               # landscape
+        return 1024, 768              #  (new_w, new_h)
+    else:                             # portrait or square
+        return 768, 1024
+
+def _resize_np(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    new_w, new_h = _target_size(h, w)
+    return np.array(Image.fromarray(img).resize((new_w, new_h), Image.BILINEAR))
+
+def convert_stimuli(
+    stimuli: pysaliency.FileStimuli,
+    new_location: Path,
+    is_master: bool,
+    is_distributed: bool,
+    device: torch.device,
+    logger: Optional[logging.Logger] = None,
+    *,
+    save_format: str = "jpeg",        # "jpeg"  or  "png"
+) -> pysaliency.FileStimuli:
+    """
+    • Resizes every image in `stimuli` to 1024×768 / 768×1024.
+    • Saves them to  `<new_location>/stimuli/`  with the chosen format.
+    • Returns a new `FileStimuli` with **absolute paths** to the resized files.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    save_format = save_format.lower()
+    if save_format not in ("jpeg", "jpg", "png"):
+        raise ValueError("save_format must be 'jpeg' or 'png'")
+
+    new_stimuli_location = new_location / "stimuli"
+
+    # ------------------------------------------------------------------ #
+    # 1. Create target directory (only on master)                        #
+    # ------------------------------------------------------------------ #
     if is_master:
-        try:
-            new_stimuli_location.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Converting stimuli resolution and saving to {new_stimuli_location}...")
-        except OSError as e:
-            logger.critical(f"Failed to create stimuli conversion directory {new_stimuli_location}: {e}")
-            return None
+        new_stimuli_location.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Converting stimuli and saving to {new_stimuli_location}")
 
-    new_filenames = []
-    filenames_iterable = tqdm(stimuli.filenames, desc="Converting Stimuli", disable=not is_master)
-    conversion_errors = 0
+    # make sure other ranks wait until directory exists
+    if is_distributed:
+        torch.distributed.barrier()
 
-    for filename in filenames_iterable:
+    # ------------------------------------------------------------------ #
+    # 2. Iterate over original images                                    #
+    # ------------------------------------------------------------------ #
+    new_filenames: List[str] = []
+    io_errors = 0
+
+    for fname_in in tqdm(stimuli.filenames,
+                         desc="Converting stimuli",
+                         disable=not is_master):
+
         try:
-            stimulus = imread(filename)
-            if stimulus.ndim == 2:
-                stimulus = np.stack([stimulus]*3, axis=-1)
-            elif stimulus.shape[2] == 1:
-                stimulus = np.concatenate([stimulus]*3, axis=-1)
-            elif stimulus.shape[2] == 4:
-                stimulus = stimulus[:,:,:3]
-            if stimulus.shape[2] != 3:
-                if is_master: logger.warning(f"Skipping stimulus {filename} with unexpected shape {stimulus.shape}")
-                conversion_errors += 1
-                continue
-            new_stimulus = convert_stimulus(stimulus)
-            basename = os.path.basename(filename)
-            new_filename = new_stimuli_location / basename
+            img_np = np.asarray(Image.open(fname_in).convert("RGB"))
+        except Exception as e:
             if is_master:
-                # Store original shape in the JSON metadata if using FileStimuli's save method
-                # Or, handle metadata storage separately if needed.
-                if new_stimulus.shape != stimulus.shape or not new_filename.exists():
-                    try: imwrite(new_filename, new_stimulus)
-                    except Exception as e: logger.error(f"Failed to write {new_filename}: {e}"); conversion_errors +=1; continue
-                elif not new_filename.exists():
-                    try: shutil.copy(filename, new_filename)
-                    except Exception as e: logger.error(f"Failed to copy {filename} to {new_filename}: {e}"); conversion_errors += 1; continue
-            new_filenames.append(str(new_filename.resolve()))   # <- absolute
-        except Exception as read_err:
-            if is_master: logger.exception(f"Failed to read or process stimulus {filename}")
-            conversion_errors += 1
+                logger.warning(f"[READ-FAIL] {fname_in} – {e}")
+            io_errors += 1
             continue
 
-    if is_master and conversion_errors > 0:
-        logger.warning(f"Encountered {conversion_errors} errors during stimuli conversion.")
+        img_resized = _resize_np(img_np)
 
-    # synchronize if distributed
+        # -----------------------  output name  ------------------------- #
+        stem = Path(fname_in).stem
+        suffix = ".jpg" if save_format in ("jpeg", "jpg") else ".png"
+        fname_out = new_stimuli_location / f"{stem}{suffix}"
+
+        # -----------------------  write file (master only)  ------------ #
+        if is_master and not fname_out.exists():
+            try:
+                if save_format in ("jpeg", "jpg"):
+                    Image.fromarray(img_resized).save(
+                        fname_out, "JPEG", quality=93, optimize=True)
+                else:                   # png
+                    Image.fromarray(img_resized).save(fname_out, "PNG")
+            except Exception as e:
+                logger.warning(f"[WRITE-FAIL] {fname_out} – {e}")
+                io_errors += 1
+                continue
+
+        new_filenames.append(str(fname_out.resolve()))
+
+    # gather counts across ranks
     if is_distributed:
-        dist.barrier()
+        io_errors_tensor = torch.tensor(io_errors, device=device)
+        torch.distributed.all_reduce(io_errors_tensor, op=torch.distributed.ReduceOp.SUM)
+        io_errors = int(io_errors_tensor.item())
 
-    # persist cache and metadata
+    if is_master and io_errors:
+        logger.warning(f"⚠️  {io_errors} images failed during read/write")
+
+    # ------------------------------------------------------------------ #
+    # 3. Save cache files (master)                                       #
+    # ------------------------------------------------------------------ #
     if is_master:
-        with open(new_location / "stimuli.pkl", "wb") as f:
-            cpickle.dump(pysaliency.FileStimuli(new_filenames), f, protocol=pickle.HIGHEST_PROTOCOL)
+        with atomic_save(str(new_location / "stimuli.pkl"),
+                 text_mode=False, overwrite_part=True) as f:
+            cpickle.dump(pysaliency.FileStimuli(new_filenames), f)
+
         meta = {
             "filenames": new_filenames,
             "shapes":    [list(s) for s in pysaliency.FileStimuli(new_filenames).shapes],
+            "save_format": save_format
         }
         with open(new_location / "stimuli.json", "w") as f:
             json.dump(meta, f, indent=2)
 
-    # return a FileStimuli made from the *string* paths
-    return pysaliency.FileStimuli(new_filenames)
+    # make sure every rank sees the cache files
+    if is_distributed:
+        torch.distributed.barrier()
 
+    return pysaliency.FileStimuli(new_filenames)
 
 
 
