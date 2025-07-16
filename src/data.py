@@ -72,118 +72,63 @@ def decode_and_prepare_image(path_or_bytes: str | Path | bytes) -> np.ndarray:
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        stimuli: pysaliency.Stimuli,
-        fixations: pysaliency.Fixations,
-        centerbias_model: pysaliency.Model | None = None,
-        lmdb_path: str | Path | None = None,
+        stimuli,
+        fixations,
+        centerbias_model=None,
+        *,                 # keyword-only after this
+        lmdb_path=None,
         transform=None,
-        cached: bool | None = None,
-        average: str = 'fixation'
+        cached=None,
+        average="fixation",
     ):
-        self.stimuli = stimuli
-        self.fixations = fixations
+        logger.info("⏳ ImageDataset initialising…")
+
+        self.stimuli          = stimuli
+        self.fixations        = fixations
         self.centerbias_model = centerbias_model
-        self.lmdb_path = Path(lmdb_path) if lmdb_path else None
-        self.transform = transform
-        self.average = average
+        self.transform        = transform
+        self.average          = average
 
-        if cached is None:
-            self.cached = len(self.stimuli) < 100
+        # ----- LMDB bookkeeping (lazy-open later in __getitem__) -------
+        self.lmdb_path = (
+            Path(lmdb_path).expanduser().resolve() if lmdb_path else None
+        )
+        self.lmdb_env  = None            # each worker opens its own handle
+        if self.lmdb_path is not None:
+            logger.info(f"  • LMDB path set to {self.lmdb_path} (lazy open)")
         else:
-            self.cached = cached
-        self.cache_fixation_data = self.cached
+            logger.info("  • LMDB disabled (direct file reads)")
 
-        self.lmdb_env = None # Initialize to None
-
-        if self.lmdb_path:
-            if self.centerbias_model is None: # Condition from your _export_dataset_to_lmdb path
-                logger.warning(f"ImageDataset: LMDB path '{self.lmdb_path}' provided, but centerbias_model is None. "
-                               "Cannot create/validate LMDB for image/centerbias. LMDB will NOT be used.")
-            elif not isinstance(self.stimuli, pysaliency.FileStimuli):
-                logger.warning(f"ImageDataset: LMDB path '{self.lmdb_path}' provided, but stimuli object is not FileStimuli. "
-                               "Cannot get filenames for LMDB creation. LMDB will NOT be used.")
-            else:
-                # Always call _export_dataset_to_lmdb if lmdb_path and requirements are met.
-                # This function will handle checking for existing valid DB or regenerating it.
-                # It should typically only run on master process if in DDP.
-                # We'll assume the main script handles calling this on master only, or _export handles DDP.
-                # For now, let's assume it's called by each process but only master writes.
-                # A dist.barrier() might be needed in main script after dataset init if master creates it.
-                
-                # --- LMDB EXPORT CALL ---
-                # This call needs to be robust, e.g., only master rank writes.
-                # For simplicity in the Dataset class, we just call it.
-                # The _export_dataset_to_lmdb function itself should be DDP-aware if necessary,
-                # or the calling script (main.py) should manage DDP for this setup step.
-                # Let's assume for now that if it's called by multiple DDP processes,
-                # lmdb.open with subdir=True and file locks will mostly handle it,
-                # or the "check if valid and complete" part prevents redundant writes.
-                # The current _export_dataset_to_lmdb is mostly designed for single-process execution.
-                # A truly DDP-safe version would have master create, others wait.
-                
-                # Simplification: _export_dataset_to_lmdb will check existence.
-                # If you are in DDP, this export should ideally be done by rank 0 before other ranks try to open.
-                # The main training script should orchestrate this.
-                # However, the current _export_dataset_to_lmdb includes a check for valid and complete DB.
-                
-                # Check if master and if export needed (this is a simplified check)
-                is_master_process = True # Placeholder, this should be passed or determined
-                if 'RANK' in os.environ: # Basic DDP check
-                    is_master_process = int(os.environ.get("RANK",0)) == 0
-
-                if is_master_process: # Only master attempts to create/validate fully
-                    logger.info(f"ImageDataset (Master): Ensuring LMDB at {self.lmdb_path} is up-to-date...")
-                    _export_dataset_to_lmdb(self.stimuli, self.centerbias_model, str(self.lmdb_path))
-                
-                # All processes wait if in DDP, ensuring master finishes DB creation/check
-                if 'WORLD_SIZE' in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1:
-                    if dist.is_initialized(): # Check if DDP is actually active
-                        logger.debug(f"ImageDataset (Rank {os.environ.get('RANK')}): Waiting at barrier for LMDB.")
-                        dist.barrier()
-                    else: # DDP env vars set, but not initialized (e.g. before DDP group init)
-                        # This state is tricky. For now, we proceed.
-                        pass
-
-
-                # After potential creation/validation, try to open read-only
-                lmdb_data_file = self.lmdb_path / "data.mdb"
-                if lmdb_data_file.exists() and self.lmdb_path.is_dir():
-                    try:
-                        self.lmdb_env = lmdb.open(str(self.lmdb_path), subdir=True,
-                                                readonly=True, lock=False, readahead=False, meminit=False)
-                        logger.info(f"ImageDataset: Successfully opened LMDB: {self.lmdb_path}")
-                        self.cached = False
-                        self.cache_fixation_data = True
-                    except lmdb.Error as e:
-                        logger.error(f"ImageDataset: Failed to open LMDB at {self.lmdb_path} even after export attempt: {e}. LMDB will NOT be used.")
-                        self.lmdb_env = None # Ensure it's None on failure
-                else:
-                    logger.warning(f"ImageDataset: LMDB data file {lmdb_data_file} still not found after export attempt. LMDB will NOT be used.")
-                    self.lmdb_env = None
-        # else: self.lmdb_env remains None (initialized above)
-
+        # ----- decide RAM caching of full samples ----------------------
+        self.cached = bool(cached) if cached is not None else (
+            self.lmdb_path is None and len(self.stimuli) < 100
+        )
         if self.cached:
             self._cache = {}
-            logger.info("ImageDataset: Main data RAM caching (image, CB, fix_coords) ENABLED.")
+            logger.info(f"  • RAM caching ENABLED for {len(self.stimuli)} items")
         else:
-            logger.info("ImageDataset: Main data RAM caching DISABLED (due to LMDB or config).")
+            logger.info("  • RAM caching DISABLED")
 
-        if self.cache_fixation_data:
-            logger.info("ImageDataset: Populating fixation coordinate RAM cache (_xs_cache, _ys_cache)...")
-            self._xs_cache = {}
-            self._ys_cache = {}
-            for x_coord, y_coord, n_idx in zip(self.fixations.x_int, self.fixations.y_int, tqdm(self.fixations.n, desc="Caching fixation coords")):
-                self._xs_cache.setdefault(n_idx, []).append(x_coord)
-                self._ys_cache.setdefault(n_idx, []).append(y_coord)
-            for key_idx in list(self._xs_cache.keys()): self._xs_cache[key_idx] = np.array(self._xs_cache[key_idx], dtype=int)
-            for key_idx in list(self._ys_cache.keys()): self._ys_cache[key_idx] = np.array(self._ys_cache[key_idx], dtype=int)
-            logger.info("ImageDataset: Fixation coordinate RAM cache populated.")
-        else:
-            self._xs_cache, self._ys_cache = None, None
-            logger.info("ImageDataset: Fixation coordinate RAM caching DISABLED.")
+        # ----- pre-cache fixation coordinates --------------------------
+        logger.info("  • Building fixation-coordinate caches …")
+        self._xs_cache, self._ys_cache = {}, {}
+        for x, y, n in zip(self.fixations.x_int,
+                           self.fixations.y_int,
+                           self.fixations.n):
+            self._xs_cache.setdefault(n, []).append(x)
+            self._ys_cache.setdefault(n, []).append(y)
+        for k in list(self._xs_cache):
+            self._xs_cache[k] = np.asarray(self._xs_cache[k], dtype=int)
+            self._ys_cache[k] = np.asarray(self._ys_cache[k], dtype=int)
+        logger.debug("    fixation-coord caches built")
+
+        logger.info("✅ ImageDataset ready")
 
     def get_shapes(self):
         return list(self.stimuli.sizes) # [(H, W), ...] or [(H, W, C), ...]
+
+    def __len__(self):
+        return len(self.stimuli)
 
     def _get_stimulus_as_array(self, n_idx: int) -> np.ndarray:
         """Helper to get stimulus n_idx as a NumPy array from various Stimuli types."""
@@ -213,124 +158,182 @@ class ImageDataset(torch.utils.data.Dataset):
                     centerbias_prediction = np.zeros((h, w), dtype=np.float32)
 
                 return image_chw_uint8, centerbias_prediction.astype(np.float32)
-
-    def __getitem__(self, key: int):
-        if not self.cached or key not in self._cache:
-            image_chw_f32, centerbias_hw_f32 = self._get_image_data(key)
             
-            xs_arr, ys_arr = None, None
-            if self.cache_fixation_data and self._xs_cache is not None:
-                if key in self._xs_cache:
-                    if self.cached:
-                        xs_arr = self._xs_cache.pop(key, np.array([], dtype=int))
-                        ys_arr = self._ys_cache.pop(key, np.array([], dtype=int))
-                    else:
-                        xs_arr = self._xs_cache.get(key, np.array([], dtype=int))
-                        ys_arr = self._ys_cache.get(key, np.array([], dtype=int))
-            
-            if xs_arr is None: 
-                inds = self.fixations.n == key
-                xs_arr = np.array(self.fixations.x_int[inds], dtype=int)
-                ys_arr = np.array(self.fixations.y_int[inds], dtype=int)
+    def _open_lmdb_env(self) -> lmdb.Environment:
+        return lmdb.open(
+            str(self.lmdb_path), subdir=True,
+            readonly=True, lock=False,
+            readahead=False, meminit=False
+        )
 
-            data = {
-                "image": image_chw_f32, 
-                "x": xs_arr,
-                "y": ys_arr,
-                "centerbias": centerbias_hw_f32.astype(np.float32), 
-            }
-            data['weight'] = 1.0 if self.average == 'image' else float(len(xs_arr)) if len(xs_arr) > 0 else 1.0
+    def __getitem__(self, idx: int):
+        # 1.  ensure LMDB handle for THIS worker
+        if self.lmdb_env is None and self.lmdb_path is not None:
+            logger.info(f"[PID {os.getpid()}] opening LMDB → {self.lmdb_path}")
+            self.lmdb_env = self._open_lmdb_env()
 
-            if self.cached: self._cache[key] = data
+        # 2.  cache fast-path
+        if self.cached and idx in self._cache:
+            logger.debug(f"cache hit item {idx}")
+            sample = self._cache[idx]
         else:
-            data = self._cache[key]
+            # 3-a. image + center-bias
+            image, cb = self._get_image_data(idx)
 
-        item_to_return = dict(data) if self.transform is not None else data
-        if self.transform:
-            return self.transform(item_to_return)
-        return item_to_return
+            # 3-b. fixation coordinates
+            xs = self._xs_cache.get(idx, np.empty(0, dtype=int))
+            ys = self._ys_cache.get(idx, np.empty(0, dtype=int))
 
-    def __len__(self):
-        return len(self.stimuli)
+            # 3-c. assemble
+            sample = dict(
+                image      = image,
+                x          = xs,
+                y          = ys,
+                centerbias = cb.astype(np.float32),
+                weight     = 1.0 if self.average == "image" else float(len(xs)),
+            )
+            if self.cached:
+                self._cache[idx] = sample
+                logger.debug(f"stored item {idx} in RAM cache")
+
+        # 4.  optional transform
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample
 
 
 
 class ImageDatasetWithSegmentation(ImageDataset):
-    def __init__(self, *args, # Args for parent ImageDataset (stimuli, fixations, etc.)
-                 segmentation_mask_dir: str | Path | None = None,
-                 segmentation_mask_format: str = "png",
-                 segmentation_mask_fixed_memmap_file: str | Path | None = None,
-                 segmentation_mask_variable_payload_file: str | Path | None = None,
-                 segmentation_mask_variable_header_file: str | Path | None = None,
-                 segmentation_mask_bank_dtype: str = "uint8",
-                 **kwargs): # Kwargs for parent ImageDataset
+    def __init__(
+        self,
+        stimuli,
+        fixations,
+        centerbias_model=None,
+        *,                       # ------- keyword-only after this
+        lmdb_path=None,
+        transform=None,
+        cached=None,
+        average="fixation",
+        # ------------- segmentation-specific arguments -----------------
+        segmentation_mask_dir: str | Path | None = None,
+        segmentation_mask_format: str = "png",
+        segmentation_mask_fixed_memmap_file: str | Path | None = None,
+        segmentation_mask_variable_payload_file: str | Path | None = None,
+        segmentation_mask_variable_header_file: str | Path | None = None,
+        segmentation_mask_bank_dtype: str = "uint8",
+    ):
+        logger.info("⏳ ImageDatasetWithSegmentation initialising…")
 
-        super().__init__(*args, **kwargs) # Call parent init
+        # ------------------------------------------------------------------
+        # 1.  *Base* dataset initialisation  (no segmentation kwargs)
+        # ------------------------------------------------------------------
+        super().__init__(
+            stimuli,
+            fixations,
+            centerbias_model=centerbias_model,
+            lmdb_path=lmdb_path,
+            transform=transform,
+            cached=cached,
+            average=average,
+        )
+        logger.debug("✓ Base ImageDataset init completed")
 
-        self.individual_mask_files_dir = Path(segmentation_mask_dir).resolve() if segmentation_mask_dir else None
-        
-        self.segmentation_mask_format = segmentation_mask_format.lower()
-        self._mask_bank_dtype_np = np.dtype(segmentation_mask_bank_dtype)
+        # ------------------------------------------------------------------
+        # 2.  Book-keeping for mask handling
+        # ------------------------------------------------------------------
+        self.segmentation_mask_format  = segmentation_mask_format.lower()
+        self._mask_bank_dtype_np       = np.dtype(segmentation_mask_bank_dtype)
 
-        self.mask_fixed_mmap_bank = None
-        self.mask_fixed_mmap_shape = None
+        # paths
+        self.individual_mask_files_dir = (
+            Path(segmentation_mask_dir).expanduser().resolve()
+            if segmentation_mask_dir else None
+        )
+
+        # holders for the various strategies
+        self.mask_fixed_mmap_bank       = None
         self.mask_variable_payload_mmap = None
-        self.mask_variable_header_data = None
+        self.mask_variable_header_data  = None
+        self.mask_loading_strategy      = "dummy"   # provisional
 
-        # --- Initialize Fixed-Size Memmap Bank ---
+        # ------------------------------------------------------------------
+        # 3.  Try fixed-size mem-map bank
+        # ------------------------------------------------------------------
         if segmentation_mask_fixed_memmap_file:
-            fixed_path = Path(segmentation_mask_fixed_memmap_file).resolve()
-            if fixed_path.exists():
+            fpath = Path(segmentation_mask_fixed_memmap_file).expanduser().resolve()
+            if fpath.exists():
                 try:
-                    mmap = np.memmap(fixed_path, mode='r', dtype=self._mask_bank_dtype_np)
-                    if mmap.ndim == 3 and mmap.shape[0] == len(self.stimuli):
-                        self.mask_fixed_mmap_bank = mmap
-                        self.mask_fixed_mmap_shape = mmap.shape
-                        logger.info(f"Successfully memory-mapped FIXED-SIZE masks from: {fixed_path} shape {mmap.shape}")
+                    mm = np.memmap(fpath, mode="r", dtype=self._mask_bank_dtype_np)
+                    if mm.ndim == 3 and mm.shape[0] == len(self.stimuli):
+                        self.mask_fixed_mmap_bank = mm
+                        self.mask_loading_strategy = "fixed_bank"
+                        logger.info(f"✓ Fixed-size mask bank found: {fpath}  shape={mm.shape}")
                     else:
-                        logger.error(f"Fixed mask memmap shape {mmap.shape} incompatible with stimuli count {len(self.stimuli)} from {fixed_path}. Disabling.")
-                except Exception as e: logger.error(f"Error memory-mapping fixed-size masks from {fixed_path}: {e}")
-            else: logger.warning(f"Fixed-size mask memmap file not found: {fixed_path}")
-
-        # --- Initialize Variable-Size Memmap Bank ---
-        if not self.mask_fixed_mmap_bank and segmentation_mask_variable_payload_file and segmentation_mask_variable_header_file:
-            payload_path = Path(segmentation_mask_variable_payload_file).resolve()
-            header_path = Path(segmentation_mask_variable_header_file).resolve()
-            if payload_path.exists() and header_path.exists():
-                try:
-                    header = np.load(header_path)
-                    if header.ndim == 2 and header.shape[1] == 3 and header.shape[0] == len(self.stimuli):
-                        self.mask_variable_header_data = header
-                        self.mask_variable_payload_mmap = np.memmap(payload_path, dtype=self._mask_bank_dtype_np, mode='r')
-                        logger.info(f"Successfully set up VARIABLE-SIZE mask loading: Payload '{payload_path}', Header '{header_path}'")
-                    else:
-                        logger.error(f"Variable mask header {header_path} shape {header.shape} incompatible with stimuli count {len(self.stimuli)}. Disabling.")
-                except Exception as e: logger.error(f"Error setting up variable-size mask loading (Header: {header_path}, Payload: {payload_path}): {e}")
-            else: logger.warning(f"Variable-size mask payload or header file not found: {payload_path}, {header_path}")
-
-        # --- Determine Final Mask Loading Strategy ---
-        self.mask_loading_strategy = "dummy"
-        if self.mask_fixed_mmap_bank is not None:
-            self.mask_loading_strategy = "fixed_bank"
-            logger.info(f"Using FIXED-SIZE memmap bank for segmentation masks.")
-        elif self.mask_variable_payload_mmap is not None and self.mask_variable_header_data is not None:
-            self.mask_loading_strategy = "variable_bank"
-            logger.info(f"Using VARIABLE-SIZE memmap bank for segmentation masks.")
-        elif self.individual_mask_files_dir: # Check the direct path provided
-            logger.info(f"Attempting individual files. Checking direct mask path: '{self.individual_mask_files_dir}'")
-            if self.individual_mask_files_dir.exists() and self.individual_mask_files_dir.is_dir():
-                self.mask_loading_strategy = "individual_files"
-                logger.info(f"SUCCESS: Using individual mask files from {self.individual_mask_files_dir}.")
-                try:
-                    first_few = list(self.individual_mask_files_dir.glob(f'*.{self.segmentation_mask_format}'))[:5]
-                    if first_few: logger.info(f"  Found mask files, e.g.: {[f.name for f in first_few]}")
-                    else: logger.warning(f"  Directory {self.individual_mask_files_dir} exists, but no masks ('*.{self.segmentation_mask_format}') found directly within it.")
-                except Exception as e_glob: logger.warning(f"  Error listing mask files in {self.individual_mask_files_dir}: {e_glob}")
+                        logger.error(
+                            "❌ Fixed-bank shape mismatch "
+                            f"(got {mm.shape}, expected n={len(self.stimuli)}) – ignored"
+                        )
+                except Exception as e:
+                    logger.exception(f"❌ Could not mem-map fixed bank {fpath}: {e}")
             else:
-                logger.warning(f"FAILURE: Directory for individual masks ('{self.individual_mask_files_dir}') does not exist or is not a directory.")
-        
+                logger.warning(f"⚠ fixed-size mem-map file not found: {fpath}")
+
+        # ------------------------------------------------------------------
+        # 4.  Try variable-size mem-map bank
+        # ------------------------------------------------------------------
+        if (self.mask_loading_strategy == "dummy"
+            and segmentation_mask_variable_payload_file
+            and segmentation_mask_variable_header_file):
+
+            payload = Path(segmentation_mask_variable_payload_file).expanduser().resolve()
+            header  = Path(segmentation_mask_variable_header_file ).expanduser().resolve()
+
+            if payload.exists() and header.exists():
+                try:
+                    hdr = np.load(header)
+                    if hdr.ndim == 2 and hdr.shape[1] == 3 and hdr.shape[0] == len(self.stimuli):
+                        self.mask_variable_header_data  = hdr
+                        self.mask_variable_payload_mmap = np.memmap(
+                            payload, dtype=self._mask_bank_dtype_np, mode="r"
+                        )
+                        self.mask_loading_strategy = "variable_bank"
+                        logger.info(f"✓ Variable-size mask bank enabled (payload={payload})")
+                    else:
+                        logger.error(
+                            f"❌ Variable bank header shape {hdr.shape} "
+                            f"incompatible with stimuli count {len(self.stimuli)} – ignored"
+                        )
+                except Exception as e:
+                    logger.exception(f"❌ Error loading variable bank: {e}")
+            else:
+                logger.warning(f"⚠ Variable bank files missing: {payload} / {header}")
+
+        # ------------------------------------------------------------------
+        # 5.  Fallback to individual mask files
+        # ------------------------------------------------------------------
+        if (self.mask_loading_strategy == "dummy"
+            and self.individual_mask_files_dir
+            and self.individual_mask_files_dir.is_dir()):
+            self.mask_loading_strategy = "individual_files"
+            try:
+                sample_files = list(
+                    self.individual_mask_files_dir.glob(f"*.{self.segmentation_mask_format}")
+                )[:5]
+                logger.info(
+                    " Using individual mask files "
+                    f"in {self.individual_mask_files_dir} "
+                    f"(example: {[f.name for f in sample_files]})"
+                )
+            except Exception as e:
+                logger.warning(f"⚠ Could not list mask dir {self.individual_mask_files_dir}: {e}")
+
+        # ------------------------------------------------------------------
+        # 6.  Final status
+        # ------------------------------------------------------------------
         if self.mask_loading_strategy == "dummy":
-             logger.warning("ImageDatasetWithSegmentation: No valid mask source found/configured. Dummy (all-zero) masks will be used.")
+            logger.warning("🚧 No valid mask source found — dummy zero masks will be used.")
+
+        logger.info(f"✅ ImageDatasetWithSegmentation ready (strategy = {self.mask_loading_strategy})")
 
 
     def __getitem__(self, key: int):
@@ -424,7 +427,8 @@ class ImageDatasetWithSegmentation(ImageDataset):
             # 5. Add the final mask and return.
             final_item['segmentation_mask'] = mask_tensor_to_add
             return final_item
-
+    def __len__(self):
+        return super().__len__()
 
 class FixationDataset(torch.utils.data.Dataset):
     def __init__(
