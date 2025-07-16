@@ -767,101 +767,61 @@ class FixationMaskTransform(object):
         return item
 
 
-class ImageDatasetSampler(torch.utils.data.Sampler):
-    def __init__(self, data_source, batch_size=1, ratio_used=1.0, shuffle=True):
-        # It's good practice to call super().__init__ if inheriting from torch.utils.data.Sampler,
-        # though often not strictly necessary if you override __iter__ and __len__.
-        # super().__init__(data_source) # Optional, can be added
+class ImageDatasetSampler(torch.utils.data.Sampler[list[int]]):
+    def __init__(
+        self,
+        data_source: torch.utils.data.Dataset,
+        batch_size: int = 1,
+        ratio_used: float = 1.0,
+        shuffle: bool = True,
+    ):
+        self.data_source = data_source
+        self.batch_size  = batch_size
+        self.ratio_used  = ratio_used
+        self.shuffle     = shuffle
 
-        self.data_source = data_source # Keep a reference if needed by __iter__ or __len__ later
-                                      # In your current code, it's only used for get_shapes initially.
-        self.batch_size = batch_size
-        self.ratio_used = ratio_used
-        self.shuffle = shuffle
+        rng = random.Random()                       # independent RNG
 
-        # --- MODIFICATION FOR Subset compatibility ---
+        # -------- 1. resolve shapes for *local* indices ---------------
         if isinstance(data_source, torch.utils.data.Subset):
-            # If data_source is a Subset, get shapes from the underlying dataset
-            underlying_dataset = data_source.dataset
-            if hasattr(underlying_dataset, 'get_shapes') and callable(getattr(underlying_dataset, 'get_shapes')):
-                shapes = underlying_dataset.get_shapes()
-                # The indices k below will be relative to the underlying_dataset.
-                # We need to ensure that the indices we store in shape_indices are
-                # the indices *within the Subset*.
-                # So, we first get shapes for ALL items in the underlying dataset,
-                # then filter to only include items that are part of the current Subset.
-
-                # Get all shapes from the original full dataset
-                all_original_shapes = underlying_dataset.get_shapes()
-
-                # `data_source.indices` gives the indices in the `underlying_dataset`
-                # that form this `Subset`.
-                subset_original_indices = data_source.indices
-
-                # Get shapes only for the items in the current subset
-                # And map original indices to subset_indices (0 to len(subset)-1)
-                # shapes_for_subset will be a list of shapes, corresponding to items 0..len(subset)-1
-                shapes_for_subset = [all_original_shapes[original_idx] for original_idx in subset_original_indices]
-
-                # The indices `k` used below to populate `shape_indices` should now be
-                # relative to the subset (0 to len(subset)-1)
-                # So, `shapes` should be `shapes_for_subset`
-                shapes_to_process = shapes_for_subset
-                num_items_to_process = len(shapes_to_process)
-
-            else:
-                raise AttributeError(f"The underlying dataset of type {type(underlying_dataset)} "
-                                     "for the Subset does not have a 'get_shapes' method.")
-        elif hasattr(data_source, 'get_shapes') and callable(getattr(data_source, 'get_shapes')):
-            # This is the original path, data_source is the full dataset
-            shapes_to_process = data_source.get_shapes()
-            num_items_to_process = len(shapes_to_process) # or len(data_source)
+            parent_shapes = data_source.dataset.get_shapes()
+            shapes = [parent_shapes[i] for i in data_source.indices]
         else:
-            raise AttributeError(f"Data source of type {type(data_source)} "
-                                 "does not have a 'get_shapes' method.")
-        # --- END MODIFICATION ---
+            shapes = data_source.get_shapes()
 
-        unique_shapes = sorted(set(shapes_to_process))
-        shape_indices = [[] for _ in unique_shapes] # Corrected: use _ if shape var not used
+        # group local indices by shape (H,W)
+        shape_buckets: dict[tuple[int, int], list[int]] = {}
+        for local_idx, shp in enumerate(shapes):
+            shape_buckets.setdefault(tuple(shp[:2]), []).append(local_idx)
 
-        # The indices 'k' here must be local to the data_source being processed
-        # (either the full dataset or the subset).
-        # `enumerate` will give k from 0 to len(shapes_to_process)-1, which is correct.
-        for k, shape_val in enumerate(shapes_to_process): # Renamed shape to shape_val to avoid conflict
-            shape_indices[unique_shapes.index(shape_val)].append(k)
+        # -------- 2. build batches, never mixing shapes ---------------
+        self.batches: list[list[int]] = []
+        for idx_list in shape_buckets.values():
+            if shuffle:
+                rng.shuffle(idx_list)
 
-        if self.shuffle:
-            for indices_list in shape_indices: # Renamed indices to indices_list
-                random.shuffle(indices_list)
+            for i in range(0, len(idx_list), batch_size):
+                chunk = idx_list[i : i + batch_size]
+                if len(chunk) == batch_size or (
+                    len(chunk) and ratio_used == 1.0
+                ):
+                    self.batches.append(chunk)
 
-        # The `chunked` function will take these local indices (0 to len(data_source)-1)
-        # and form batches. These indices are what DataLoader expects for data_source.__getitem__().
-        self.batches = sum([chunked(indices_list, size=self.batch_size) for indices_list in shape_indices], [])
-        # Important: After sum(), self.batches is a list of batches, where each batch is a list of indices.
-        # Example: [[0, 1, 2], [10, 11, 12], [5, 6], ...]
+        if shuffle:
+            rng.shuffle(self.batches)
 
+        # -------- 3. optionally down-sample epoch --------------------
+        if ratio_used < 1.0:
+            keep = int(len(self.batches) * ratio_used)
+            self.batches = self.batches[:keep]
+
+    # Sampler interface ----------------------------------------------
     def __iter__(self):
-        # The batches in self.batches already contain the correct indices (relative to
-        # data_source, which is the Subset in DDP case or full dataset otherwise).
-        # So, this part of the code doesn't need to change.
-
-        batch_indices_to_iterate = list(range(len(self.batches))) # Create a list of batch indices
-
-        if self.shuffle:
-            # Shuffle the order of the batches themselves
-            random.shuffle(batch_indices_to_iterate) # Use random.shuffle for list of indices
-
-        if self.ratio_used < 1.0:
-            num_batches_to_use = int(self.ratio_used * len(batch_indices_to_iterate))
-            batch_indices_to_iterate = batch_indices_to_iterate[:num_batches_to_use]
-
-        # Yield one batch (which is a list of item indices) at a time
-        for i in batch_indices_to_iterate:
-            yield self.batches[i]
+        for batch in self.batches:
+            yield batch
 
     def __len__(self):
-        # This returns the number of batches.
-        return int(self.ratio_used * len(self.batches))
+        return len(self.batches)
 
 
 def _export_dataset_to_lmdb(stimuli: pysaliency.FileStimuli, centerbias_model: pysaliency.Model, lmdb_path, write_frequency=100):
