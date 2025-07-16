@@ -22,17 +22,17 @@ serve = "jupyter lab"
 # run 'pixi run setup'
 
 [dependencies]
-python        = ">=3.9,<3.14"
+#python = "3.11.*"
 jupyterlab    = ">=4.4.0,<5"
 ipykernel     = ">=6.29.5,<7"
 imageio       = ">=2.37.0,<3"
 scikit-learn  = ">=1.6.1,<2"
 matplotlib    = ">=3.10.1,<4"
-pandas        = ">=2.2.3,<3"
+#pandas = ">=2.2,<3"
 tensorboard   = ">=2.19.0,<3"
 gdown         = ">=5.2.0,<6"
 h5py          = ">=3.13.0,<4"
-numpy         = "<2.0"
+#numpy         = "1.26.*"
 torchmetrics  = ">=1.7.1,<2"
 
 # Conda‑managed PyTorch stack (will be overridden by GPU pip installs)
@@ -47,15 +47,20 @@ make = ">=4.4.1,<5"
 transformers = ">=4.51.3,<5"
 python-dotenv = ">=1.1.0,<2"
 pyyaml = ">=6.0.2,<7"
+cloudpickle = ">=3.1.1,<4"
 
 [pypi-dependencies]
 lmdb          = ">=1.6.2,<2"
 xformers      = "*"
 opencv-python = ">=4.11.0.86, <5"
+#cloudpickle   = "*"
+#optree        = ">=0.13"
 
 [pypi-options]
+index-url = "https://pypi.org/simple"
+
 extra-index-urls = [
     "https://download.pytorch.org/whl/cu118",
-    "https://data.pyg.org/whl/torch-2.6.0+cu118.html" # Add this line
+#    "https://data.pyg.org/whl/torch-2.6.0+cu118.html"
 ]
 
