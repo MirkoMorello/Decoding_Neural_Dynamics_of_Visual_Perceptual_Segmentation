@@ -20,11 +20,13 @@ dino_semantic_feature_layer_idx: -1  # Index from DINO layers for SPADE semantic
 segmentation_mask_format: 'png'        # Format of individual SAM masks ('png' or 'npy')
 num_total_sam_segments: 64             # Total number of SAM segment IDs (e.g., 64 for masks with IDs 0-63)
 segmentation_mask_bank_dtype: 'uint8'  # Dtype used for storing SAM masks in the bank(s)
+salicon_train_mask_dir: 'masks/salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
+salicon_val_mask_dir: 'masks/salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
 
 # --- Training Hyperparameters (SALICON pretraining) ---
-batch_size: 1                          # Adjust based on GPU VRAM
+batch_size: 4                          # Adjust based on GPU VRAM
 gradient_accumulation_steps: 2
-lr: 0.0001                             # Learning rate for SALICON stage
+lr: 0.000005                             # Learning rate for SALICON stage
 lr_milestones: [20, 40, 55]            # Epochs for LR decay for SALICON
 min_lr: 0.0000001                      # Minimum learning rate (1e-7) for any stage
 validation_epochs: 1
@@ -33,19 +35,19 @@ finalizer_initial_sigma: 8.0           # Initial sigma for the Gaussian blur in 
 
 # --- Training Hyperparameters (MIT spatial fine-tuning) ---
 fold: 0                                # MIT1003 cross-validation fold (0-9). Only active if stage is 'mit_spatial'.
-lr_mit_spatial: 0.0005                # Learning rate for MIT spatial fine-tuning (often lower than pretraining)
+lr_mit_spatial: 0.0001                # Learning rate for MIT spatial fine-tuning (often lower than pretraining)
 lr_milestones_mit_spatial: [10, 30, 40, 50, 60]    # Epochs for LR decay for MIT spatial fine-tuning
 resume_checkpoint_mit: null            # Path to checkpoint for MIT stage explicit resume (overrides SALICON->MIT flow)
 
 # --- Dataloading & System ---
 num_workers: 'auto'                    # Number of DataLoader workers per GPU ('auto' or integer)
-train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14_test' # Base output directory for experiments
+train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1' # Base output directory for experiments
 dataset_dir: './data/pysaliency_datasets' # Where SALICON, MIT1003 etc. are stored by pysaliency
 lmdb_dir: './data/lmdb_caches/dinogaze_spade_dynamic_sam' # Where LMDB caches for images will be stored
 use_lmdb_images: true                  # Use LMDB for images
 
 salicon_checkpoint_path: './experiments/dinogaze_spade_dynamic_sam64_vitl14_test/salicon_pretraining_dinov2_vitl14_spade_dynSAMscatter64_lr0.0001/step-0007.pth'
-finetune_checkpoint_path: 'experiments/dinogaze_spade_dynamic_sam64_vitl14_test/mit_spatial_fold0_dinov2_vitl14_k64_lr5e-05/step-0004.pth'
+finetune_checkpoint_path: 'experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1/mit_spatial_fold0_dinov2_vitl14_k64_lr5e-05/step-0008.pth'
 
 # ==============================================================================
 # --- SAM Mask Paths Configuration ---

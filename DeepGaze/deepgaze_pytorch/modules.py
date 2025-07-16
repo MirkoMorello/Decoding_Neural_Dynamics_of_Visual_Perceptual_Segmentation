@@ -10,44 +10,88 @@ import torch.nn.functional as F
 from .layers import GaussianFilterNd
 
 
-def encode_scanpath_features(x_hist, y_hist, size, device=None, include_x=True, include_y=True, include_duration=False):
-    assert include_x
-    assert include_y
-    assert not include_duration
+def encode_scanpath_features(
+        x_hist,                   # tensor (B, N)  or  (N,)
+        y_hist,                   # tensor (B, N)  or  (N,)
+        size,                     # (H, W) image / feature-map size
+        *,                        # force kwargs after this point
+        durations=None,           # tensor (B, N) or (N,) — optional
+        device=None,
+        include_x=True,
+        include_y=True,
+        include_duration=False):
+    """
+    Build a (B, C, H, W) tensor with ∆x, ∆y, distance (and optionally duration)
+    for every fixation in the history.
 
-    height = size[0]
-    width = size[1]
+    C =   3  if include_duration == False   (dx, dy, dist)
+        or 4  if include_duration == True   (dx, dy, dist, dur)
 
-    xs = torch.arange(width, dtype=torch.float32).to(device)
-    ys = torch.arange(height, dtype=torch.float32).to(device)
-    YS, XS = torch.meshgrid(ys, xs, indexing='ij')
+    Parameters
+    ----------
+    x_hist, y_hist : torch.Tensor or np.ndarray
+        History of fixations normalised to the same resolution as `size`.
+        Shape either (N,)  or  (B, N).  Will be cast to float32.
+    size : tuple
+        (height, width) of the target map.
+    durations : torch.Tensor or np.ndarray, optional
+        Dwell times for the same fixations, shape (N,) or (B, N).
+    """
 
-    XS = torch.repeat_interleave(
-        torch.repeat_interleave(
-            XS[np.newaxis, np.newaxis, :, :],
-            repeats=x_hist.shape[0],
-            dim=0,
-        ),
-        repeats=x_hist.shape[1],
-        dim=1,
-    )
+    # ───── basic checks ──────────────────────────────────────────────
+    assert include_x and include_y, \
+        "encode_scanpath_features currently always expects include_x and include_y = True"
+    if include_duration and durations is None:
+        raise ValueError("include_duration=True but `durations` is None")
 
-    YS = torch.repeat_interleave(
-        torch.repeat_interleave(
-            YS[np.newaxis, np.newaxis, :, :],
-            repeats=y_hist.shape[0],
-            dim=0,
-        ),
-        repeats=y_hist.shape[1],
-        dim=1,
-    )
+    H, W = int(size[0]), int(size[1])
 
-    XS -= x_hist.unsqueeze(2).unsqueeze(3)
-    YS -= y_hist.unsqueeze(2).unsqueeze(3)
+    # ───── ensure torch tensors, 2-D shape (B, N) ────────────────────
+    def _to_2d_tensor(arr, name):
+        if not torch.is_tensor(arr):
+            arr = torch.as_tensor(arr)
+        if arr.dim() == 1:                # (N,)  →  (1, N)
+            arr = arr.unsqueeze(0)
+        elif arr.dim() != 2:
+            raise ValueError(f"{name} must be 1-D or 2-D, got shape {arr.shape}")
+        return arr.float()
 
-    distances = torch.sqrt(XS**2 + YS**2)
+    x_hist = _to_2d_tensor(x_hist, "x_hist").to(device)
+    y_hist = _to_2d_tensor(y_hist, "y_hist").to(device)
+    if include_duration:
+        durations = _to_2d_tensor(durations, "durations").to(device)
 
-    return torch.cat((XS, YS, distances), axis=1)
+    B, N = x_hist.shape
+
+    # ───── coordinate grid ───────────────────────────────────────────
+    ys = torch.linspace(0, H - 1, H, dtype=torch.float32, device=device)
+    xs = torch.linspace(0, W - 1, W, dtype=torch.float32, device=device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')           # (H, W)
+
+    grid_x = grid_x.unsqueeze(0).unsqueeze(0)                        # (1,1,H,W)
+    grid_y = grid_y.unsqueeze(0).unsqueeze(0)
+
+    # repeat for B and N
+    grid_x = grid_x.expand(B, N, -1, -1)                             # (B,N,H,W)
+    grid_y = grid_y.expand(B, N, -1, -1)
+
+    # ───── broadcast fixation coordinates ────────────────────────────
+    x_hist = x_hist.view(B, N, 1, 1)
+    y_hist = y_hist.view(B, N, 1, 1)
+
+    dx = grid_x - x_hist                                             # (B,N,H,W)
+    dy = grid_y - y_hist
+    dist = torch.sqrt(dx ** 2 + dy ** 2)
+
+    feats = [dx, dy, dist]
+    if include_duration:
+        dur = durations.view(B, N, 1, 1).expand_as(dx)
+        feats.append(dur)
+
+    feat_tensor = torch.cat(feats, dim=1)                            # (B, N*C_i, H, W)
+    feat_tensor = feat_tensor.view(B, N * len(feats), H, W)          # collapse N into channel
+
+    return feat_tensor
 
 class FeatureExtractor(torch.nn.Module):
     def __init__(self, features, targets):

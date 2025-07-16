@@ -16,7 +16,8 @@ dinov2_layers_for_main_path: [-3, -2, -1] # DINO layers for the main saliency pa
 dinov2_semantic_feature_layer_idx: -1  # Index from DINO layers for SPADE semantic features. -1 means last from above list.
 
 # --- SAM Masks and SPADE Dynamic Configuration ---
-segmentation_mask_dir: './masks/individual_sam_masks/' # ROOT directory if using individual mask files as fallback/source
+salicon_train_mask_dir: 'masks/salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
+salicon_val_mask_dir: 'masks/salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
                                                       # This root would contain subdirs like 'salicon_train_sam64', 'mit1003_sam_all', etc.
 segmentation_mask_format: 'png'        # Format of individual SAM masks ('png' or 'npy')
 num_total_sam_segments: 64             # Total number of SAM segment IDs (e.g., 64 for masks with IDs 0-63)
@@ -40,7 +41,7 @@ resume_checkpoint_mit: null            # Path to checkpoint for MIT stage explic
 
 # --- Dataloading & System ---
 num_workers: 'auto'                    # Number of DataLoader workers per GPU ('auto' or integer)
-train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14' # Base output directory for experiments
+train_dir: './experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1' # Base output directory for experiments
 dataset_dir: './data/pysaliency_datasets' # Where SALICON, MIT1003 etc. are stored by pysaliency
 lmdb_dir: './data/lmdb_caches/dinogaze_spade_dynamic_sam' # Where LMDB caches for images will be stored
 use_lmdb_images: true                  # Use LMDB for images
@@ -56,8 +57,8 @@ use_lmdb_images: true                  # Use LMDB for images
 
 # --- SALICON SAM Mask Paths ---
 # Option 1: Individual files for SALICON
-train_mask_subdir_name: 'salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
-val_mask_subdir_name: 'salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
+salicon_train_mask_dir: 'salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
+salicon_val_mask_dir: 'salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
 # Option 2 & 3: Banks for SALICON (Example using variable banks)
 # train_mask_memmap_file: null # or './masks/salicon/banks/sam64/salicon_train_sam_64_fixed.npy'
 # val_mask_memmap_file: null   # or './masks/salicon/banks/sam64/salicon_val_sam_64_fixed.npy'
