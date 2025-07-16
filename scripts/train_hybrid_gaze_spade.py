@@ -37,6 +37,8 @@ Image.MAX_IMAGE_PIXELS = None
 from pysaliency.baseline_utils import BaselineModel, CrossvalidatedBaselineModel
 import cloudpickle as cpickle
 
+torch.set_float32_matmul_precision("medium") # 3090s support this, but not TITAN V
+
 try:
     from torch_scatter import scatter_mean
 except ImportError:
@@ -395,12 +397,12 @@ def mit_finetune(args, device, is_master, is_distributed, model_cpu):
     train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True, drop_last=True) if is_distributed else None
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        sampler=train_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True
+        sampler=train_sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True, multiprocessing_context="spawn",
     )
     val_sampler = torch.utils.data.DistributedSampler(val_dataset, shuffle=False, drop_last=False) if is_distributed else None
     validation_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        sampler=val_sampler, num_workers=args.num_workers, pin_memory=True
+        sampler=val_sampler, num_workers=args.num_workers, pin_memory=True, multiprocessing_context="spawn",
     )
     experiment_name = f"{args.stage}_fold{fold}_{args.densenet_model_name}_dino_{args.dino_model_name}_k{args.num_total_segments}_lr{args.lr_mit_spatial}"
     output_dir = args.train_dir / experiment_name
