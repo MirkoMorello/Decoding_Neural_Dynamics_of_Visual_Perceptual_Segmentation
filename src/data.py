@@ -130,7 +130,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.lmdb_env  = None            # each worker opens its own handle
         if self.lmdb_path is not None:
             logger.info(f"  • LMDB path set to {self.lmdb_path} (lazy open)")
-            if not self.lmdb_path.exists():           
+            if not self.lmdb_path.exists():           # <-- NEW
                 from .data import _export_dataset_to_lmdb  # avoid circular import
                 _export_dataset_to_lmdb(self.stimuli, self.centerbias_model, self.lmdb_path)
         else:

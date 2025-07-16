@@ -47,6 +47,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Tuple
 
+torch.set_float32_matmul_precision("medium") # 3090s support this, but not TITAN V
+
 
 
 try:
@@ -431,6 +433,8 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     train_dataset = ImageDatasetWithSegmentation(
         train_stim, train_fix, centerbias,
         lmdb_path=lmdb_path_train, # <--- PASS THE ARGUMENT
+        segmentation_mask_variable_header_file = args.train_mask_variable_header_file,
+        segmentation_mask_variable_payload_file = args.train_mask_variable_payload_file,
         segmentation_mask_dir=args.salicon_train_mask_dir,
         transform=FixationMaskTransform(sparse=False),
         segmentation_mask_format='png',
@@ -439,6 +443,8 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     val_dataset = ImageDatasetWithSegmentation(
         val_stim, val_fix, centerbias,
         lmdb_path=lmdb_path_val, # <--- PASS THE ARGUMENT
+        segmentation_mask_variable_header_file= args.val_mask_variable_header_file,
+        segmentation_mask_variable_payload_file=args.val_mask_variable_payload_file,
         segmentation_mask_dir=args.salicon_val_mask_dir,
         transform=FixationMaskTransform(sparse=False),
         segmentation_mask_format='png',
