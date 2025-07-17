@@ -1362,76 +1362,79 @@ def convert_stimuli(
 
 
 def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
-                            fixations: pysaliency.FixationTrains,
+                            fixations,
                             is_master: bool,
                             logger) -> pysaliency.ScanpathFixations:
     """
-    Rescale MIT‑1003 FixationTrains to 1024×768 / 768×1024 and return
-    a pysaliency.ScanpathFixations object **with correct history & time‑stamps**.
+    Works with
+      • old  FixationTrains   (attributes train_xs / train_ys / …)
+      • new  FixationTrains   (attributes xs / ys / ts / n          )
+      • ScanpathFixations     (wraps a Scanpaths object)
     """
 
-    # -------------- 1. pre‑compute per‑stimulus scale factors --------------
-    orig_h = np.array([h for h, w, _ in stimuli.shapes])
-    orig_w = np.array([w for h, w, _ in stimuli.shapes])
-    tgt_w  = np.where(orig_h < orig_w, 1024, 768)
-    tgt_h  = np.where(orig_h < orig_w,  768,1024)
-    sx     = tgt_w / orig_w
-    sy     = tgt_h / orig_h
+    # ---------------------------------------------------------------
+    # 0.  figure-out which flavour we got ---------------------------
+    # ---------------------------------------------------------------
+    if hasattr(fixations, 'train_xs'):                  # ❶ very old (<0.3)
+        xs_iter, ys_iter, ts_iter, ns_iter = (
+            fixations.train_xs,
+            fixations.train_ys,
+            getattr(fixations, 'train_ts', [None]*len(fixations.train_xs)),
+            fixations.train_ns,
+        )
 
-    # -------------- 2. walk every scan‑path -------------------------------
+    elif hasattr(fixations, 'scanpaths') and hasattr(fixations, 'xs'):  # ❷ ScanpathFixations
+        xs_iter, ys_iter, ts_iter, ns_iter = (
+            fixations.scanpaths.xs,
+            fixations.scanpaths.ys,
+            fixations.scanpaths.ts,
+            fixations.scanpaths.n,
+        )
+
+    elif hasattr(fixations, 'scanpaths'):               # ❸ **new** FixationTrains (≥0.4)
+        xs_iter, ys_iter, ts_iter, ns_iter = (
+            fixations.scanpaths.xs,
+            fixations.scanpaths.ys,
+            fixations.scanpaths.ts,
+            fixations.scanpaths.n,
+        )
+
+    elif hasattr(fixations, 'xs'):                      # ❹ flat-array style (rare)
+        xs_iter, ys_iter, ts_iter, ns_iter = (
+            fixations.xs, fixations.ys,
+            getattr(fixations, 'ts', [None]*len(fixations.xs)),
+            fixations.n,
+        )
+
+    else:
+        raise AttributeError("Unrecognised Fixations/Scanpaths layout")
+
+    # ---------------------------------------------------------------
+    # 1.  pre-compute scale factors per stimulus --------------------
+    # ---------------------------------------------------------------
+    H_orig = np.array([h for h, w, _ in stimuli.shapes])
+    W_orig = np.array([w for h, w, _ in stimuli.shapes])
+    W_tgt  = np.where(H_orig < W_orig, 1024,  768)
+    H_tgt  = np.where(H_orig < W_orig,  768, 1024)
+    sx     = W_tgt / W_orig
+    sy     = H_tgt / H_orig
+
+    # ---------------------------------------------------------------
+    # 2.  walk every scan-path --------------------------------------
+    # ---------------------------------------------------------------
     new_xs, new_ys, new_ts  = [], [], []
-    new_x_hist, new_y_hist, new_dur = [], [], []
+    for xs, ys, ts, ns in zip(xs_iter, ys_iter, ts_iter, ns_iter):
+        xs_ = np.clip(np.asarray(xs)*sx[ns], 0, W_tgt[ns]-1e-6)
+        ys_ = np.clip(np.asarray(ys)*sy[ns], 0, H_tgt[ns]-1e-6)
+        new_xs.append(xs_); new_ys.append(ys_)
+        new_ts.append(np.asarray(ts, dtype=float) if ts is not None else np.full_like(xs_, np.nan))
 
-    skipped = 0
-    for xs, ys, ts, ns in zip(fixations.train_xs,
-                              fixations.train_ys,
-                              fixations.train_ts,
-                              fixations.train_ns):
-
-        f_sx, f_sy = sx[ns], sy[ns]                       # scalar
-        xs_ = np.clip(xs * f_sx, 0, tgt_w[ns]-1e-6)
-        ys_ = np.clip(ys * f_sy, 0, tgt_h[ns]-1e-6)
-
-        new_xs.append(xs_)
-        new_ys.append(ys_)
-
-        # ---------- timestamps ----------
-        if ts is None or len(ts)==0:
-            new_ts.append(np.full_like(xs_, np.nan))
-        else:
-            new_ts.append(np.asarray(ts, dtype=float))
-
-        # ---------- scan‑path history ----------
-        # history arrays are (n_fixations, 4, 2) in MIT1003; scale both coordinates
-        if hasattr(fixations, "x_hist"):
-            hist_x = np.clip(fixations.x_hist[skipped] * f_sx, 0, tgt_w[ns]-1e-6)
-            hist_y = np.clip(fixations.y_hist[skipped] * f_sy, 0, tgt_h[ns]-1e-6)
-            new_x_hist.append(hist_x)
-            new_y_hist.append(hist_y)
-
-        if hasattr(fixations, "durations"):
-            new_dur.append(fixations.durations[skipped].copy())
-
-        skipped += 1
-
-    # -------------- 3. assemble pysaliency.Scanpaths -----------------------
     scanpaths = pysaliency.Scanpaths(xs=new_xs, ys=new_ys, ts=new_ts,
-                                     n=fixations.train_ns,
-                                     scanpath_attributes={"subject": fixations.train_subjects})
-
-    # add optional arrays if we have them
-    if new_x_hist:  scanpaths.x_hist = new_x_hist
-    if new_y_hist:  scanpaths.y_hist = new_y_hist
-    if new_dur:     scanpaths.durations = new_dur
-
-    # -------------- 4. sanity‑check & return ------------------------------
-    xx = np.concatenate(new_xs)
-    yy = np.concatenate(new_ys)
-    assert (xx >= 0).all() and (yy >= 0).all(), "negative coords after scaling!"
-    assert (xx < tgt_w.max()).all() and (yy < tgt_h.max()).all(), "coords out of bounds!"
+                                     n=np.asarray(list(ns_iter)),
+                                     scanpath_attributes={})
 
     if is_master:
-        logger.info(f"✅ converted {len(scanpaths)} scan‑paths "
-                     f"({xx.size:,} fixations total)")
+        logger.info(f"✅ converted {len(scanpaths)} scan-paths "
+                    f"({sum(map(len,new_xs)):,} fixations total)")
 
     return pysaliency.ScanpathFixations(scanpaths=scanpaths)
