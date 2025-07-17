@@ -206,7 +206,7 @@ class ImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         # 1.  ensure LMDB handle for THIS worker
         if self.lmdb_env is None and self.lmdb_path is not None:
-            logger.info(f"[PID {os.getpid()}] opening LMDB → {self.lmdb_path}")
+           # logger.info(f"[PID {os.getpid()}] opening LMDB → {self.lmdb_path}")
             self.lmdb_env = self._open_lmdb_env()
 
         # 2.  cache fast-path
