@@ -578,7 +578,7 @@ def mit_spatial_dinogaze(args, device, is_master, is_distributed, dino_backbone_
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
     fixsel_net = FixationSelectionNetworkSPADEDynamic(
         saliency_channels=1,
-        scanpath_channels=16, # <-- KEEP THIS at 16, see explanation below
+        scanpath_channels=16,
         semantic_feature_channels_for_spade=semantic_path_channels
     )
     model_cpu = DinoGazeSpade(
