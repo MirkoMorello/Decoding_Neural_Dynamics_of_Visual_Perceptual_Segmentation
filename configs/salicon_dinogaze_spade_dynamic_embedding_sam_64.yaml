@@ -56,8 +56,10 @@ use_lmdb_images: true                  # Use LMDB for images
 
 # --- SALICON SAM Mask Paths ---
 # Option 1: Individual files for SALICON
-train_mask_subdir_name: 'salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
-val_mask_subdir_name: 'salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
+salicon_train_mask_dir: 'masks/salicon/train_sam64' # Subdir under segmentation_mask_dir for SALICON train
+salicon_val_mask_dir: 'masks/salicon/val_sam64'     # Subdir under segmentation_mask_dir for SALICON val
+
+
 # Option 2 & 3: Banks for SALICON (Example using variable banks)
 # train_mask_memmap_file: null # or './masks/salicon/banks/sam64/salicon_train_sam_64_fixed.npy'
 # val_mask_memmap_file: null   # or './masks/salicon/banks/sam64/salicon_val_sam_64_fixed.npy'
