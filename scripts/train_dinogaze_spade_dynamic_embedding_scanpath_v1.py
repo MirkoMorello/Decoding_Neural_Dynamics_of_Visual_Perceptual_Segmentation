@@ -399,7 +399,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
     fixsel_net = FixationSelectionNetworkSPADEDynamic(
         saliency_channels=1,
-        scanpath_channels=16, # <-- KEEP THIS at 16, see explanation below
+        scanpath_channels=16, 
         semantic_feature_channels_for_spade=semantic_path_channels
     )
     model_cpu = DinoGazeSpade(
@@ -432,7 +432,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     
     train_dataset = ImageDatasetWithSegmentation(
         train_stim, train_fix, centerbias,
-        lmdb_path=lmdb_path_train, # <--- PASS THE ARGUMENT
+        lmdb_path=lmdb_path_train, 
         segmentation_mask_variable_header_file = args.train_mask_variable_header_file,
         segmentation_mask_variable_payload_file = args.train_mask_variable_payload_file,
         segmentation_mask_dir=args.salicon_train_mask_dir,
@@ -442,7 +442,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     )
     val_dataset = ImageDatasetWithSegmentation(
         val_stim, val_fix, centerbias,
-        lmdb_path=lmdb_path_val, # <--- PASS THE ARGUMENT
+        lmdb_path=lmdb_path_val, 
         segmentation_mask_variable_header_file= args.val_mask_variable_header_file,
         segmentation_mask_variable_payload_file=args.val_mask_variable_payload_file,
         segmentation_mask_dir=args.salicon_val_mask_dir,

@@ -11,6 +11,8 @@ log_level: 'INFO'
 
 # --- Main Path Backbone (DenseNet) ---
 densenet_model_name: 'densenet201'
+num_workers: 8
+
 
 # --- Semantic Guidance Backbone (DINOv2) ---
 dino_model_name: 'dinov2_vitl14'      # ViT-Base. Good balance of speed and performance.
@@ -42,13 +44,14 @@ lr_milestones_mit_spatial: [15, 30]
 salicon_checkpoint_path: './experiments_hybrid_gaze_spade_sam_16/salicon_pretrain_hybrid_dinov2_vitl14_lr0.0005/final_best_val.pth'
 
 # --- Dataloading & System ---
-num_workers: 'auto'                     # 'auto' or integer
+#num_workers: 'auto'                     # 'auto' or integer
 train_dir: './experiments/experiments_hybrid_gaze_spade_sam_16' # Base output directory for experiments
 dataset_dir: './data/pysaliency_datasets'   # Where SALICON, MIT1003 etc. are stored
 lmdb_dir: './data/lmdb_caches_hybrid'       # Where LMDB caches for images will be stored
 finalizer_initial_sigma: 8.0
 finalizer_learn_sigma: true
 use_torch_compile: true                 # Highly recommended if using PyTorch 2.0+
+use_lmdb_images: true
 
 # ==============================================================================
 # --- MASK PATHS CONFIGURATION ---
