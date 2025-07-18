@@ -2,7 +2,7 @@
 """
 Multi-GPU-ready training script for DinoGaze with DINOv2 backbone,
 SPADE normalization, and dynamic semantic embeddings from segmentation masks.
-This script has SPADE layers in fixationselection network as well.
+This version includes scanpath network with spade layers
 """
 import os
 import sys
@@ -31,6 +31,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 import math
 
+from src.models.common.spade_layers import SPADELayerNormDynamic as SPADELayerNormDynamic
+from src.models.common.spade_layers import SaliencyNetworkSPADEDynamic as SaliencyNetworkSPADEDynamic
+from src.models.common.spade_layers import build_scanpath_network_spade_dynamic as build_scanpath_network_spade_dynamic
+
 import pysaliency
 import pysaliency.external_datasets.mit
 from pysaliency.dataset_config import train_split, validation_split
@@ -46,8 +50,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Tuple
-
-torch.set_float32_matmul_precision("medium") # 3090s support this, but not TITAN V
 
 
 
@@ -66,8 +68,7 @@ try:
         FixationMaskTransform,
         FixationDatasetWithSegmentation,
         convert_stimuli as convert_stimuli_mit,
-        convert_fixation_trains as convert_fixation_trains_mit,
-        safe_precompute_sizes
+        convert_fixation_trains as convert_fixation_trains_mit
     )
     from src.dinov2_backbone import DinoV2Backbone
     from src.modules import Finalizer, build_fixation_selection_network, build_scanpath_network, encode_scanpath_features 
@@ -88,10 +89,10 @@ def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
     is_distributed = world_size > 1
     if is_distributed:
         # Set a generous timeout to accommodate the long baseline calculation on rank 0
-        timeout = datetime.timedelta(hours=3)
+        timeout = datetime.timedelta(hours=2) # 2 hours
         
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout) # <--- THIS LINE IS MODIFIED
         
         device = torch.device(f"cuda:{local_rank}")
         is_master = rank == 0
@@ -104,114 +105,7 @@ def init_distributed() -> tuple[torch.device, int, int, bool, bool]:
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
-        
 
-class FixationSelectionNetworkSPADEDynamic(nn.Module):
-    """
-    Builds the final network that combines saliency and scanpath features,
-    and then applies SPADE modulation to the merged representation.
-    """
-    def __init__(self, saliency_channels, scanpath_channels, semantic_feature_channels_for_spade):
-        super().__init__()
-        # Total channels after concatenating the two input streams
-        concatenated_channels = saliency_channels + scanpath_channels
-        
-        # First, a convolution to merge the concatenated features and project them.
-        # This allows the model to learn a good initial combination.
-        self.conv_merge = nn.Conv2d(concatenated_channels, 128, (1, 1), bias=False)
-        self.bias_merge = Bias(128)
-        self.softplus_merge = nn.Softplus()
-
-        # Now, apply SPADE modulation to the merged representation
-        self.spade_ln1 = SPADELayerNormDynamic(128, semantic_feature_channels_for_spade)
-        
-        # Subsequent layers process the modulated features
-        self.conv1 = nn.Conv2d(128, 16, (1, 1), bias=False)
-        self.bias1 = Bias(16)
-        self.softplus1 = nn.Softplus()
-        
-        self.spade_ln2 = SPADELayerNormDynamic(16, semantic_feature_channels_for_spade)
-        
-        self.conv2 = nn.Conv2d(16, 1, (1, 1), bias=False) # Final output layer
-
-    def forward(self, input_tuple, painted_semantic_map):
-        """
-        Args:
-            input_tuple (tuple): A tuple containing (saliency_output, scanpath_output).
-            painted_semantic_map (torch.Tensor): The semantic map for SPADE modulation.
-        """
-        saliency_out, scanpath_out = input_tuple
-        
-        # Concatenate the two feature streams along the channel dimension
-        h = torch.cat([saliency_out, scanpath_out], dim=1)
-        
-        # Process through the network
-        h = self.conv_merge(h)
-        h = self.bias_merge(h)
-        h = self.softplus_merge(h)
-        
-        h = self.spade_ln1(h, painted_semantic_map)
-        
-        h = self.conv1(h)
-        h = self.bias1(h)
-        h = self.softplus1(h)
-
-        h = self.spade_ln2(h, painted_semantic_map)
-
-        h = self.conv2(h)
-        
-        return h
-
-class SPADELayerNormDynamic(nn.Module):
-    def __init__(self, norm_features, semantic_feature_channels,
-                 hidden_mlp_channels=128, eps=1e-12, kernel_size=3):
-        super().__init__()
-        self.norm_features = norm_features
-        self.eps = eps
-        self.semantic_feature_channels = semantic_feature_channels
-        padding = kernel_size // 2
-        self.mlp_shared = nn.Sequential(
-            nn.Conv2d(self.semantic_feature_channels, hidden_mlp_channels,
-                      kernel_size=kernel_size, padding=padding, bias=True),
-            nn.ReLU(inplace=True)
-        )
-        self.mlp_gamma = nn.Conv2d(hidden_mlp_channels, norm_features,
-                                   kernel_size=kernel_size, padding=padding, bias=True)
-        self.mlp_beta = nn.Conv2d(hidden_mlp_channels, norm_features,
-                                  kernel_size=kernel_size, padding=padding, bias=True)
-
-    def forward(self, x, painted_semantic_map):
-        normalized_shape = (self.norm_features, x.size(2), x.size(3))
-        normalized_x = F.layer_norm(x, normalized_shape, weight=None, bias=None, eps=self.eps)
-        semantic_map_resized = F.interpolate(painted_semantic_map, size=x.size()[2:], mode='bilinear', align_corners=False)
-        shared_features = self.mlp_shared(semantic_map_resized)
-        gamma_map = self.mlp_gamma(shared_features)
-        beta_map = self.mlp_beta(shared_features)
-        out = normalized_x * (1 + gamma_map) + beta_map
-        return out
-
-class SaliencyNetworkSPADEDynamic(nn.Module):
-    def __init__(self, input_channels_main_path, semantic_feature_channels_for_spade):
-        super().__init__()
-        self.spade_ln0 = SPADELayerNormDynamic(input_channels_main_path, semantic_feature_channels_for_spade)
-        self.conv0 = nn.Conv2d(input_channels_main_path, 8, (1, 1), bias=False)
-        self.bias0 = Bias(8); self.softplus0 = nn.Softplus()
-        self.spade_ln1 = SPADELayerNormDynamic(8, semantic_feature_channels_for_spade)
-        self.conv1 = nn.Conv2d(8, 16, (1, 1), bias=False)
-        self.bias1 = Bias(16); self.softplus1 = nn.Softplus()
-        self.spade_ln2 = SPADELayerNormDynamic(16, semantic_feature_channels_for_spade)
-        self.conv2 = nn.Conv2d(16, 1, (1, 1), bias=False)
-        self.bias2 = Bias(1); self.softplus2 = nn.Softplus()
-
-    def forward(self, x_main_path, painted_semantic_map):
-        h = x_main_path
-        h = self.spade_ln0(h, painted_semantic_map)
-        h = self.conv0(h); h = self.bias0(h); h = self.softplus0(h)
-        h = self.spade_ln1(h, painted_semantic_map)
-        h = self.conv1(h); h = self.bias1(h); h = self.softplus1(h)
-        h = self.spade_ln2(h, painted_semantic_map)
-        h = self.conv2(h); h = self.bias2(h); h = self.softplus2(h)
-        return h
 
 class DinoGazeSpade(nn.Module):
     def __init__(self, features_module: DinoV2Backbone,
@@ -263,85 +157,67 @@ class DinoGazeSpade(nn.Module):
         return painted_flat.view(B, H_img, W_img, C_dino).permute(0, 3, 1, 2)
 
     def forward(self, image, centerbias, scanpath_features=None, x_hist=None, y_hist=None, durations=None, **kwargs):
-            """
-            Processes an input image and scanpath history to produce a saliency log-density map.
+        """
+        Processes an input image and scanpath history to produce a saliency log-density map.
+        This version uses the "shim" approach to be compatible with the old network logic.
+        """
+        segmentation_mask = kwargs.get('segmentation_mask', None)
+        if segmentation_mask is None:
+            raise ValueError(f"{self.__class__.__name__} requires 'segmentation_mask' in its input.")
 
-            This robust version ensures architectural consistency across all training stages
-            (spatial-only and scanpath) by always providing a valid tensor for the scanpath
-            path, enabling the use of a consistent fixation selection network.
-            """
-            segmentation_mask = kwargs.get('segmentation_mask', None)
-            if segmentation_mask is None:
-                raise ValueError(f"{self.__class__.__name__} requires 'segmentation_mask' in its input.")
+        orig_img_shape_hw = image.shape[2:]
 
-            # --- 1. Backbone Feature Extraction ---
-            orig_img_shape_hw = image.shape[2:]
-            with torch.no_grad():
-                extracted_feature_maps = self.features(image)
+        with torch.no_grad():
+            extracted_feature_maps = self.features(image)
 
-            # --- 2. Prepare Features and Semantic Map ---
-            readout_h = math.ceil(orig_img_shape_hw[0] / self.readout_factor)
-            readout_w = math.ceil(orig_img_shape_hw[1] / self.readout_factor)
-            readout_spatial_shape = (readout_h, readout_w)
+        readout_h = math.ceil(orig_img_shape_hw[0] / self.readout_factor)
+        readout_w = math.ceil(orig_img_shape_hw[1] / self.readout_factor)
+        readout_spatial_shape = (readout_h, readout_w)
 
-            processed_features_list = [
-                F.interpolate(feat_map, size=readout_spatial_shape, mode='bilinear', align_corners=False)
-                for feat_map in extracted_feature_maps
-            ]
-            concatenated_backbone_features = torch.cat(processed_features_list, dim=1)
+        processed_features_list = [
+            F.interpolate(feat_map, size=readout_spatial_shape, mode='bilinear', align_corners=False)
+            for feat_map in extracted_feature_maps
+        ]
+        concatenated_backbone_features = torch.cat(processed_features_list, dim=1)
 
-            F_semantic_patches_from_dino = extracted_feature_maps[self.semantic_feature_layer_idx]
-            S_painted_map_full_res = self._create_painted_semantic_map_vectorized(F_semantic_patches_from_dino, segmentation_mask)
+        F_semantic_patches_from_dino = extracted_feature_maps[self.semantic_feature_layer_idx]
+        S_painted_map_full_res = self._create_painted_semantic_map_vectorized(F_semantic_patches_from_dino, segmentation_mask)
 
-            # --- 3. Saliency Head Processing (SPADE-modulated) ---
-            saliency_path_output = self.saliency_network(concatenated_backbone_features, S_painted_map_full_res)
-            
-            # --- 4. Unified Scanpath Head Processing (SPADE-modulated) ---
-            # This block now handles all cases: spatial stages, first fixation, and subsequent fixations.
-            
-            # Get shape and device from a tensor that is always present
-            B, _, H, W = saliency_path_output.shape
-            device = saliency_path_output.device
-            
-            # The output of the scanpath network is hardcoded to 16 channels. This should be a class property
-            # or derived from the network itself, but for now, this is consistent with the architecture.
-            scanpath_output_channels = 16 
-
-            # Check if we are in a scanpath stage AND have a valid history to process
-            if self.scanpath_network is not None and x_hist is not None and y_hist is not None and x_hist.numel() > 0:
-                # History exists: encode it and pass it through the scanpath network
-                scanpath_input_tensor = encode_scanpath_features(
+        saliency_path_output = self.saliency_network(concatenated_backbone_features, S_painted_map_full_res)
+        
+        # --- Start of Scanpath Logic ---
+        scanpath_path_output = None # Initialize
+        
+        if self.scanpath_network is not None:
+            if x_hist is not None and y_hist is not None and x_hist.numel() > 0:
+                scanpath_tensor = encode_scanpath_features(
                     x_hist, y_hist,
                     size=orig_img_shape_hw,
-                    device=device
+                    device=image.device,
                 )
-                scanpath_input_tensor = F.interpolate(
-                    scanpath_input_tensor, 
-                    size=(H, W), # Use the determined readout spatial shape
-                    mode='bilinear', 
-                    align_corners=False
+                scanpath_tensor = F.interpolate(
+                    scanpath_tensor,
+                    size=saliency_path_output.shape[2:],
+                    mode='bilinear',
+                    align_corners=False,
                 )
-                # Pass both the scanpath features and the semantic map for SPADE modulation
-                scanpath_path_output = self.scanpath_network(scanpath_input_tensor)
-
+                scanpath_path_output = self.scanpath_network(
+                    scanpath_tensor,
+                    S_painted_map_full_res,   # <-- semantic conditioning
+                )
             else:
-                # SHIM: Handles spatial-only stages (where self.scanpath_network is None) OR
-                # the first fixation of a scanpath sequence (where x_hist is empty).
-                # Create a zero-tensor with the expected shape for the scanpath path.
-                scanpath_path_output = torch.zeros(B, scanpath_output_channels, H, W, device=device)
-            
-            # --- 5. Final Fixation Selection (SPADE-modulated) ---
-            # The input is now always a tuple of two valid tensors, making the architecture consistent.
-            combined_input_for_fixsel = (saliency_path_output, scanpath_path_output)
-            
-            # The fixation selection network also receives the semantic map for its own SPADE layers.
-            final_readout_before_finalizer = self.fixation_selection_network(combined_input_for_fixsel, S_painted_map_full_res)
-            
-            # --- 6. Finalizer and Log-Density Calculation ---
-            saliency_log_density = self.finalizer(final_readout_before_finalizer, centerbias)
-            
-            return saliency_log_density
+                B, _, H, W = saliency_path_output.shape
+                scanpath_path_output = torch.zeros(B, 16, H, W, device=image.device)
+        
+        # --- End of Scanpath Logic ---
 
+        # The input is now always a tuple of two tensors, (tensor, zero_tensor), never (tensor, None)
+        combined_input_for_fixsel = (saliency_path_output, scanpath_path_output)
+        final_readout_before_finalizer = self.fixation_selection_network(combined_input_for_fixsel)
+        
+        saliency_log_density = self.finalizer(final_readout_before_finalizer, centerbias)
+        
+        return saliency_log_density
 
 #==================================
 # SALICON PRE-TRAINING
@@ -397,11 +273,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     
         # 3. Build Model
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
-    fixsel_net = FixationSelectionNetworkSPADEDynamic(
-        saliency_channels=1,
-        scanpath_channels=16, 
-        semantic_feature_channels_for_spade=semantic_path_channels
-    )
+    fixsel_net  = build_fixation_selection_network(scanpath_features=0) # 0 for spatial only
     model_cpu = DinoGazeSpade(
         features_module=dino_backbone_cpu,
         saliency_network=saliency_net,
@@ -419,7 +291,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     if is_master: _logger.info("[Compat] Ensured DINO backbone is frozen and in eval() mode.")
 
     model = model_cpu.to(device)
-    if is_distributed: model = DDP(model, device_ids=[device.index], find_unused_parameters=True)
+    if is_distributed: model = DDP(model, device_ids=[device.index], find_unused_parameters=False)
     if args.use_torch_compile: model = torch.compile(model)
     
     # Re-create the centerbias object for the dataloader on all processes
@@ -432,9 +304,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     
     train_dataset = ImageDatasetWithSegmentation(
         train_stim, train_fix, centerbias,
-        lmdb_path=lmdb_path_train, 
-        segmentation_mask_variable_header_file = args.train_mask_variable_header_file,
-        segmentation_mask_variable_payload_file = args.train_mask_variable_payload_file,
+        lmdb_path=lmdb_path_train, # <--- PASS THE ARGUMENT
         segmentation_mask_dir=args.salicon_train_mask_dir,
         transform=FixationMaskTransform(sparse=False),
         segmentation_mask_format='png',
@@ -442,9 +312,7 @@ def salicon_pretrain_dinogaze(args, device, is_master, is_distributed, dino_back
     )
     val_dataset = ImageDatasetWithSegmentation(
         val_stim, val_fix, centerbias,
-        lmdb_path=lmdb_path_val, 
-        segmentation_mask_variable_header_file= args.val_mask_variable_header_file,
-        segmentation_mask_variable_payload_file=args.val_mask_variable_payload_file,
+        lmdb_path=lmdb_path_val, # <--- PASS THE ARGUMENT
         segmentation_mask_dir=args.salicon_val_mask_dir,
         transform=FixationMaskTransform(sparse=False),
         segmentation_mask_format='png',
@@ -505,14 +373,11 @@ def get_mit_data_and_preprocess(args, is_master, is_distributed, device):
             stimuli_resized = cpickle.load(f)
     else:
         if is_master: _logger.info("Converting MIT stimuli (resizing images)...")
-        stimuli_resized = convert_stimuli_mit(stimuli_orig, mit_converted_data_path, is_master, is_distributed, device, _logger, save_format="png")
+        stimuli_resized = convert_stimuli_mit(stimuli_orig, mit_converted_data_path, is_master, is_distributed, device, _logger)
         if is_master:
             with atomic_save(str(stimuli_cache), text_mode=False, overwrite_part=True) as f:
                 cpickle.dump(stimuli_resized, f)
         if is_distributed: dist.barrier()
-    
-    safe_precompute_sizes(stimuli_resized)
-
 
     # --- Step 3: Convert FIXATIONS  ---
     if scanpaths_cache.exists() and scanpaths_cache.stat().st_size > 0:
@@ -521,6 +386,7 @@ def get_mit_data_and_preprocess(args, is_master, is_distributed, device):
             fixations_processed = cpickle.load(f)
     else:
         if is_master: _logger.info("Converting MIT fixation trains...")
+        # REPLICATE OLD SCRIPT BEHAVIOR: Use original stimuli for fixation conversion
         fixations_processed = convert_fixation_trains_mit(stimuli_orig, fixations_orig, is_master, _logger)
         if is_master:
             with atomic_save(str(scanpaths_cache), text_mode=False, overwrite_part=True) as f:
@@ -575,11 +441,7 @@ def mit_spatial_dinogaze(args, device, is_master, is_distributed, dino_backbone_
     
     # 3. Build Model
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
-    fixsel_net = FixationSelectionNetworkSPADEDynamic(
-        saliency_channels=1,
-        scanpath_channels=16,
-        semantic_feature_channels_for_spade=semantic_path_channels
-    )
+    fixsel_net  = build_fixation_selection_network(scanpath_features=0)
     model_cpu = DinoGazeSpade(
         features_module=dino_backbone_cpu,
         saliency_network=saliency_net,
@@ -702,12 +564,10 @@ def mit_scanpath_dinogaze(args, device, is_master, is_distributed, dino_backbone
     
     # 3. Build model
     saliency_net = SaliencyNetworkSPADEDynamic(main_path_channels, semantic_path_channels)
-    scanpath_net = build_scanpath_network()
-    fixsel_net = FixationSelectionNetworkSPADEDynamic(
-        saliency_channels=1,  # Output of saliency_network is 1 channel
-        scanpath_channels=16, # Output of scanpath_network is 16 channels
-        semantic_feature_channels_for_spade=semantic_path_channels
+    scanpath_net = build_scanpath_network_spade_dynamic(
+    backbone=dino_backbone_cpu,               # auto-selects 1024 for ViT-L/14
     )
+    fixsel_net = build_fixation_selection_network(scanpath_features=16) # 16 is output of scanpath_network
     model_cpu = DinoGazeSpade(
         features_module=dino_backbone_cpu, saliency_network=saliency_net, fixation_selection_network=fixsel_net,
         scanpath_network=scanpath_net, semantic_feature_layer_idx=args.dino_semantic_feature_layer_idx,
