@@ -1,0 +1,22 @@
+stage:
+  name: "salicon_pretrain_deepgaze3" # For output directory
+  model_key: "deepgaze3_original"    # Registered in src/models/deepgaze3.py
+  dataset_key: "SALICON"             # Registered in src/data/salicon.py
+  
+  # Hyperparameters for this stage
+  lr: 0.001
+  milestones: [15, 30, 45, 60]
+  batch_size: 8
+  
+  # Model-specific config passed to the builder
+  extra:
+    downsample: 1.5
+    requires_segmentation: false # DeepGazeIII does not need masks
+
+compile: true
+seed: 42
+num_workers: 8
+
+paths:
+  dataset_dir: "./data/pysaliency_datasets"
+  train_dir: "./experiments"

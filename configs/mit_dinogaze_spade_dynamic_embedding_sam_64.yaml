@@ -46,8 +46,8 @@ dataset_dir: './data/pysaliency_datasets' # Where SALICON, MIT1003 etc. are stor
 lmdb_dir: './data/lmdb_caches/dinogaze_spade_dynamic_sam' # Where LMDB caches for images will be stored
 use_lmdb_images: true                  # Use LMDB for images
 
-salicon_checkpoint_path: './experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1/salicon_pretraining_dino_dinov2_vitl14_lr0.0001/step-0005.pth'
-finetune_checkpoint_path: './experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1/salicon_pretraining_dino_dinov2_vitl14_lr0.0001/step-0005.pth'
+salicon_checkpoint_path: 'experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1/salicon_pretraining_dino_dinov2_vitl14_lr0.0001/step-0002.pth'
+finetune_checkpoint_path: 'experiments/dinogaze_spade_dynamic_sam64_vitl14_scanpath_v1/salicon_pretraining_dino_dinov2_vitl14_lr0.0001/step-0002.pth'
 
 # ==============================================================================
 # --- SAM Mask Paths Configuration ---
