@@ -71,7 +71,8 @@ def _fix_seed(seed: int) -> None:
 
 @_dc.dataclass
 class StageCfg:
-    name: str                              # e.g. "salicon_pretrain"
+    kind: str
+    name: str                              # folder name; can default to kind
     model_key: str                         # registry key
     dataset_key: str                       # registry key
 
@@ -91,6 +92,7 @@ class RunCfg:
     stage: StageCfg
     compile: bool = False
     seed: int = 123
+    num_workers: int | str = 'auto'
 
     # paths
     paths: Dict[str, Path] = _dc.field(default_factory=lambda: {
@@ -289,20 +291,25 @@ def _load_cfg(path: str) -> RunCfg:
     # --- Stage ---------------------------------------------------------
     stage_raw = raw.get("stage", {})
     stage_cfg = StageCfg(
-        name=stage_raw["name"],
-        model_key=stage_raw["model_key"],
-        dataset_key=stage_raw["dataset_key"],
-        lr=stage_raw.get("lr", 5e-4),
-        milestones=tuple(stage_raw.get("milestones", ())),
-        batch_size=stage_raw.get("batch_size", 8),
-        grad_acc_steps=stage_raw.get("grad_acc_steps", 1),
-        min_lr=stage_raw.get("min_lr", 1e-7),
-        val_every=stage_raw.get("val_every", 1),
-        resume_ckpt=stage_raw.get("resume_ckpt"),
+            kind        = stage_raw["kind"],
+            name        = stage_raw.get("name", stage_raw["kind"]),
+            model_key   = stage_raw["model_key"],
+            dataset_key = stage_raw["dataset_key"],
+            lr = stage_raw.get("lr", 5e-4),
+            milestones = tuple(stage_raw.get("milestones", ())),
+            batch_size = stage_raw.get("batch_size", 8),
+            grad_acc_steps = stage_raw.get("grad_acc_steps", 1),
+            min_lr = stage_raw.get("min_lr", 1e-7),
+            val_every = stage_raw.get("val_every", 1),
+            resume_ckpt = stage_raw.get("resume_ckpt"),
     )
     paths = {k: Path(v) for k, v in raw.get("paths", {}).items()}
 
-    cfg = RunCfg(stage=stage_cfg, compile=raw.get("compile", False), seed=raw.get("seed", 123), paths=paths)
+    cfg = RunCfg(stage=stage_cfg,
+                compile=raw.get("compile", False),
+                seed=raw.get("seed", 123),
+                paths=paths,
+                num_workers=raw.get("num_workers", 'auto'))
     return cfg
 
 # -----------------------------------------------------------------------------
@@ -320,6 +327,22 @@ if __name__ == "__main__":
     # apply CLI overrides
     for k, v in overrides.items():
         _deep_set(cfg, k, v)
+        
+    # Resolve 'auto' for num_workers into an integer
+    if isinstance(cfg.num_workers, str) and cfg.num_workers.lower() == 'auto':
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        try:
+            # Get the number of available CPUs for this process
+            cpu_count = len(os.sched_getaffinity(0))
+        except AttributeError:
+            cpu_count = os.cpu_count() or 1
+        
+        # Calculate workers per process, with a reasonable cap (e.g., 8)
+        workers_per_process = min(8, cpu_count // world_size if world_size > 0 else cpu_count)
+        cfg.num_workers = workers_per_process
+    else:
+        # Ensure it's an integer if not 'auto'
+        cfg.num_workers = int(cfg.num_workers)
 
     # ensure working dirs
     if cfg.paths["train_dir"]:
