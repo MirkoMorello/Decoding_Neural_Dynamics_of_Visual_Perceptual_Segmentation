@@ -1013,20 +1013,27 @@ def _train(this_directory, model,
         if best_val_epoch_num_final > 0:
             best_epoch_ckpt_path_final = output_dir_path / f'step-{best_val_epoch_num_final:04d}.pth'
             if best_epoch_ckpt_path_final.exists():
-                final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
+                # The new, predictable name for the best checkpoint
+                final_best_val_path = output_dir_path / 'final_best_val.pth' 
+                
                 try:
-                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu', weights_only=False)
-                    if 'model' in best_ckpt_data:
-                        torch.save(best_ckpt_data['model'], str(final_best_val_model_path))
-                        logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}) to {final_best_val_model_path}")
-                    else:
-                        torch.save(best_ckpt_data, str(final_best_val_model_path))
-                        logger.info(f"Saved BEST validation model state_dict (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}, from raw state_dict) to {final_best_val_model_path}")
+                    # Simply copy the entire file
+                    import shutil
+                    shutil.copy(str(best_epoch_ckpt_path_final), str(final_best_val_path))
+                    logger.info(f"Copied BEST validation checkpoint (Epoch {best_val_epoch_num_final}, {validation_metric}: {best_val_score_final:.4f}) to {final_best_val_path}")
+                    
+                    # Also save the model-only state for easy inference later
+                    final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
+                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu')
+                    model_state_dict_to_save = _extract_model_state_dict_from_checkpoint(best_ckpt_data, logger)
+                    if model_state_dict_to_save:
+                        torch.save(model_state_dict_to_save, str(final_best_val_model_path))
+                        logger.info(f"Saved BEST validation model state_dict for inference to {final_best_val_model_path}")
 
                 except Exception as e_best_save:
-                    logger.error(f"Failed to save/copy best validation model from {best_epoch_ckpt_path_final}: {e_best_save}", exc_info=True)
+                    logger.error(f"Failed to copy/save best validation checkpoint from {best_epoch_ckpt_path_final}: {e_best_save}", exc_info=True)
             else:
-                logger.warning(f"Best validation checkpoint file {best_epoch_ckpt_path_final} not found. Cannot save 'final_best_val_model.pth'.")
+                logger.warning(f"Best validation checkpoint file {best_epoch_ckpt_path_final} not found. Cannot save final best checkpoint.")
         else:
             logger.warning(f"No best validation epoch found in progress log for metric '{validation_metric}'.")
 
