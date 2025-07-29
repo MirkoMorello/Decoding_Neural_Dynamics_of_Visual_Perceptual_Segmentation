@@ -302,6 +302,8 @@ def _load_cfg(path: str) -> RunCfg:
             min_lr = stage_raw.get("min_lr", 1e-7),
             val_every = stage_raw.get("val_every", 1),
             resume_ckpt = stage_raw.get("resume_ckpt"),
+            extra       = stage_raw.get("extra", {}),
+
     )
     paths = {k: Path(v) for k, v in raw.get("paths", {}).items()}
 
@@ -349,4 +351,4 @@ if __name__ == "__main__":
         cfg.paths["train_dir"].mkdir(parents=True, exist_ok=True)
 
     train_stage(cfg)
- 
+    
