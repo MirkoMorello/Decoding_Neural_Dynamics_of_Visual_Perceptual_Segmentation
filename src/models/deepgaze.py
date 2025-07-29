@@ -1,4 +1,3 @@
-# src/models/deepgaze3.py
 """
 Model definition and builder for the original DeepGazeIII model.
 
@@ -7,6 +6,7 @@ convolutional heads for saliency and scanpath processing. It does not use
 any form of SPADE normalization.
 """
 from collections import OrderedDict
+import logging
 import torch
 import torch.nn as nn
 
@@ -17,16 +17,15 @@ from src.layers import (
     Conv2dMultiInput, FlexibleScanpathHistoryEncoding
 )
 
-# Import the DenseNet backbone
 try:
     from DeepGaze.deepgaze_pytorch.features.densenet import RGBDenseNet201
 except ImportError:
-    raise ImportError("The 'DeepGaze' library is required.")
+    raise ImportError("The 'DeepGaze' library is required for the DeepGazeIII model.")
 
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # 1. COMPONENT BUILDER FUNCTIONS
-#    (Moved directly from the original training script for encapsulation)
 # =============================================================================
 
 def _build_saliency_network(input_channels: int) -> nn.Module:
@@ -46,11 +45,11 @@ def _build_saliency_network(input_channels: int) -> nn.Module:
         ('softplus2', nn.Softplus()),
     ]))
 
-def _build_scanpath_network() -> nn.Module:
-    """Builds the standard scanpath processing head."""
+def _build_scanpath_network(in_fixations: int) -> nn.Module:
+    """Builds the scanpath processing head, configurable by history length."""
     return nn.Sequential(OrderedDict([
         ('encoding0', FlexibleScanpathHistoryEncoding(
-            in_fixations=4, channels_per_fixation=3,
+            in_fixations=in_fixations, channels_per_fixation=3,
             out_channels=128, kernel_size=(1, 1), bias=True)
         ),
         ('softplus0', nn.Softplus()),
@@ -60,10 +59,9 @@ def _build_scanpath_network() -> nn.Module:
         ('softplus1', nn.Softplus()),
     ]))
 
-def _build_fixation_selection_network(scanpath_features: int = 16) -> nn.Module:
+def _build_fixation_selection_network(scanpath_features: int) -> nn.Module:
     """Builds the network that combines saliency and scanpath features."""
     saliency_channels = 1
-    # Handle the case where there is no scanpath input
     in_channels_list = [saliency_channels]
     if scanpath_features > 0:
         in_channels_list.append(scanpath_features)
@@ -89,8 +87,10 @@ def _build_fixation_selection_network(scanpath_features: int = 16) -> nn.Module:
 def build(cfg):
     """
     Builds the complete original DeepGazeIII model from a configuration object.
+    Architecture and freezing are controlled by explicit flags in `cfg.stage.extra`.
     """
-    extra_params = cfg.stage.extra or {}
+    extra = cfg.stage.extra
+    logger.info("Building DeepGazeIII model with configuration: %s", extra)
     
     # 1. Build the frozen DenseNet-201 backbone
     densenet_base = RGBDenseNet201()
@@ -103,24 +103,27 @@ def build(cfg):
     for param in features_module.parameters():
         param.requires_grad = False
     features_module.eval()
-
-    # The number of input channels for DenseNet-201 with these hooks is fixed at 2048.
-    saliency_network_input_channels = 2048
     
-    # 2. Build the network heads based on the stage configuration
-    saliency_net = _build_saliency_network(saliency_network_input_channels)
+    # 2. Build the network heads based on explicit config flags
+    saliency_net = _build_saliency_network(input_channels=2048)
 
     scanpath_net = None
     fixsel_net = None
-    included_fixations = []
-    
-    if "scanpath" in cfg.stage.name:
-        scanpath_net = _build_scanpath_network()
+    included_fixations = extra.get("included_fixations") # Get history list
+
+    if extra.get("is_scanpath_stage", False):
+        if not included_fixations:
+            raise ValueError("'is_scanpath_stage' is true, but 'included_fixations' is not defined in config.stage.extra.")
+        
+        logger.info("  - Building in SCANPATH mode.")
+        scanpath_net = _build_scanpath_network(in_fixations=len(included_fixations))
         fixsel_net = _build_fixation_selection_network(scanpath_features=16)
-        included_fixations = [-1, -2, -3, -4]
     else:
-        # For spatial-only stages
+        logger.info("  - Building in SPATIAL-ONLY mode.")
         fixsel_net = _build_fixation_selection_network(scanpath_features=0)
+        if included_fixations:
+            logger.warning("  - 'included_fixations' is set but 'is_scanpath_stage' is false. History will not be used.")
+            included_fixations = None # Ensure it's None for the model
 
     # 3. Assemble the final DeepGazeIII model
     model = DeepGazeIII(
@@ -128,15 +131,15 @@ def build(cfg):
         saliency_network=saliency_net,
         scanpath_network=scanpath_net,
         fixation_selection_network=fixsel_net,
-        downsample=extra_params.get("downsample", 2.0),
-        readout_factor=4,  # Constant for this architecture
-        saliency_map_factor=4, # Constant for this architecture
+        downsample=extra.get("downsample", 1.0),
+        readout_factor=4,
+        saliency_map_factor=4,
         included_fixations=included_fixations
     )
 
-    # 4. Apply stage-specific logic, like freezing parts of the head
-    if "frozen" in cfg.stage.name:
-        # Freeze the initial layers of the saliency network for the 'mit_scanpath_frozen' stage
+    # 4. Apply stage-specific freezing based on an explicit config flag
+    if extra.get("freeze_saliency_network", False):
+        logger.info("  - Freezing saliency network as per 'freeze_saliency_network: true'.")
         frozen_scopes = [
             "saliency_network.layernorm0", "saliency_network.conv0", "saliency_network.bias0",
             "saliency_network.layernorm1", "saliency_network.conv1", "saliency_network.bias1",
@@ -144,11 +147,10 @@ def build(cfg):
         for name, param in model.named_parameters():
             if any(name.startswith(scope) for scope in frozen_scopes):
                 param.requires_grad = False
-    
-    elif "full" in cfg.stage.name:
-        # For the 'full' stage, ensure all head parameters are trainable
+    else:
+        # For all other cases, ensure all head parameters are trainable by default.
+        logger.info("  - All head parameters are trainable (backbone remains frozen).")
         for name, param in model.named_parameters():
-            # The backbone is in a separate 'features' module, so this targets the heads.
             if not name.startswith('features.'):
                 param.requires_grad = True
     
