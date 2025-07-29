@@ -124,15 +124,29 @@ class ImageDataset(torch.utils.data.Dataset):
         self.average          = average
 
         # ----- LMDB bookkeeping (lazy-open later in __getitem__) -------
-        self.lmdb_path = (
-            Path(lmdb_path).expanduser().resolve() if lmdb_path else None
-        )
-        self.lmdb_env  = None            # each worker opens its own handle
+        self.lmdb_path = Path(lmdb_path).expanduser().resolve() if lmdb_path else None
+        self.lmdb_env  = None # Each worker opens its own handle
+
         if self.lmdb_path is not None:
             logger.info(f"  • LMDB path set to {self.lmdb_path} (lazy open)")
-            if not self.lmdb_path.exists():           # <-- NEW
-                from .data import _export_dataset_to_lmdb  # avoid circular import
-                _export_dataset_to_lmdb(self.stimuli, self.centerbias_model, self.lmdb_path)
+            
+            # Determine if we are in a distributed setting
+            is_distributed = dist.is_available() and dist.is_initialized()
+            is_master = dist.get_rank() == 0 if is_distributed else True
+
+            # Only the master process should ever create the cache
+            if is_master:
+                # The export function now handles checking and regeneration internally
+                _export_dataset_to_lmdb(
+                    stimuli=self.stimuli,
+                    centerbias_model=self.centerbias_model,
+                    lmdb_path=self.lmdb_path,
+                    logger=logger
+                )
+            
+            # ALL processes must wait here until the master has finished creating the cache
+            if is_distributed:
+                dist.barrier()
         else:
             logger.info("  • LMDB disabled (direct file reads)")
 
@@ -861,123 +875,74 @@ class ImageDatasetSampler(torch.utils.data.Sampler[list[int]]):
         return len(self.batches)
 
 
-def _export_dataset_to_lmdb(stimuli: pysaliency.FileStimuli, centerbias_model: pysaliency.Model, lmdb_path, write_frequency=100):
+def _export_dataset_to_lmdb(stimuli, centerbias_model, lmdb_path, logger, write_frequency=500):
     """
-    Checks if a valid LMDB database exists; if not, generates it. KISS version.
-
-    1. Checks if lmdb_path is a directory containing a valid LMDB with the correct item count.
-    2. If valid, prints a message and returns immediately.
-    3. If not valid (doesn't exist, not a dir, wrong count, corrupted),
-       it removes the existing path (if any) and generates the database from scratch.
+    Safely creates an LMDB cache. Checks for validity and regenerates if needed.
+    This function should only be called by the master process.
     """
-    lmdb_path_str = str(os.path.expanduser(lmdb_path))
+    lmdb_path = Path(lmdb_path)
     expected_count = len(stimuli)
-    is_valid_and_complete = False # Flag to track if we should skip generation
 
     # --- Phase 1: Check for existing valid LMDB ---
-    if os.path.isdir(lmdb_path_str):
-        db_check = None
+    if lmdb_path.exists():
         try:
-            # Attempt to open read-only to check metadata
-            db_check = lmdb.open(lmdb_path_str, subdir=True, readonly=True, lock=False)
-            with db_check.begin() as txn_check:
-                len_bytes = txn_check.get(b'__len__')
-                if len_bytes is not None:
-                    try:
-                        retrieved_count = int(len_bytes.decode('utf-8'))
-                        if retrieved_count == expected_count:
-                            # Valid and complete! Set the flag.
-                            is_valid_and_complete = True
-                        else:
-                            print(f"LMDB check: Count mismatch ({retrieved_count} vs {expected_count}). Needs regeneration.")
-                    except (ValueError, UnicodeDecodeError):
-                         print(f"LMDB check: Error decoding count. Needs regeneration.")
-                else:
-                     print("LMDB check: '__len__' key missing. Needs regeneration.")
+            with lmdb.open(str(lmdb_path), readonly=True, lock=False) as env_check:
+                with env_check.begin() as txn_check:
+                    count_bytes = txn_check.get(b'__count__')
+                    if count_bytes and int(count_bytes.decode()) == expected_count:
+                        logger.info(f"✅ Valid LMDB found at {lmdb_path} with {expected_count} items. Skipping creation.")
+                        return # Exit early if cache is valid
+        except (lmdb.Error, TypeError, ValueError) as e:
+            logger.warning(f"⚠️ Found existing but invalid LMDB at {lmdb_path} ({e}). Will regenerate.")
+    
+    # --- Phase 2: If we are here, we need to create the cache ---
+    logger.info(f"⏳ Creating LMDB cache for {expected_count} items at {lmdb_path}...")
+    if lmdb_path.exists():
+        logger.info(f"  - Removing old cache directory...")
+        shutil.rmtree(lmdb_path)
+    lmdb_path.mkdir(parents=True, exist_ok=True)
 
-            db_check.close() # Close the read-only handle
-
-        except lmdb.Error as e:
-            # Error opening/reading the existing DB
-            print(f"LMDB check: Could not open/read existing DB ({e}). Needs regeneration.")
-            if db_check: # Ensure handle is closed even on error
-                 try: db_check.close()
-                 except lmdb.Error: pass # Ignore close errors if already bad
-        # No need for further exception handling here, is_valid_and_complete remains False
-
-    # --- Phase 2: Return if valid, otherwise proceed to generate ---
-    if is_valid_and_complete:
-        print(f"Valid LMDB found at {lmdb_path_str} with {expected_count} items. Skipping generation.")
-        return # <<< EXIT EARLY
-
-    # --- Phase 3: Cleanup and Generation (Only runs if not returned early) ---
-    print(f"Regenerating LMDB at {lmdb_path_str}")
-
-    # --- Cleanup existing path ---
-    if os.path.lexists(lmdb_path_str): # Use lexists to handle broken symlinks too
-        print(f"Removing existing path: {lmdb_path_str}")
-        try:
-            if os.path.isdir(lmdb_path_str) and not os.path.islink(lmdb_path_str):
-                shutil.rmtree(lmdb_path_str)
-                # recreate the directory so LMDB can open it
-                os.makedirs(lmdb_path_str, exist_ok=True)
-
-            else: # It's a file or a symlink
-                 os.remove(lmdb_path_str)
-        except OSError as e:
-            print(f"Warning: Failed to remove existing path {lmdb_path_str}: {e}. Generation might fail.")
-            # Depending on the error, you might want to raise it here
-            # raise e
-
-    # --- Generate the database ---
-    os.makedirs(lmdb_path_str, exist_ok=True)
     db_write = None
     try:
-        # Open for writing. subdir=True creates the directory if needed.
-        db_write = lmdb.open(lmdb_path_str, subdir=True,
-                           map_size = 32 * 1024**3, readonly=False, # Adjust map_size if needed
-                           meminit=False, map_async=True)
+        db_write = lmdb.open(str(lmdb_path), map_size=32 * 1024**3, readonly=False, meminit=False, map_async=True)
+        written_count = 0
+        with db_write.begin(write=True) as txn:
+            for idx in tqdm(range(expected_count), desc="Writing LMDB", leave=False):
+                try:
+                    stimulus_path = stimuli.filenames[idx]
+                    image_arr = np.array(Image.open(stimulus_path).convert("RGB"))
+                    
+                    # Create payload
+                    image_chw_uint8 = image_arr.transpose(2, 0, 1)
+                    centerbias = centerbias_model.log_density(image_arr)
+                    payload = pickle.dumps({
+                        'image': image_chw_uint8,
+                        'centerbias': centerbias.astype(np.float32)
+                    })
+                    
+                    # Write to DB
+                    key = '{}'.format(idx).encode('ascii')
+                    txn.put(key, payload)
+                    written_count += 1
 
-        actual_written_count = 0
-        txn_write = db_write.begin(write=True)
-        try: # Wrap write loop for transaction handling
-            for idx, stimulus in enumerate(tqdm(stimuli, desc="Writing LMDB entries")):
-                key = u'{}'.format(idx).encode('ascii')
-                stimulus_filename = stimuli.filenames[idx] # Assumes FileStimuli
-                centerbias = centerbias_model.log_density(stimulus) # Calculate centerbias
-                encoded_data = _encode_filestimulus_item(stimulus_filename, centerbias)
-
-                if encoded_data is not None: # Handle potential encoding errors
-                    txn_write.put(key, encoded_data)
-                    actual_written_count += 1
-
-                # Commit periodically
-                if actual_written_count > 0 and actual_written_count % write_frequency == 0:
-                    txn_write.commit()
-                    txn_write = db_write.begin(write=True)
-
-            # Commit the final transaction
-            txn_write.commit()
-            txn_write = None # Mark transaction as finished
-
-            # Write metadata AFTER successful data commit
-            print(f"Writing metadata: count = {actual_written_count}")
-            with db_write.begin(write=True) as txn_meta:
-                 len_bytes_write = str(actual_written_count).encode('utf-8')
-                 txn_meta.put(b'__len__', len_bytes_write)
-
-        finally: # Ensure transaction is aborted if loop failed
-            if txn_write:
-                print("Aborting write transaction due to error.")
-                txn_write.abort()
+                except Exception as e:
+                    logger.error(f"  - Failed to process item {idx} ({stimuli.filenames[idx]}): {e}")
+                    continue
+            
+            # Write metadata
+            txn.put(b'__count__', str(written_count).encode('utf-8'))
+        logger.info(f"✅ LMDB cache created with {written_count} items.")
 
     except Exception as e:
-         print(f"!!! ERROR during LMDB generation: {e}")
-         # Optionally re-raise
-         # raise e
-    finally: # Ensure database is closed
+        logger.error(f"❌ CRITICAL ERROR during LMDB generation: {e}", exc_info=True)
+        # If creation fails, clean up the corrupted directory to force a rebuild next time
         if db_write:
-            print("Closing database.")
+            db_write.close()
+        if lmdb_path.exists():
+            shutil.rmtree(lmdb_path)
+        raise e # Re-raise the exception to stop the training run
+    finally:
+        if db_write:
             db_write.close()
 
 
@@ -1001,6 +966,11 @@ def _get_image_data_from_lmdb(lmdb_env, n):
     with lmdb_env.begin(write=False) as txn:
         byteflow = txn.get(key)
     
+    if byteflow is None:
+        raise KeyError(
+            f"Key '{key.decode()}' (stimulus index {n}) not found in LMDB at '{lmdb_env.path()}'. "
+            "The cache is likely corrupted or incomplete. "
+            "Please delete the directory and restart training to rebuild it.")
     data = pickle.loads(byteflow)
     
     # Non c'è più bisogno di decodificare o convertire, è già pronto
