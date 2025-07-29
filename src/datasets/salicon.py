@@ -22,26 +22,21 @@ def prepare_salicon(cfg, ddp_ctx, logger):
     global_paths = cfg.paths
     stage_extra = cfg.stage.extra
 
-    # --- CHANGE 1: Define and use salicon_loc correctly ---
-    # The root location for the raw SALICON dataset files.
     salicon_loc = global_paths["dataset_dir"] / 'SALICON'
     
     # 1. Download data (master only)
     if ddp_ctx.is_master:
         logger.info(f"Checking for SALICON data at: {salicon_loc}")
-        # The location passed to get_SALICON should be the parent of the 'SALICON' directory
         pysaliency.get_SALICON_train(location=str(salicon_loc.parent))
         pysaliency.get_SALICON_val(location=str(salicon_loc.parent))
     ddp_ctx.barrier()
 
-    # Load the data after ensuring it's present
     train_stim, train_fix = pysaliency.get_SALICON_train(location=str(salicon_loc.parent))
     val_stim, val_fix = pysaliency.get_SALICON_val(location=str(salicon_loc.parent))
 
     # 2. Calculate and broadcast baseline log-likelihood from a central cache
     train_ll, val_ll = None, None
     if ddp_ctx.is_master:
-        # Define and use the central baseline cache directory ---
         baseline_cache_dir = global_paths["dataset_dir"] / "SALICON_baseline_cache"
         baseline_cache_dir.mkdir(parents=True, exist_ok=True)
         train_ll_cache = baseline_cache_dir / 'salicon_baseline_train_ll.pkl'
@@ -51,26 +46,20 @@ def prepare_salicon(cfg, ddp_ctx, logger):
             stimuli=train_stim, fixations=train_fix,
             bandwidth=0.0217, eps=2e-13, caching=False
         )
-
         try:
-            with open(train_ll_cache, 'rb') as f:
-                train_ll = cpickle.load(f)
+            with open(train_ll_cache, 'rb') as f: train_ll = cpickle.load(f)
         except (FileNotFoundError, EOFError):
             logger.info("Calculating SALICON train baseline LL...")
             train_ll = centerbias.information_gain(train_stim, train_fix, average='image')
-            # Use atomic_save for safe writing in case of interruption
             with atomic_save(train_ll_cache, text_mode=False, overwrite_part=True) as f:
                 cpickle.dump(train_ll, f)
-
         try:
-            with open(val_ll_cache, 'rb') as f:
-                val_ll = cpickle.load(f)
+            with open(val_ll_cache, 'rb') as f: val_ll = cpickle.load(f)
         except (FileNotFoundError, EOFError):
             logger.info("Calculating SALICON validation baseline LL...")
             val_ll = centerbias.information_gain(val_stim, val_fix, average='image')
             with atomic_save(val_ll_cache, text_mode=False, overwrite_part=True) as f:
                 cpickle.dump(val_ll, f)
-
         logger.info(f"SALICON Baselines - Train LL: {train_ll:.4f}, Val LL: {val_ll:.4f}")
 
     ll_bcast = [train_ll, val_ll]
@@ -85,47 +74,70 @@ def prepare_salicon(cfg, ddp_ctx, logger):
         bandwidth=0.0217, eps=2e-13, caching=False
     )
 
-    lmdb_path_train = global_paths.get("lmdb_dir") / "salicon_train" if global_paths.get("lmdb_dir") else None
-    lmdb_path_val = global_paths.get("lmdb_dir") / "salicon_val" if global_paths.get("lmdb_dir") else None
-    
-    # This barrier isn't strictly necessary here but doesn't hurt.
-    # It ensures all processes wait for baselines before proceeding.
-    ddp_ctx.barrier()
-
+    # ==================== START OF NEW LOGIC ====================
     model_requires_segmentation = stage_extra.get("requires_segmentation", False)
-    DatasetClass = ImageDatasetWithSegmentation if model_requires_segmentation else ImageDataset
-
-    ds_kwargs = {
-        "transform": FixationMaskTransform(sparse=False),
-        "average": "image",
-    }
+    
+    # 1. Determine unique cache path based on mask usage
+    train_cache_suffix, val_cache_suffix = "", ""
+    train_mask_dir_rel, val_mask_dir_rel = None, None
     
     if model_requires_segmentation:
-        train_mask_rel_path = stage_extra.get('salicon_train_mask_dir')
-        val_mask_rel_path = stage_extra.get('salicon_val_mask_dir')
+        train_mask_dir_rel = stage_extra.get('salicon_train_mask_dir')
+        val_mask_dir_rel = stage_extra.get('salicon_val_mask_dir')
 
-        if not train_mask_rel_path or not val_mask_rel_path:
-            raise ValueError("Config for SALICON with segmentation requires 'salicon_train_mask_dir' and 'salicon_val_mask_dir' in stage.extra")
-        
-        train_mask_abs_path = PROJECT_ROOT / train_mask_rel_path
-        val_mask_abs_path = PROJECT_ROOT / val_mask_rel_path
-        
-        logger.info(f"Train masks path: {train_mask_abs_path}")
-        logger.info(f"Validation masks path: {val_mask_abs_path}")
+        # Create a unique suffix from the mask directory name itself
+        train_cache_suffix = f"_masks_{Path(train_mask_dir_rel).name}" if train_mask_dir_rel else "_with_dummy_masks"
+        val_cache_suffix = f"_masks_{Path(val_mask_dir_rel).name}" if val_mask_dir_rel else "_with_dummy_masks"
 
-        train_dataset = DatasetClass(train_stim, train_fix, centerbias_for_loader,
-                                     lmdb_path=str(lmdb_path_train) if lmdb_path_train else None,
-                                     segmentation_mask_dir=train_mask_abs_path, **ds_kwargs)
-        val_dataset = DatasetClass(val_stim, val_fix, centerbias_for_loader,
-                                   lmdb_path=str(lmdb_path_val) if lmdb_path_val else None,
-                                   segmentation_mask_dir=val_mask_abs_path, **ds_kwargs)
-    else:
-        train_dataset = DatasetClass(train_stim, train_fix, centerbias_for_loader,
-                                     lmdb_path=str(lmdb_path_train) if lmdb_path_train else None,
-                                     **ds_kwargs)
-        val_dataset = DatasetClass(val_stim, val_fix, centerbias_for_loader,
-                                   lmdb_path=str(lmdb_path_val) if lmdb_path_val else None,
-                                   **ds_kwargs)
+    lmdb_path_train = global_paths.get("lmdb_dir") / f"salicon_train{train_cache_suffix}" if global_paths.get("lmdb_dir") else None
+    lmdb_path_val = global_paths.get("lmdb_dir") / f"salicon_val{val_cache_suffix}" if global_paths.get("lmdb_dir") else None
+
+    # 2. Trigger DDP-safe cache creation on master process
+    if ddp_ctx.is_master:
+        if lmdb_path_train:
+            train_mask_dir_abs = PROJECT_ROOT / train_mask_dir_rel if train_mask_dir_rel else None
+            create_lmdb_cache_if_needed(
+                stimuli=train_stim,
+                centerbias_model=centerbias_for_loader,
+                lmdb_path=lmdb_path_train,
+                logger=logger,
+                segmentation_mask_dir=train_mask_dir_abs
+            )
+        if lmdb_path_val:
+            val_mask_dir_abs = PROJECT_ROOT / val_mask_dir_rel if val_mask_dir_rel else None
+            create_lmdb_cache_if_needed(
+                stimuli=val_stim,
+                centerbias_model=centerbias_for_loader, # Note: using train centerbias for val cache is usually acceptable
+                lmdb_path=lmdb_path_val,
+                logger=logger,
+                segmentation_mask_dir=val_mask_dir_abs
+            )
+    
+    if ddp_ctx.enabled:
+        ddp_ctx.barrier() # All processes wait for caches to be ready
+
+    # 3. Instantiate Dataset classes
+    DatasetClass = ImageDatasetWithSegmentation if model_requires_segmentation else ImageDataset
+    
+    train_ds_kwargs = {
+        "transform": FixationMaskTransform(sparse=False),
+        "average": "image",
+        "lmdb_path": str(lmdb_path_train) if lmdb_path_train else None
+    }
+    val_ds_kwargs = {
+        "transform": FixationMaskTransform(sparse=False),
+        "average": "image",
+        "lmdb_path": str(lmdb_path_val) if lmdb_path_val else None
+    }
+
+    if model_requires_segmentation:
+        # Pass the original mask dir for the fallback logic inside ImageDatasetWithSegmentation
+        train_ds_kwargs['segmentation_mask_dir'] = PROJECT_ROOT / train_mask_dir_rel if train_mask_dir_rel else None
+        val_ds_kwargs['segmentation_mask_dir'] = PROJECT_ROOT / val_mask_dir_rel if val_mask_dir_rel else None
+    
+    train_dataset = DatasetClass(train_stim, train_fix, centerbias_for_loader, **train_ds_kwargs)
+    val_dataset = DatasetClass(val_stim, val_fix, centerbias_for_loader, **val_ds_kwargs)
+    # ===================== END OF NEW LOGIC =====================
 
     # 4. Create DataLoaders
     train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True) if ddp_ctx.enabled else None
