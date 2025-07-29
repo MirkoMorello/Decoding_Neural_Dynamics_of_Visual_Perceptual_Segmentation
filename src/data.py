@@ -141,7 +141,8 @@ class ImageDataset(torch.utils.data.Dataset):
                     stimuli=self.stimuli,
                     centerbias_model=self.centerbias_model,
                     lmdb_path=self.lmdb_path,
-                    logger=logger
+                    logger=logger,
+                    **self._create_lmdb_args
                 )
             
             # ALL processes must wait here until the master has finished creating the cache
@@ -229,7 +230,7 @@ class ImageDataset(torch.utils.data.Dataset):
             sample = self._cache[idx]
         else:
             # 3-a. image + center-bias
-            image, cb = self._get_image_data(idx)
+            stimulus_data = self._get_image_data(idx) # (image, centerbias) and maybe a mask
 
             # 3-b. fixation coordinates
             xs = self._xs_cache.get(idx, np.empty(0, dtype=int))
@@ -237,10 +238,9 @@ class ImageDataset(torch.utils.data.Dataset):
 
             # 3-c. assemble
             sample = dict(
-                image      = image,
+                **stimulus_data, # Unpack image, centerbias, and maybe a mask
                 x          = xs,
                 y          = ys,
-                centerbias = cb.astype(np.float32),
                 weight     = 1.0 if self.average == "image" else float(len(xs)),
             )
             if self.cached:
@@ -278,6 +278,14 @@ class ImageDatasetWithSegmentation(ImageDataset):
         # ------------------------------------------------------------------
         # 1.  *Base* dataset initialisation  (no segmentation kwargs)
         # ------------------------------------------------------------------
+        # 1. We define the specific arguments for THIS class's cache creation.
+        self._create_lmdb_args = {
+            'segmentation_mask_dir': segmentation_mask_dir,
+            'segmentation_mask_format': segmentation_mask_format
+        }
+
+        # 2. Call the parent __init__. It will now use our overridden arguments
+        #    to create the correct cache (with masks).
         super().__init__(
             stimuli,
             fixations,
@@ -393,6 +401,11 @@ class ImageDatasetWithSegmentation(ImageDataset):
             attribute from the FileStimuli object to reliably get the stimulus ID.
             """
             # 1. Get base data from parent. This loads the resized image from the cache path.
+            
+            if self.use_unified_lmdb:
+                # If we're using the unified cache, the parent __getitem__ does everything.
+                # It will load the dictionary containing image, centerbias, and the mask.
+                return super().__getitem__(key)
             try:
                 original_item_from_parent = super().__getitem__(key)
             except IndexError:
@@ -646,13 +659,6 @@ class FixationDatasetWithSegmentation(FixationDataset):
         # This will include 'image', 'x_hist', 'y_hist', 'centerbias', etc.
         data = super().__getitem__(key)
 
-        # The parent may have already applied a transform. We need to handle this.
-        # The ideal place to add the mask is *before* the transform.
-        # A small refactor of the parent could help, but we can work around it.
-        # Let's assume the parent doesn't return tensors yet, or we convert back.
-        # Your current parent `FixationDataset` returns a dict of numpy arrays
-        # before the transform, so this is fine.
-
         # 2. Load and add the segmentation mask
         mask_tensor_to_add = None
         stimulus_idx = self.fixations.n[key]
@@ -680,16 +686,10 @@ class FixationDatasetWithSegmentation(FixationDataset):
             # Create a dummy numpy array if loading failed
             img_h, img_w = data['image'].shape[1], data['image'].shape[2]
             mask_tensor_to_add = np.zeros((img_h, img_w), dtype=np.int64)
+            logger.warning(f"Using dummy mask for stimulus {stimulus_idx} (shape: {mask_tensor_to_add.shape})")
         
         data['segmentation_mask'] = mask_tensor_to_add
 
-        # 3. The parent class's __getitem__ already handles the transform at the end,
-        # so we don't need to call it again. Our job is just to add the mask
-        # to the dictionary before it's returned.
-        # Wait, the parent already calls the transform. This is a problem.
-        # We need to re-structure slightly.
-
-        # Let's try a better approach that doesn't break the transform logic.
         return self._get_item_with_mask(key)
 
 
@@ -875,109 +875,103 @@ class ImageDatasetSampler(torch.utils.data.Sampler[list[int]]):
         return len(self.batches)
 
 
-def _export_dataset_to_lmdb(stimuli, centerbias_model, lmdb_path, logger, write_frequency=500):
+def _export_dataset_to_lmdb(
+    stimuli,
+    centerbias_model,
+    lmdb_path,
+    logger,
+    write_frequency=500,
+    *,  # New args are keywords for backward compatibility
+    segmentation_mask_dir=None,
+    segmentation_mask_format="png"
+):
     """
-    Safely creates an LMDB cache. Checks for validity and regenerates if needed.
-    This function should only be called by the master process.
+    Safely creates an LMDB cache. Conditionally includes segmentation masks.
+    This function is DDP-aware and should only be called by the master process.
     """
     lmdb_path = Path(lmdb_path)
     expected_count = len(stimuli)
 
-    # --- Phase 1: Check for existing valid LMDB ---
+    # --- More robust validation for caches with/without masks ---
     if lmdb_path.exists():
         try:
             with lmdb.open(str(lmdb_path), readonly=True, lock=False) as env_check:
                 with env_check.begin() as txn_check:
                     count_bytes = txn_check.get(b'__count__')
-                    if count_bytes and int(count_bytes.decode()) == expected_count:
-                        logger.info(f"✅ Valid LMDB found at {lmdb_path} with {expected_count} items. Skipping creation.")
-                        return # Exit early if cache is valid
-        except (lmdb.Error, TypeError, ValueError) as e:
-            logger.warning(f"⚠️ Found existing but invalid LMDB at {lmdb_path} ({e}). Will regenerate.")
+                    has_masks_bytes = txn_check.get(b'__has_masks__')
+                    has_masks_in_cache = has_masks_bytes is not None and has_masks_bytes.decode() == '1'
+                    
+                    if (count_bytes and int(count_bytes.decode()) == expected_count and
+                        (segmentation_mask_dir is None) == (not has_masks_in_cache)):
+                        logger.info(f"✅ Valid LMDB found at {lmdb_path}. Skipping creation.")
+                        return
+        except Exception as e:
+            logger.warning(f"⚠️ Invalid LMDB found at {lmdb_path} ({e}). Will regenerate.")
     
-    # --- Phase 2: If we are here, we need to create the cache ---
     logger.info(f"⏳ Creating LMDB cache for {expected_count} items at {lmdb_path}...")
     if lmdb_path.exists():
-        logger.info(f"  - Removing old cache directory...")
         shutil.rmtree(lmdb_path)
     lmdb_path.mkdir(parents=True, exist_ok=True)
 
-    db_write = None
+    db = None
     try:
-        db_write = lmdb.open(str(lmdb_path), map_size=32 * 1024**3, readonly=False, meminit=False, map_async=True)
+        db = lmdb.open(str(lmdb_path), map_size=64 * 1024**3, readonly=False, meminit=False, map_async=True)
         written_count = 0
-        with db_write.begin(write=True) as txn:
+        with db.begin(write=True) as txn:
             for idx in tqdm(range(expected_count), desc="Writing LMDB", leave=False):
                 try:
-                    stimulus_path = stimuli.filenames[idx]
+                    stimulus_path = Path(stimuli.filenames[idx])
                     image_arr = np.array(Image.open(stimulus_path).convert("RGB"))
                     
-                    # Create payload
-                    image_chw_uint8 = image_arr.transpose(2, 0, 1)
-                    centerbias = centerbias_model.log_density(image_arr)
-                    payload = pickle.dumps({
-                        'image': image_chw_uint8,
-                        'centerbias': centerbias.astype(np.float32)
-                    })
-                    
-                    # Write to DB
+                    payload = {
+                        'image': image_arr.transpose(2, 0, 1),
+                        'centerbias': centerbias_model.log_density(image_arr).astype(np.float32)
+                    }
+
+                    # --- Conditionally add the mask to the payload ---
+                    if segmentation_mask_dir:
+                        mask_path = Path(segmentation_mask_dir) / f"{stimulus_path.stem}.{segmentation_mask_format}"
+                        if mask_path.exists():
+                            mask_img = Image.open(mask_path).convert('L')
+                            payload['segmentation_mask'] = np.array(mask_img, dtype=np.int64)
+                        else:
+                            logger.warning(f"Mask not found for {stimulus_path.name}, creating dummy mask in cache.")
+                            payload['segmentation_mask'] = np.zeros(image_arr.shape[:2], dtype=np.int64)
+
                     key = '{}'.format(idx).encode('ascii')
-                    txn.put(key, payload)
+                    txn.put(key, pickle.dumps(payload))
                     written_count += 1
-
                 except Exception as e:
-                    logger.error(f"  - Failed to process item {idx} ({stimuli.filenames[idx]}): {e}")
-                    continue
-            
-            # Write metadata
-            txn.put(b'__count__', str(written_count).encode('utf-8'))
-        logger.info(f"✅ LMDB cache created with {written_count} items.")
+                    logger.error(f"Failed to process item {idx} ({stimuli.filenames[idx]}): {e}")
 
+            txn.put(b'__count__', str(written_count).encode('utf-8'))
+            if segmentation_mask_dir:
+                txn.put(b'__has_masks__', b'1') # Add the flag if masks were included
+        logger.info(f"✅ LMDB cache created with {written_count} items.")
     except Exception as e:
         logger.error(f"❌ CRITICAL ERROR during LMDB generation: {e}", exc_info=True)
-        # If creation fails, clean up the corrupted directory to force a rebuild next time
-        if db_write:
-            db_write.close()
-        if lmdb_path.exists():
-            shutil.rmtree(lmdb_path)
-        raise e # Re-raise the exception to stop the training run
+        if db: db.close()
+        if lmdb_path.exists(): shutil.rmtree(lmdb_path)
+        raise e
     finally:
-        if db_write:
-            db_write.close()
+        if db: db.close()
 
-
-def _encode_filestimulus_item(filename, centerbias):
-    """Codifica l'immagine PRE-ELABORATA e il centerbias."""
-    # Usa la nostra nuova funzione canonica per ottenere l'array corretto
-    image_chw_f32 = decode_and_prepare_image(filename)
-
-    # Serializza l'array NumPy e il centerbias
-    # Pickle è semplice e funziona bene qui.
-    payload = pickle.dumps({
-        'image': image_chw_f32,
-        'centerbias': centerbias.astype(np.float32) # Assicura che anche il CB sia float32
-    })
-    return payload
 
 
 def _get_image_data_from_lmdb(lmdb_env, n):
-    """Legge l'immagine e il centerbias PRE-ELABORATI da LMDB."""
+    """Reads LMDB and returns"""
     key = '{}'.format(n).encode('ascii')
     with lmdb_env.begin(write=False) as txn:
         byteflow = txn.get(key)
     
     if byteflow is None:
         raise KeyError(
-            f"Key '{key.decode()}' (stimulus index {n}) not found in LMDB at '{lmdb_env.path()}'. "
-            "The cache is likely corrupted or incomplete. "
-            "Please delete the directory and restart training to rebuild it.")
-    data = pickle.loads(byteflow)
+            f"Key '{key.decode()}' (stimulus index {n}) not found in LMDB. "
+            "Cache may be corrupted. Delete it and restart."
+        )
     
-    # Non c'è più bisogno di decodificare o convertire, è già pronto
-    image_chw_f32 = data['image']
-    centerbias_hw_f32 = data['centerbias']
-    
-    return image_chw_f32, centerbias_hw_f32
+    # The payload is now a dictionary, which is what the __getitem__ expects
+    return pickle.loads(byteflow)
 
 
 
@@ -1032,7 +1026,7 @@ def prepare_spatial_dataset(
             shuffle=True,
             drop_last=True
         )
-        # CRITICAL: Set the epoch for the DistributedSampler
+        # Set the epoch for the DistributedSampler
         distributed_sampler.set_epoch(current_epoch)
 
         # 2. Create a Subset of the full_dataset for the current rank.
@@ -1045,9 +1039,6 @@ def prepare_spatial_dataset(
             batch_size=batch_size,           # Per-GPU batch size
             shuffle=True                     # Shuffle items within the subset before batching by shape
         )
-        # Optional: if ImageDatasetSampler has its own epoch setting
-        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
-        #     shape_aware_batch_sampler.set_epoch(current_epoch)
 
         # 4. Create the DataLoader for DDP
         loader = torch.utils.data.DataLoader(
@@ -1066,9 +1057,6 @@ def prepare_spatial_dataset(
             batch_size=batch_size,
             shuffle=True # Assuming this enables shuffling within ImageDatasetSampler
         )
-        # Optional: if ImageDatasetSampler has its own epoch setting
-        # if hasattr(batch_sampler_single_gpu, 'set_epoch'):
-        #    batch_sampler_single_gpu.set_epoch(current_epoch)
 
         loader = torch.utils.data.DataLoader(
             full_dataset,
@@ -1092,8 +1080,8 @@ def prepare_scanpath_dataset(
     is_master: bool,
     device: torch.device,   # device is kept for consistency, used by barrier
     path: Path | None = None,
-    current_epoch: int = 0, # Added: current epoch for DistributedSampler
-    logger = None,       # Added: logger for error messages
+    current_epoch: int = 0,
+    logger = None, 
 ):
     """
     Prepares the DataLoader for scanpath prediction (fixation-based),
@@ -1125,7 +1113,7 @@ def prepare_scanpath_dataset(
         lmdb_path=lmdb_path_str,
     )
 
-    loader: torch.utils.data.DataLoader # Type hint for clarity
+    loader: torch.utils.data.DataLoader
 
     if is_distributed:
         # DDP Path:
@@ -1136,7 +1124,7 @@ def prepare_scanpath_dataset(
             shuffle=True,       # Shuffles the global list of indices
             drop_last=True      # Ensures all GPUs get the same number of samples
         )
-        # CRITICAL: Set the epoch for the DistributedSampler for proper shuffling each epoch
+        # Set the epoch for the DistributedSampler for proper shuffling each epoch
         distributed_sampler.set_epoch(current_epoch)
 
         # 3. Create a Subset of the full_dataset for the current rank.
@@ -1153,9 +1141,6 @@ def prepare_scanpath_dataset(
             batch_size=batch_size,           # Per-GPU batch size
             shuffle=True                     # Shuffle items within the subset before batching by shape
         )
-        # Optional: if ImageDatasetSampler itself has epoch-aware internal shuffling
-        # if hasattr(shape_aware_batch_sampler, 'set_epoch'):
-        #     shape_aware_batch_sampler.set_epoch(current_epoch)
 
         # 5. Create the DataLoader for DDP
         loader = torch.utils.data.DataLoader(
@@ -1192,9 +1177,9 @@ def prepare_scanpath_dataset(
 
     return loader
 
-# -----------------------------------------------------------------------------
-# MIT Data Conversion Functions (Copied from original with DDP modifications)
-# -----------------------------------------------------------------------------
+# --------------------------------
+# MIT Data Conversion Functions 
+# --------------------------------
 # ── shared size helper ─────────────────────────────────────────────
 def target_size(h_orig, w_orig):          # returns (width, height)
     if h_orig < w_orig:                   # landscape
@@ -1345,7 +1330,7 @@ def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
     # ---------------------------------------------------------------
     # 0.  figure-out which flavour we got ---------------------------
     # ---------------------------------------------------------------
-    if hasattr(fixations, 'train_xs'):                  # ❶ very old (<0.3)
+    if hasattr(fixations, 'train_xs'):                  # very old (<0.3)
         xs_iter, ys_iter, ts_iter, ns_iter = (
             fixations.train_xs,
             fixations.train_ys,
@@ -1353,7 +1338,7 @@ def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
             fixations.train_ns,
         )
 
-    elif hasattr(fixations, 'scanpaths') and hasattr(fixations, 'xs'):  # ❷ ScanpathFixations
+    elif hasattr(fixations, 'scanpaths') and hasattr(fixations, 'xs'):  # ScanpathFixations
         xs_iter, ys_iter, ts_iter, ns_iter = (
             fixations.scanpaths.xs,
             fixations.scanpaths.ys,
@@ -1361,7 +1346,7 @@ def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
             fixations.scanpaths.n,
         )
 
-    elif hasattr(fixations, 'scanpaths'):               # ❸ **new** FixationTrains (≥0.4)
+    elif hasattr(fixations, 'scanpaths'):               # FixationTrains (≥0.4)
         xs_iter, ys_iter, ts_iter, ns_iter = (
             fixations.scanpaths.xs,
             fixations.scanpaths.ys,
@@ -1369,7 +1354,7 @@ def convert_fixation_trains(stimuli: pysaliency.FileStimuli,
             fixations.scanpaths.n,
         )
 
-    elif hasattr(fixations, 'xs'):                      # ❹ flat-array style (rare)
+    elif hasattr(fixations, 'xs'):                      # flat-array style (rare)
         xs_iter, ys_iter, ts_iter, ns_iter = (
             fixations.xs, fixations.ys,
             getattr(fixations, 'ts', [None]*len(fixations.xs)),
