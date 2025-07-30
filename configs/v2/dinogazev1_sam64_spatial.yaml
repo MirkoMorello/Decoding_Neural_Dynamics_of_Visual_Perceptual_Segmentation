@@ -1,0 +1,49 @@
+#
+# STAGE 2: Fine-tune the pre-trained model on MIT1003 (spatial only).
+# FOLD 0
+#
+
+stage:
+  kind: "mit_spatial_finetune"
+  name: "dinogaze_spade_v1_sam64_fold0" # Name includes the fold for clarity
+  model_key: "dinogaze_spade_v1"
+  dataset_key: "MIT1003"
+  
+  # --- Hyperparameters for this stage ---
+  lr: 0.00005 # From your old lr_mit_spatial
+  milestones: [10, 20, 30, 35]
+  batch_size: 2
+  grad_acc_steps: 1
+  min_lr: 1.0e-7
+  val_every: 1
+  
+  # --- CHECKPOINT CHAINING ---
+  # This path is now predictable based on the 'kind' and 'name' of the previous stage.
+  #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
+  resume_ckpt : "experiments/dinogaze_spade_v1_sam64/step-0004.pth"
+  # --- Model- and Data-specific parameters ---
+  extra:
+    # Model parameters (can be the same or different from pre-training)
+    requires_segmentation: true
+    dino_model_name: 'dinov2_vitl14'
+    dino_patch_size: 14
+    dino_layers_for_main_path: [-3, -2, -1]
+    dino_semantic_feature_layer_idx: -1
+    num_total_segments: 64
+    finalizer_initial_sigma: 8.0
+    finalizer_learn_sigma: true
+    
+    # Data parameters for the MIT1003 builder
+    fold: 0
+    mask_dir: 'masks/mit1003/sam_vitl_k64_mit' # A single mask directory for the whole dataset
+
+# --- Global Run Settings ---
+compile: false
+seed: 42
+num_workers: 'auto'
+
+# --- Global Path Configuration ---
+paths:
+  dataset_dir: "./data/pysaliency_datasets"
+  train_dir: "./experiments"
+  lmdb_dir: "./data/lmdb_caches"

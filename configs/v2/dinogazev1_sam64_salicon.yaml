@@ -1,0 +1,58 @@
+# configs/salicon_pretrain_v1.yaml
+#
+# STAGE 1: Pre-train the DinoGaze+SPADE (v1) model on the SALICON dataset.
+
+stage:
+  kind: "salicon_pretrain"
+  name: "dinogaze_spade_v1_sam64"
+  model_key: "dinogaze_spade_v1"
+  dataset_key: "SALICON"
+  
+  # --- Hyperparameters for this stage ---
+  lr: 0.0001
+  milestones: [15, 20, 25, 30, 35]
+  batch_size: 2
+  grad_acc_steps: 2
+  min_lr: 1.0e-7
+  val_every: 1
+  resume_ckpt: null # No resume for the first pre-training stage (unless interrupted)
+  
+  # --- Model-specific parameters passed to the builder function ---
+  extra:
+    requires_segmentation: true
+    is_scanpath_stage: false
+    freeze_saliency_network: false
+
+    included_fixations: [-1, -2, -3, -4]
+    
+    # DINOv2 backbone settings
+    dino_model_name: 'dinov2_vitl14'
+    dino_patch_size: 14
+    dino_layers_for_main_path: [-3, -2, -1]
+    dino_semantic_feature_layer_idx: -1
+    
+    # Segmentation and SPADE settings
+    num_total_segments: 64
+
+    # Finalizer settings
+    finalizer_initial_sigma: 8.0
+    finalizer_learn_sigma: true
+
+    # Mask Paths for the SALICON Data Builder
+    salicon_train_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_train'
+    salicon_val_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_val'
+
+    # Scanpath history to take into account
+
+
+
+# --- Global Run Settings ---
+compile: true
+seed: 42
+num_workers: 'auto'
+
+# --- Path Configuration ---
+paths:
+  dataset_dir: "./data/pysaliency_datasets"
+  train_dir: "./experiments" # The output will be in ./experiments/salicon_pretrain_dinogaze_spade_v1/
+  lmdb_dir: "./data/lmdb_caches"
