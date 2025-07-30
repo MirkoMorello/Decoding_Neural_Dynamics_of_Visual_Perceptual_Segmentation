@@ -553,6 +553,15 @@ def _extract_model_state_dict_from_checkpoint(checkpoint_content, logger):
     logger.error("Could not automatically extract a valid model state_dict from the checkpoint content.")
     return None
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Helper to repeatedly unwrap a model from DDP and torch.compile wrappers."""
+    while hasattr(model, "module") or hasattr(model, "_orig_mod"):
+        if hasattr(model, "module"): # DDP wrapper
+            model = model.module
+        if hasattr(model, "_orig_mod"): # torch.compile wrapper
+            model = model._orig_mod
+    return model
+
 
 def restore_from_checkpoint(model: torch.nn.Module,
                             optimizer: torch.optim.Optimizer = None,
@@ -561,7 +570,8 @@ def restore_from_checkpoint(model: torch.nn.Module,
                             path: str = None,
                             device: torch.device = None,
                             is_distributed: bool = False, # Kept for consistency, DDP handled via model instance
-                            logger: logging.Logger = None):
+                            logger: logging.Logger = None,
+                            load_weights_only: bool = False):
     """
     Restores training state (model, optimizer, scheduler, scaler, step, loss) from a checkpoint.
     Args:
@@ -580,7 +590,7 @@ def restore_from_checkpoint(model: torch.nn.Module,
     
     if not path or not os.path.exists(path):
         logger.error(f"Checkpoint path '{path}' not found or not specified. Cannot restore.")
-        return 0, np.nan, False # step, loss, scheduler_restored
+        return 0, np.nan, False
 
     logger.info(f"Attempting to restore checkpoint from: {path}")
     try:
@@ -590,93 +600,57 @@ def restore_from_checkpoint(model: torch.nn.Module,
         logger.error(f"Failed to load checkpoint file '{path}'. Error: {e}", exc_info=True)
         return 0, np.nan, False
 
-    # --- 1. Restore Model State ---
-    model_state_dict_raw = _extract_model_state_dict_from_checkpoint(checkpoint_content, logger)
+    model_state_dict = _extract_model_state_dict_from_checkpoint(checkpoint_content, logger)
 
-    if model_state_dict_raw:
-        target_model_for_loading = model.module if isinstance(model, DDP) else model
-        
-        # Clean the state_dict: ensure no 'module.' prefix if loading into model.module or non-DDP model
-        _clean_state_dict = OrderedDict()
-        # Check if the raw state_dict (extracted from checkpoint) has 'module.' prefixes
-        raw_dict_has_module_prefix = any(key.startswith('module.') for key in model_state_dict_raw.keys())
-
-        if raw_dict_has_module_prefix:
-            logger.info("Raw model state_dict from checkpoint has 'module.' prefix. Stripping for loading into target model.")
-            for k, v in model_state_dict_raw.items():
-                if k.startswith('module.'):
-                    _clean_state_dict[k[len('module.'):]] = v
-                else:
-                    _clean_state_dict[k] = v # Should not happen if raw_dict_has_module_prefix is true, but keep for safety
-        else:
-            # Raw state_dict does not have 'module.' prefix, which is expected if saved from model.module.state_dict()
-            _clean_state_dict = model_state_dict_raw
-        
+    if model_state_dict:
+        target_model_for_loading = _unwrap_model(model)
         try:
-            missing_keys, unexpected_keys = target_model_for_loading.load_state_dict(_clean_state_dict, strict=False)
-            
+            missing_keys, unexpected_keys = target_model_for_loading.load_state_dict(model_state_dict, strict=False)
             if missing_keys: logger.warning(f"Model Load: Missing parameter keys: {missing_keys}")
             if unexpected_keys: logger.warning(f"Model Load: Unexpected parameter keys: {unexpected_keys}")
-            logger.info("Model state successfully loaded into target model (model.module or model itself).")
-
+            logger.info("Model state successfully loaded into the unwrapped target model.")
         except Exception as e:
             logger.error(f"Error during model.load_state_dict: {e}", exc_info=True)
-            return 0, np.nan, False # Critical error if model weights can't be loaded
+            return 0, np.nan, False
     else:
-        logger.error("No model state_dict could be extracted from the checkpoint. Model not restored.")
-        return 0, np.nan, False # Critical if no model weights
+        logger.error("No model state_dict could be extracted. Model not restored.")
+        return 0, np.nan, False
+    
+    if load_weights_only:
+        logger.info("`load_weights_only` is True. Skipping optimizer, scheduler, and epoch state. Starting fresh.")
+        return 0, np.nan, False # Return epoch 0, no loss, scheduler not restored
 
-    # --- 2. Restore Optimizer, Scheduler, Scaler (if checkpoint_content is a dict and they exist) ---
     scheduler_restored_flag = False
-    if isinstance(checkpoint_content, dict): # These are only present if saved by save_training_state
+    if isinstance(checkpoint_content, dict):
         if 'optimizer' in checkpoint_content and optimizer is not None:
             try:
                 optimizer.load_state_dict(checkpoint_content['optimizer'])
                 logger.info("Optimizer state restored.")
-                # Move optimizer state tensors to the correct device
                 for state in optimizer.state.values(): 
-                    for k_opt, v_opt in state.items():
-                        if isinstance(v_opt, torch.Tensor):
-                            state[k_opt] = v_opt.to(device)
-            except Exception as e:
-                logger.warning(f"Could not restore optimizer state: {e}. Optimizer starts fresh.", exc_info=False)
-        elif optimizer is not None:
-            logger.info("Optimizer state not found in checkpoint. Optimizer starts fresh.")
-
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor): state[k] = v.to(device)
+            except Exception:
+                logger.warning("Could not restore optimizer state. Optimizer starts fresh.")
+        
         if 'scheduler' in checkpoint_content and scheduler is not None:
             try:
                 scheduler.load_state_dict(checkpoint_content['scheduler'])
                 logger.info("Scheduler state restored.")
                 scheduler_restored_flag = True
-            except Exception as e:
-                logger.warning(f"Could not restore scheduler state: {e}. Scheduler starts fresh.", exc_info=False)
-        elif scheduler is not None:
-            logger.info("Scheduler state not found in checkpoint. Scheduler starts fresh.")
-
+            except Exception:
+                logger.warning("Could not restore scheduler state. Scheduler starts fresh.")
+        
         if 'grad_scaler' in checkpoint_content and scaler is not None and device.type == 'cuda':
             try:
                 scaler.load_state_dict(checkpoint_content['grad_scaler'])
                 logger.info("GradScaler state restored.")
-            except Exception as e:
-                logger.warning(f"Could not restore GradScaler state: {e}. Scaler starts fresh.", exc_info=False)
-        elif scaler is not None and device.type == 'cuda':
-            logger.info("GradScaler state not found in checkpoint. Scaler starts fresh.")
-    else: # Checkpoint was likely just a model state_dict
-        logger.info("Checkpoint content is not a dictionary (likely just model weights). Skipping optimizer/scheduler/scaler restore.")
+            except Exception:
+                logger.warning("Could not restore GradScaler state. Scaler starts fresh.")
 
-    # --- 3. Restore Step/Epoch and Loss ---
-    restored_step = 0
-    restored_loss = np.nan
-
-    if isinstance(checkpoint_content, dict):
-        restored_step = checkpoint_content.get('step', 0) # 'step' often means epoch in this context
-        restored_loss = checkpoint_content.get('loss', np.nan) 
+    restored_step = checkpoint_content.get('step', 0) if isinstance(checkpoint_content, dict) else 0
+    restored_loss = checkpoint_content.get('loss', np.nan) if isinstance(checkpoint_content, dict) else np.nan
     
-    if restored_step > 0:
-        logger.info(f"Restored to step/epoch {restored_step}. Last recorded loss: {restored_loss if not np.isnan(restored_loss) else 'N/A'}.")
-    else:
-        logger.info("No previous step/loss found in checkpoint, or checkpoint was model weights only.")
-    
+    logger.info(f"Restored to step/epoch {restored_step}. Last recorded loss: {restored_loss if not np.isnan(restored_loss) else 'N/A'}.")
     logger.info(f"Checkpoint restoration from '{path}' complete.")
     return restored_step, restored_loss, scheduler_restored_flag
 
@@ -720,7 +694,7 @@ def _train(this_directory, model,
            device=None,
            is_distributed=False, is_master=True,
            logger=None,
-           train_sampler=None): # <-- UNICA MODIFICA ALLA FIRMA
+           train_sampler=None):
     """ Main training loop. Now uses logger passed from the main script. """
 
     if logger is None:
@@ -785,28 +759,43 @@ def _train(this_directory, model,
         except Exception as e:
             logger.error(f"Failed to create TensorBoard SummaryWriter at {tb_log_dir}: {e}. TB logging disabled.", exc_info=True)
 
-    checkpoint_path_to_attempt_restore = None
-    if startwith and Path(startwith).exists():
+    # Priority 1: Check for a local checkpoint to resume an interrupted run.
+    intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
+    if intermediate_checkpoints:
+        checkpoint_path_to_attempt_restore = intermediate_checkpoints[-1]
+        is_finetuning_from_external_ckpt = False # This is a resumption, not fine-tuning
+        if is_master:
+            logger.info(f"Found local checkpoint. Resuming interrupted run from: {checkpoint_path_to_attempt_restore}")
+    
+    # Priority 2: If no local checkpoint, check for an external one from the config for fine-tuning.
+    elif startwith and Path(startwith).exists():
         checkpoint_path_to_attempt_restore = startwith
-        if is_master: logger.info(f"Attempting to restore from specified checkpoint: {startwith}")
+        is_finetuning_from_external_ckpt = True # This is for fine-tuning
+        if is_master:
+            logger.info(f"No local checkpoint found. Starting fine-tuning from external checkpoint: {startwith}")
+    
+    # Priority 3: No checkpoints found at all.
     else:
-        intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
-        if intermediate_checkpoints:
-            checkpoint_path_to_attempt_restore = intermediate_checkpoints[-1]
-            if is_master: logger.info(f"No 'startwith' specified. Found latest intermediate checkpoint: {checkpoint_path_to_attempt_restore}")
+        if is_master:
+            logger.info("No local or external checkpoint found. Starting training from scratch.")
 
+    # Now, attempt to restore if a path was determined.
     if checkpoint_path_to_attempt_restore:
         current_epoch_step, last_avg_train_loss_epoch, scheduler_state_restored = restore_from_checkpoint(
             model, optimizer, lr_scheduler, scaler, str(checkpoint_path_to_attempt_restore), device,
-            is_distributed, logger
+            is_distributed, logger,
+            load_weights_only=is_finetuning_from_external_ckpt # Pass the flag
         )
-        if is_master: logger.info(
-            f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
-            f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}")
-    elif startwith:
-        logger.warning(f"'startwith' checkpoint {startwith} not found. Starting fresh.")
-    else:
-        if is_master: logger.info("No checkpoint found in output directory. Starting training from scratch (epoch 0).")
+        if is_master:
+            if is_finetuning_from_external_ckpt:
+                logger.info(f"Fine-tuning started with weights from: {checkpoint_path_to_attempt_restore}. Training starts at Epoch 1.")
+            else:
+                 logger.info(
+                    f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
+                    f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}"
+                )
+    elif startwith: # This case handles when `startwith` was provided but the file didn't exist.
+        logger.warning(f"'startwith' checkpoint '{startwith}' not found. Starting fresh.")
 
     log_csv_path = output_dir_path / 'progress_log.csv'
     if is_master and log_csv_path.exists():
