@@ -19,6 +19,7 @@ import torch.distributed as dist
 from imageio.v3 import imread, imwrite
 from torch.utils.data import Sampler, RandomSampler, BatchSampler
 import numpy as np
+import math
 import torch
 from boltons.fileutils import atomic_save
 import cloudpickle as cpickle
@@ -249,7 +250,7 @@ class ImageDataset(torch.utils.data.Dataset):
 
         # 4.  optional transform
         if self.transform is not None:
-            sample = self.transform(sample)
+            sample = self.transform(sample.copy()) 
         return sample
 
 
@@ -818,61 +819,129 @@ class FixationMaskTransform(object):
         return item
 
 
-class ImageDatasetSampler(torch.utils.data.Sampler[list[int]]):
+class ImageDatasetSampler(Sampler[list[int]]):
+    """
+    A DDP-aware Sampler that groups items of the same shape into batches.
+
+    This sampler transparently handles both single-GPU and DDP (Distributed)
+    scenarios. In DDP mode, it first distributes the data among ranks and then
+    performs shape-aware batching on each rank's subset of data.
+
+    Args:
+        data_source (Dataset): Dataset to sample from. Must have a .get_shapes() method.
+        batch_size (int): The PER-GPU batch size.
+        shuffle (bool, optional): If True, shuffle indices every epoch. Defaults to True.
+        num_replicas (int, optional): Number of processes for DDP.
+            Defaults to the current DDP world size.
+        rank (int, optional): Rank of the current process for DDP.
+            Defaults to the current DDP rank.
+        seed (int, optional): Random seed for shuffling. Defaults to 0.
+        drop_last (bool, optional): If True, the sampler will drop the last
+            non-full batch from each shape group. This is recommended for DDP
+            to prevent hangs. Defaults to True.
+    """
     def __init__(
         self,
         data_source: torch.utils.data.Dataset,
         batch_size: int = 1,
-        ratio_used: float = 1.0,
         shuffle: bool = True,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        seed: int = 0,
+        drop_last: bool = True,
+        # ratio_used is kept for signature compatibility but not used in this impl.
+        ratio_used: float = 1.0, 
     ):
+        if num_replicas is None:
+            if not dist.is_available() or not dist.is_initialized():
+                num_replicas = 1
+            else:
+                num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available() or not dist.is_initialized():
+                rank = 0
+            else:
+                rank = dist.get_rank()
+
         self.data_source = data_source
-        self.batch_size  = batch_size
-        self.ratio_used  = ratio_used
-        self.shuffle     = shuffle
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
 
-        rng = random.Random()                       # independent RNG
+        # Get all shapes once from the full dataset
+        self.shapes = self.data_source.get_shapes()
 
-        # -------- 1. resolve shapes for *local* indices ---------------
-        if isinstance(data_source, torch.utils.data.Subset):
-            parent_shapes = data_source.dataset.get_shapes()
-            shapes = [parent_shapes[i] for i in data_source.indices]
+        # DDP logic: ensure every GPU sees the same number of samples
+        if self.drop_last and len(self.data_source) % self.num_replicas != 0:
+            self.num_samples = math.ceil(
+                (len(self.data_source) - self.num_replicas) / self.num_replicas
+            )
         else:
-            shapes = data_source.get_shapes()
+            self.num_samples = math.ceil(len(self.data_source) / self.num_replicas)
+        
+        self.total_size = self.num_samples * self.num_replicas
+        
+        self.batches = self._generate_batches()
 
-        # group local indices by shape (H,W)
-        shape_buckets: dict[tuple[int, int], list[int]] = {}
-        for local_idx, shp in enumerate(shapes):
-            shape_buckets.setdefault(tuple(shp[:2]), []).append(local_idx)
+    def _generate_batches(self):
+        # 1. Get all indices and shuffle if required
+        indices = list(range(len(self.data_source)))
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = [indices[i] for i in torch.randperm(len(indices), generator=g).tolist()]
 
-        # -------- 2. build batches, never mixing shapes ---------------
-        self.batches: list[list[int]] = []
-        for idx_list in shape_buckets.values():
-            if shuffle:
-                rng.shuffle(idx_list)
+        # 2. Add padding for DDP if not dropping last
+        if not self.drop_last:
+            padding_size = self.total_size - len(indices)
+            if padding_size > 0:
+                indices += indices[:padding_size]
+        else:
+            indices = indices[:self.total_size]
 
-            for i in range(0, len(idx_list), batch_size):
-                chunk = idx_list[i : i + batch_size]
-                if len(chunk) == batch_size or (
-                    len(chunk) and ratio_used == 1.0
-                ):
-                    self.batches.append(chunk)
+        # 3. Get the subset of indices for the current rank
+        rank_indices = indices[self.rank:self.total_size:self.num_replicas]
 
-        if shuffle:
-            rng.shuffle(self.batches)
+        # 4. Group these rank-specific indices by shape
+        shape_buckets = {}
+        for idx in rank_indices:
+            # Use tuple(shape[:2]) to handle (H, W, C) and (H, W)
+            shape_key = tuple(self.shapes[idx][:2]) 
+            shape_buckets.setdefault(shape_key, []).append(idx)
 
-        # -------- 3. optionally down-sample epoch --------------------
-        if ratio_used < 1.0:
-            keep = int(len(self.batches) * ratio_used)
-            self.batches = self.batches[:keep]
+        # 5. Create batches for this rank from the buckets
+        batches = []
+        for bucket_indices in shape_buckets.values():
+            if self.shuffle:
+                random.shuffle(bucket_indices)
+            
+            for i in range(0, len(bucket_indices), self.batch_size):
+                chunk = bucket_indices[i : i + self.batch_size]
+                if not self.drop_last or len(chunk) == self.batch_size:
+                    batches.append(chunk)
+        
+        # 6. Shuffle the order of the batches themselves
+        if self.shuffle:
+            random.shuffle(batches)
+        
+        return batches
 
-    # Sampler interface ----------------------------------------------
     def __iter__(self):
-        for batch in self.batches:
-            yield batch
+        # Regenerate batches for the current epoch
+        self.batches = self._generate_batches()
+        return iter(self.batches)
 
     def __len__(self):
+        # Return the number of batches for the current rank
         return len(self.batches)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Sets the epoch for this sampler. Called by the training loop."""
+        self.epoch = epoch
 
 
 def _export_dataset_to_lmdb(stimuli, centerbias_model, lmdb_path, logger, write_frequency=500):
