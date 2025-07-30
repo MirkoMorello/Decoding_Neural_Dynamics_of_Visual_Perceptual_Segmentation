@@ -219,9 +219,13 @@ def train_stage(run_cfg: RunCfg) -> None:
     # optim / sched --------------------------------------------------------------------------------------------------
     optim, sched = make_optim_and_sched(model, run_cfg.stage)
 
-    # handoff to old, battle‑tested loop -----------------------------------------------------------------------------
+    train_sampler_for_loop = (
+        train_dl.batch_sampler if hasattr(train_dl, "batch_sampler") and train_dl.batch_sampler is not None
+        else train_dl.sampler if hasattr(train_dl, "sampler") else None
+    )
+    
     train_loop(
-        this_directory=run_cfg.paths["train_dir"] / run_cfg.stage.name,
+        this_directory=run_cfg.paths["train_dir"] / run_cfg.stage.kind / run_cfg.stage.name,
         model=model,
         train_loader=train_dl,
         train_baseline_log_likelihood=baseline_ll["train"],
@@ -237,7 +241,7 @@ def train_stage(run_cfg: RunCfg) -> None:
         is_distributed=ddp.enabled,
         is_master=ddp.is_master,
         logger=logging.getLogger("trainer"),
-        train_sampler=train_dl.sampler if hasattr(train_dl, "sampler") else None,
+        train_sampler=train_sampler_for_loop,
     )
 
     ddp.cleanup()
@@ -292,7 +296,7 @@ def _load_cfg(path: str) -> RunCfg:
     stage_raw = raw.get("stage", {})
     stage_cfg = StageCfg(
             kind        = stage_raw["kind"],
-            name        = stage_raw.get("name", stage_raw["kind"]),
+            name        = stage_raw.get("name"),
             model_key   = stage_raw["model_key"],
             dataset_key = stage_raw["dataset_key"],
             lr = stage_raw.get("lr", 5e-4),
