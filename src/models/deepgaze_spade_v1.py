@@ -1,3 +1,10 @@
+"""
+This file contains the implementation of the DeepGazeIII model with SPADE layers.
+It uses a DenseNet-201 backbone and supports both spatial and scanpath-based saliency prediction.
+It uses Densenet features for the main saliency pathway and a separate semantic map for SPADE modulation.
+This version uses no semantic painting, the embedding is learned through time.
+"""
+
 # src/models/densenet_spade.py
 import torch
 import torch.nn as nn
@@ -5,7 +12,7 @@ import math
 from torch.nn import functional as F
 
 from src.registry import register_model
-from src.modules import (
+from src.modules import ( 
     Finalizer, build_scanpath_network, encode_scanpath_features,
     build_fixation_selection_network, FeatureExtractor
 )
@@ -100,7 +107,7 @@ def _build_densenet_backbone(device='cpu'):
         main_path_channels = sum(f.shape[1] for f in dummy_out)
     return features_module, main_path_channels
 
-@register_model("densenet_spade")
+@register_model("deepgaze_spade_v1")
 def build(cfg):
     """Constructs DeepGazeIII with DenseNet and SPADE."""
     extra = cfg.stage.extra

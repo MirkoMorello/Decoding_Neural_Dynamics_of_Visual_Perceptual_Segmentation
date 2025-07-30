@@ -18,7 +18,6 @@ from src.modules import (
     build_scanpath_network, encode_scanpath_features
 )
 from src.dinov2_backbone import DinoV2Backbone
-# We need both the dynamic saliency head and the dynamic fixation selection head
 from src.models.common.spade_layers import (
     SaliencyNetworkSPADEDynamic,
     FixationSelectionNetworkSPADEDynamic 
@@ -41,7 +40,7 @@ except ImportError:
 # 1. COMPLETE MODEL CLASS DEFINITION
 # =============================================================================
 
-class DeepgazeSpadeHybrid(nn.Module):
+class DeepgazeSpadeV3(nn.Module):
     """
     A saliency model combining DenseNet features with DINO-based dynamic SPADE.
     This version supports both spatial and scanpath training stages.
@@ -75,7 +74,6 @@ class DeepgazeSpadeHybrid(nn.Module):
         self.dino_features.eval()
 
     def _create_painted_semantic_map_vectorized(self, F_dino_patches, raw_sam_pixel_segmap):
-        # This function remains the same as before.
         B, C_dino, H_p, W_p = F_dino_patches.shape
         _, H_img, W_img = raw_sam_pixel_segmap.shape
         device = F_dino_patches.device
@@ -137,7 +135,6 @@ class DeepgazeSpadeHybrid(nn.Module):
             scanpath_out = torch.zeros(B, 16, H, W, device=device) # Assuming scanpath head outputs 16 channels
 
         # 7. Final Fixation Selection (SPADE-modulated)
-        # It now correctly receives the painted map for its own SPADE layers.
         final_readout = self.fixation_selection_network((saliency_output, scanpath_out), painted_map)
         
         # 8. Finalizer
@@ -150,7 +147,7 @@ class DeepgazeSpadeHybrid(nn.Module):
 # 2. MODEL BUILDER FUNCTION
 # =============================================================================
 
-@register_model("hybrid_spade")
+@register_model("deepgaze_spade_v3")
 def build(cfg):
     """
     Builds the complete DeepgazeSpadeHybrid from a configuration object.
@@ -212,7 +209,7 @@ def build(cfg):
     )
     
     # 5. Assemble the final model
-    model = DeepgazeSpadeHybrid(
+    model = DeepgazeSpadeV3(
         densenet_features=densenet_features,
         dino_features=dino_semantic_features,
         saliency_network=saliency_net,

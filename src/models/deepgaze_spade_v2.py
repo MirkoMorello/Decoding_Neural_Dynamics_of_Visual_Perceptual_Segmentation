@@ -39,7 +39,7 @@ except ImportError:
 # 1. COMPLETE MODEL CLASS DEFINITION
 # =============================================================================
 
-class DeepGazeIIIDynamicEmbedding(nn.Module):
+class DeepgazeSpadeV2(nn.Module):
     """
     The complete DeepGazeIII model with a DenseNet backbone and dynamic SPADE.
     This version supports both spatial and scanpath training stages.
@@ -172,7 +172,7 @@ def _build_densenet_backbone_and_channels():
         
     return features_module, main_path_channels, dummy_output
 
-@register_model("densenet_spade_dynamic")
+@register_model("deepgaze_spade_v2")
 def build(cfg):
     """
     Builds the complete DeepGazeIIIDynamicEmbedding model from a configuration object.
@@ -205,7 +205,7 @@ def build(cfg):
     )
     
     # 3. Assemble the final model
-    model = DeepGazeIIIDynamicEmbedding(
+    model = DeepgazeSpadeV2(
         features_module=features,
         saliency_network=saliency_net,
         fixation_selection_network=fixsel_net,
