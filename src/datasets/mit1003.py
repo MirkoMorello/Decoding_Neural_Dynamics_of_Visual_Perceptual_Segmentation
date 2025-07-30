@@ -1,6 +1,9 @@
+# Place this in the same file where you have @register_data("MIT1003")
+# This is a complete replacement for your existing prepare_mit1003 function.
+
 import torch
 import pysaliency
-from torch.utils.data import DataLoader, DistributedSampler, Subset
+from torch.utils.data import DataLoader
 import cloudpickle as cpickle
 from pathlib import Path
 from boltons.fileutils import atomic_save
@@ -86,18 +89,21 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
     stim_train, scan_train = pysaliency.dataset_config.train_split(stimuli_resized, scanpaths_resized, crossval_folds=10, fold_no=fold)
     stim_val, scan_val = pysaliency.dataset_config.validation_split(stimuli_resized, scanpaths_resized, crossval_folds=10, fold_no=fold)
     
-    # Convert to fixations for baseline calculation
-    fix_train = scan_train.to_fixations()
-    fix_val = scan_val.to_fixations()
+    fix_train = scan_train
+    fix_val = scan_val
 
-    # The baseline model should be trained on the full dataset for cross-validation
-    centerbias = pysaliency.baseline_utils.CrossvalidatedBaselineModel(stimuli_resized, scanpaths_resized.to_fixations())
+    centerbias = pysaliency.baseline_utils.CrossvalidatedBaselineModel(
+        stimuli_resized, 
+        scanpaths_resized, 
+        bandwidth=10**-1.6667673342543432, 
+        eps=10**-14.884189168516073, 
+        caching=False
+    )
 
     train_ll, val_ll = None, None
     if ddp_ctx.is_master:
-        # It's better to cache baselines per fold to avoid re-computation
         baseline_cache_dir = cfg.paths["train_dir"] / "MIT1003_baseline_cache"
-        baseline_cache_dir.mkdir(exist_ok=True)
+        baseline_cache_dir.mkdir(exist_ok=True, parents=True)
         train_ll_cache = baseline_cache_dir / f'train_ll_fold{fold}.pkl'
         val_ll_cache = baseline_cache_dir / f'val_ll_fold{fold}.pkl'
         
@@ -115,14 +121,13 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
 
         logger.info(f"MIT1003 Fold {fold} Baselines - Train LL: {train_ll:.4f}, Val LL: {val_ll:.4f}")
 
-    # Broadcast baseline values to all processes
     ll_bcast = [train_ll, val_ll]
     if ddp_ctx.enabled:
         torch.distributed.broadcast_object_list(ll_bcast, src=0)
     train_ll, val_ll = ll_bcast
     baseline_ll = {"train": train_ll, "val": val_ll}
 
-    # 3. Create Datasets based on explicit stage configuration
+    # --- Step 3. Create Datasets based on explicit stage configuration ---
     model_requires_segmentation = extra.get("requires_segmentation", False)
     is_scanpath_stage = extra.get("is_scanpath_stage", False)
     
@@ -153,32 +158,40 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
         train_dataset = DatasetClass(stim_train, fix_train, centerbias, **ds_kwargs)
         val_dataset = DatasetClass(stim_val, fix_val, centerbias, **ds_kwargs)
 
-    # 4. Create DataLoaders with shape-aware sampling
-    train_sampler = None # Will be used by _train for DDP set_epoch
-    if ddp_ctx.enabled:
-        # Create a sampler that deals with the whole dataset
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=True)
-        # Create a subset of the dataset for the current rank to use with the shape-aware sampler
-        rank_subset_indices = list(iter(train_sampler))
-        rank_train_dataset = Subset(train_dataset, rank_subset_indices)
-        
-        train_batch_sampler = ImageDatasetSampler(
-            data_source=rank_train_dataset,
-            batch_size=cfg.stage.batch_size,
-            shuffle=True
-        )
-        train_loader = DataLoader(
-            rank_train_dataset,
-            batch_sampler=train_batch_sampler,
-            num_workers=cfg.num_workers,
-            pin_memory=True
-        )
-    else:
-        # For single GPU, the shape-aware sampler works on the whole dataset
-        train_batch_sampler = ImageDatasetSampler(train_dataset, batch_size=cfg.stage.batch_size, shuffle=True)
-        train_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, num_workers=cfg.num_workers, pin_memory=True)
+    # --- Step 4. Create DataLoaders with shape-aware sampling (CORRECTED) ---
+    logger.info("Creating DataLoaders with DDP-aware ImageDatasetSampler for both train and validation.")
 
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if ddp_ctx.enabled else None
-    val_loader = DataLoader(val_dataset, batch_size=cfg.stage.batch_size * 2, sampler=val_sampler, num_workers=cfg.num_workers, pin_memory=True, shuffle=False)
+    # 4a. Create the TRAIN loader
+    train_batch_sampler = ImageDatasetSampler(
+        data_source=train_dataset,
+        batch_size=cfg.stage.batch_size,
+        shuffle=True,
+        drop_last=True,  # Recommended for DDP to prevent hangs on uneven data splits
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_batch_sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        persistent_workers=cfg.num_workers > 0
+    )
+
+    # 4b. Create the VALIDATION loader
+    # Using the same sampler here solves the crash during validation.
+    val_batch_sampler = ImageDatasetSampler(
+        data_source=val_dataset,
+        batch_size=cfg.stage.batch_size, 
+        shuffle=False,                       # No need to shuffle validation data
+        drop_last=False,                     # Process all validation samples
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=val_batch_sampler,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        persistent_workers=cfg.num_workers > 0
+    )
 
     return train_loader, val_loader, baseline_ll
