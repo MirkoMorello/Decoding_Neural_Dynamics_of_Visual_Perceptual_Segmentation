@@ -119,36 +119,51 @@ class LayerNorm(nn.Module):
 
 
 def gaussian_filter_1d(tensor, dim, sigma, truncate=4, kernel_size=None, padding_mode='replicate', padding_value=0.0):
+    """
+    A torch.compile-friendly 1D Gaussian filter.
+    """
     sigma = torch.as_tensor(sigma, device=tensor.device, dtype=tensor.dtype)
 
     if kernel_size is not None:
+        # Ensure kernel_size is a tensor on the correct device
         kernel_size = torch.as_tensor(kernel_size, device=tensor.device, dtype=torch.int64)
     else:
-        kernel_size = torch.as_tensor(2 * torch.ceil(truncate * sigma) + 1, device=tensor.device, dtype=torch.int64)
+        # Calculate kernel_size using torch ops. It remains a tensor.
+        kernel_size = 2 * torch.ceil(truncate * sigma) + 1
+        # It's important that kernel_size ends up as an integer for padding calculations.
+        # Since it's calculated from constants and a scalar sigma, this is safe.
+        kernel_size = kernel_size.long()
 
-    kernel_size = kernel_size.detach()
 
-    kernel_size_int = kernel_size.detach().cpu().numpy()
+    # We need the kernel size as a Python integer for F.pad and creating the grid.
+    # .item() is the correct, compile-friendly way to get the value of a 0-dim tensor.
+    # This will create a "graph break", but it's a necessary and static one if sigma
+    # is constant, which is much better than a .cpu().numpy() call.
+    kernel_size_int = kernel_size.item()
 
-    mean = (torch.as_tensor(kernel_size, dtype=tensor.dtype) - 1) / 2
+    # The kernel is always odd, so (kernel_size_int - 1) is even.
+    # Integer division `//` is all we need. No need for math.ceil.
+    # This is pure Python integer arithmetic, which is fine.
+    padding_val = (kernel_size_int - 1) // 2
+    padding = (padding_val, padding_val)
 
-    grid = torch.arange(kernel_size, device=tensor.device) - mean
+    # The rest of the function can now use the correctly-computed integer values
+    mean = (kernel_size_int - 1) / 2
+    grid = torch.arange(kernel_size_int, device=tensor.device) - mean
 
-    kernel_shape = (1, 1, kernel_size)
+    kernel_shape = (1, 1, kernel_size_int)
     grid = grid.view(kernel_shape)
-
+    # No need to detach the grid if its components are already constants or detached.
+    # But it's good practice to ensure it doesn't carry a grad history.
     grid = grid.detach()
 
     source_shape = tensor.shape
-
     tensor = torch.movedim(tensor, dim, len(source_shape)-1)
     dim_last_shape = tensor.shape
-    assert tensor.shape[-1] == source_shape[dim]
 
-    # we need reshape instead of view for batches like B x C x H x W
     tensor = tensor.reshape(-1, 1, source_shape[dim])
 
-    padding = (math.ceil((kernel_size_int - 1) / 2), math.ceil((kernel_size_int - 1) / 2))
+    # F.pad is fine now because `padding` is a tuple of Python integers.
     tensor_ = F.pad(tensor, padding, padding_mode, padding_value)
 
     # create gaussian kernel from grid using current sigma
