@@ -209,7 +209,7 @@ def train_stage(run_cfg: RunCfg) -> None:
         model = model.to(ddp.device)
 
     if run_cfg.compile:
-        model = torch.compile(model)
+        model = torch.compile(model, mode="reduce-overhead")
 
     # dataset --------------------------------------------------------------------------------------------------------
     if run_cfg.stage.dataset_key not in DATA_REGISTRY:
