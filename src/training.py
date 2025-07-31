@@ -599,6 +599,24 @@ def restore_from_checkpoint(model: torch.nn.Module,
     except Exception as e:
         logger.error(f"Failed to load checkpoint file '{path}'. Error: {e}", exc_info=True)
         return 0, np.nan, False
+        
+    # Restore RNG states first, if they exist in the checkpoint.
+    # This is crucial for bit-for-bit reproducibility of data shuffling.
+    if isinstance(checkpoint_content, dict):
+        if 'rng_state' in checkpoint_content:
+            try:
+                torch.set_rng_state(checkpoint_content['rng_state'].cpu()) # RNG state must be on CPU
+                logger.info("CPU RNG state restored.")
+            except Exception as e:
+                logger.warning(f"Could not restore CPU RNG state. Sampler sequence may differ. Error: {e}")
+        
+        if 'cuda_rng_state' in checkpoint_content and scaler is not None and device.type == 'cuda':
+            try:
+                # This should be a list of tensors, one for each CUDA device
+                torch.cuda.set_rng_state_all(checkpoint_content['cuda_rng_state'])
+                logger.info("CUDA RNG states restored.")
+            except Exception as e:
+                logger.warning(f"Could not restore CUDA RNG states. Error: {e}")
 
     model_state_dict = _extract_model_state_dict_from_checkpoint(checkpoint_content, logger)
 
@@ -618,7 +636,7 @@ def restore_from_checkpoint(model: torch.nn.Module,
     
     if load_weights_only:
         logger.info("`load_weights_only` is True. Skipping optimizer, scheduler, and epoch state. Starting fresh.")
-        return 0, np.nan, False # Return epoch 0, no loss, scheduler not restored
+        return 0, np.nan, False
 
     scheduler_restored_flag = False
     if isinstance(checkpoint_content, dict):
@@ -626,6 +644,7 @@ def restore_from_checkpoint(model: torch.nn.Module,
             try:
                 optimizer.load_state_dict(checkpoint_content['optimizer'])
                 logger.info("Optimizer state restored.")
+                # Move optimizer state tensors to the correct device
                 for state in optimizer.state.values(): 
                     for k, v in state.items():
                         if isinstance(v, torch.Tensor): state[k] = v.to(device)
@@ -669,8 +688,8 @@ def save_training_state(model, optimizer, scheduler, scaler, step, loss, path,
             'grad_scaler': scaler.state_dict(),
             'step': step,
             'loss': loss,
-            # 'rng_state': torch.get_rng_state(), # Optional
-            # 'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None, # Optional
+            'rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True) # Ensure dir exists
         with atomic_save(path, text_mode=False, overwrite_part=True) as f:
@@ -784,7 +803,7 @@ def _train(this_directory, model,
         current_epoch_step, last_avg_train_loss_epoch, scheduler_state_restored = restore_from_checkpoint(
             model, optimizer, lr_scheduler, scaler, str(checkpoint_path_to_attempt_restore), device,
             is_distributed, logger,
-            load_weights_only=is_finetuning_from_external_ckpt # Pass the flag
+            load_weights_only=is_finetuning_from_external_ckpt
         )
         if is_master:
             if is_finetuning_from_external_ckpt:
