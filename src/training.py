@@ -778,6 +778,10 @@ def _train(this_directory, model,
         except Exception as e:
             logger.error(f"Failed to create TensorBoard SummaryWriter at {tb_log_dir}: {e}. TB logging disabled.", exc_info=True)
 
+    # Initialize checkpoint-related variables before the logic block.
+    checkpoint_path_to_attempt_restore = None
+    is_finetuning_from_external_ckpt = False
+
     # Priority 1: Check for a local checkpoint to resume an interrupted run.
     intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
     if intermediate_checkpoints:
