@@ -223,7 +223,7 @@ class Finalizer(nn.Module):
         out = out[:, 0, :, :]
 
         # add to center bias
-        out = out + self.center_bias_weight * downscaled_centerbias
+        out = out.clone() + self.center_bias_weight * downscaled_centerbias # clone to avoid in-place operation warnings
 
         out = F.interpolate(out[:, np.newaxis, :, :], size=[centerbias.shape[1], centerbias.shape[2]])[:, 0, :, :]
 
