@@ -1,0 +1,94 @@
+\RequirePackage{geometry}
+\RequirePackage{graphicx}
+
+
+\RequirePackage[osf,sc]{mathpazo}
+\linespread{1.05}
+
+\RequirePackage{fontspec}
+\newfontface\unimifont{Adobe Garamond Pro}
+
+
+\newcommand{\supervisortext}{supervisor}
+\newcommand{\cosupervisortext}{{co-supervisor}}
+\newcommand{\matrtext}{registration nr}
+
+\newcommand{\logoleft}[1]{\newcommand{\@logoleft}{#1}}
+\newcommand{\logocenter}[1]{\newcommand{\@logocenter}{#1}}
+\newcommand{\logoright}[1]{\newcommand{\@logoright}{#1}}
+\newcommand{\department}[1]{\newcommand{\@department}{#1}}
+\newcommand{\university}[1]{\newcommand{\@university}{#1}}
+\newcommand{\degree}[1]{\newcommand{\@degree}{#1}}
+\newcommand{\predegree}[1]{\newcommand{\@predegree}{#1}}
+\newcommand{\supervisor}[1]{\newcommand{\@supervisor}{#1}}
+\newcommand{\cosupervisor}[1]{\newcommand{\@cosupervisor}{#1}}
+\newcommand{\matr}[1]{\newcommand{\@matr}{#1}}
+\newcommand{\maketitlepage}{
+	\begin{titlepage}
+		% \thispagestyle{empty}
+		\newgeometry{top=2.5cm,left=3cm,right=3cm,bottom=2cm}
+
+		\begin{center}
+			\Large
+			% \ifdefined \@logo
+			% 	\includegraphics[height=5cm]{\@logo}
+			% 	\vspace{5mm}
+			% \fi
+			
+			\begin{tabular}{ccc}
+				\includegraphics[height=3.5cm]{\@logoleft} &
+				\hspace{1.5cm}
+				\includegraphics[height=3.5cm]{\@logocenter} &
+				\hspace{1.5cm}
+				\includegraphics[height=3.5cm]{\@logoright} \\
+        	\end{tabular}
+			\vspace{5mm}
+
+			\ifdefined \@university
+				{\huge\unimifont\MakeUppercase\@university}\\[1ex]
+			\fi
+
+			\ifdefined \@department
+				\@department\\[1ex]
+			\fi%
+			
+			\ifdefined \@predegree
+				\vspace{3mm}
+				{\@predegree}\\
+			\fi%
+			\ifdefined \@degree
+				\emph{\@degree}
+			\fi%
+
+			\par
+			\hrulefill
+		\end{center}
+		\vspace{1.5cm}
+		\begin{center}
+			\Huge{\textsc{\expandafter{\@title}}}
+		\end{center}
+		\vspace{13mm}
+		\begin{flushright}
+			\Large \@author
+			\vspace{1mm}
+			\ifdefined \@matr
+				\\ \item[\bfseries\footnotesize\MakeUppercase{\matrtext}] \large \@matr
+			\fi
+		\end{flushright}
+		\vspace{20mm}
+		\begin{description}
+			\large
+			\ifdefined \@supervisor
+			\item[\bfseries\footnotesize\MakeUppercase{\supervisortext}] \@supervisor
+			      \fi
+			      \ifdefined \@cosupervisor
+			\item[\bfseries\footnotesize\MakeUppercase{\cosupervisortext}] \@cosupervisor
+			      \fi
+		\end{description}
+		\vfill
+		\begin{center}
+			\large \@date
+		\end{center}
+		\restoregeometry
+	\end{titlepage}
+}
