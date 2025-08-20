@@ -612,8 +612,14 @@ def restore_from_checkpoint(model: torch.nn.Module,
         
         if 'cuda_rng_state' in checkpoint_content and scaler is not None and device.type == 'cuda':
             try:
-                # This should be a list of tensors, one for each CUDA device
-                torch.cuda.set_rng_state_all(checkpoint_content['cuda_rng_state'])
+                # Load the state
+                cuda_rng_state = checkpoint_content['cuda_rng_state']
+                # Ensure it's a list of ByteTensors
+                if isinstance(cuda_rng_state, list):
+                    casted_rng_state = [s.to(dtype=torch.uint8) for s in cuda_rng_state] # Cast each tensor
+                    torch.cuda.set_rng_state_all(casted_rng_state)
+                else: # Handle older single-tensor format if necessary
+                    torch.cuda.set_rng_state(cuda_rng_state.to(dtype=torch.uint8)) # Cast the single tensor
                 logger.info("CUDA RNG states restored.")
             except Exception as e:
                 logger.warning(f"Could not restore CUDA RNG states. Error: {e}")
@@ -713,7 +719,8 @@ def _train(this_directory, model,
            device=None,
            is_distributed=False, is_master=True,
            logger=None,
-           train_sampler=None):
+           train_sampler=None,
+           is_finetuning_run=False):
     """ Main training loop. Now uses logger passed from the main script. """
 
     if logger is None:
@@ -780,22 +787,19 @@ def _train(this_directory, model,
 
     # Initialize checkpoint-related variables before the logic block.
     checkpoint_path_to_attempt_restore = None
-    is_finetuning_from_external_ckpt = False
-
+    
     # Priority 1: Check for a local checkpoint to resume an interrupted run.
     intermediate_checkpoints = sorted(output_dir_path.glob('step-*.pth'))
     if intermediate_checkpoints:
         checkpoint_path_to_attempt_restore = intermediate_checkpoints[-1]
-        is_finetuning_from_external_ckpt = False # This is a resumption, not fine-tuning
         if is_master:
             logger.info(f"Found local checkpoint. Resuming interrupted run from: {checkpoint_path_to_attempt_restore}")
     
     # Priority 2: If no local checkpoint, check for an external one from the config for fine-tuning.
-    elif startwith and Path(startwith).exists():
-        checkpoint_path_to_attempt_restore = startwith
-        is_finetuning_from_external_ckpt = True # This is for fine-tuning
+    elif is_finetuning_run:
         if is_master:
-            logger.info(f"No local checkpoint found. Starting fine-tuning from external checkpoint: {startwith}")
+            logger.info("Starting new fine-tuning stage. Weights were pre-loaded. Training starts from scratch for this stage.")
+        # `checkpoint_path_to_attempt_restore` remains None, which is correct.
     
     # Priority 3: No checkpoints found at all.
     else:
@@ -803,20 +807,18 @@ def _train(this_directory, model,
             logger.info("No local or external checkpoint found. Starting training from scratch.")
 
     # Now, attempt to restore if a path was determined.
+    load_weights_only_flag = False # We never need to load weights only inside this loop
     if checkpoint_path_to_attempt_restore:
         current_epoch_step, last_avg_train_loss_epoch, scheduler_state_restored = restore_from_checkpoint(
             model, optimizer, lr_scheduler, scaler, str(checkpoint_path_to_attempt_restore), device,
             is_distributed, logger,
-            load_weights_only=is_finetuning_from_external_ckpt
+            load_weights_only=load_weights_only_flag 
         )
         if is_master:
-            if is_finetuning_from_external_ckpt:
-                logger.info(f"Fine-tuning started with weights from: {checkpoint_path_to_attempt_restore}. Training starts at Epoch 1.")
-            else:
-                 logger.info(
-                    f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
-                    f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}"
-                )
+            logger.info(
+                f"Restored state from {checkpoint_path_to_attempt_restore}. Resuming from epoch {current_epoch_step + 1}. "
+                f"Last train loss: {last_avg_train_loss_epoch:.5f}. Scheduler restored: {scheduler_state_restored}"
+            )
     elif startwith: # This case handles when `startwith` was provided but the file didn't exist.
         logger.warning(f"'startwith' checkpoint '{startwith}' not found. Starting fresh.")
 
