@@ -873,7 +873,7 @@ class ImageDatasetSampler(Sampler[list[int]]):
         self.epoch = 0
 
         # Get all shapes once from the full dataset
-        self.shapes = self.data_source.get_shapes()
+        self.shapes = self.data_source.dataset.get_shapes() if isinstance(self.data_source, torch.utils.data.Subset) else self.data_source.get_shapes()
 
         # DDP logic: ensure every GPU sees the same number of samples
         if self.drop_last and len(self.data_source) % self.num_replicas != 0:
