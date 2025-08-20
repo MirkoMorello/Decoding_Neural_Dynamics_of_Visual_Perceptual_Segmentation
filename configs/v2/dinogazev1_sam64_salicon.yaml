@@ -11,8 +11,8 @@ stage:
   # --- Hyperparameters for this stage ---
   lr: 0.0001
   milestones: [15, 20, 25, 30, 35]
-  batch_size: 2
-  grad_acc_steps: 2
+  batch_size: 4
+  grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
   resume_ckpt: null # No resume for the first pre-training stage (unless interrupted)
@@ -47,9 +47,9 @@ stage:
 
 
 # --- Global Run Settings ---
-compile: true
-seed: 42
-num_workers: 'auto'
+compile: false
+seed: 43
+num_workers: 4
 
 # --- Path Configuration ---
 paths:

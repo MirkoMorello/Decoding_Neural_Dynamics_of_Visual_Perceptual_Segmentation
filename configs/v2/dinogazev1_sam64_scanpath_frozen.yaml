@@ -10,16 +10,16 @@ stage:
   dataset_key: "MIT1003"
   
   # --- Hyperparameters for this stage ---
-  lr: 0.0005 # From your old lr_mit_scanpath_frozen
+  lr: 0.00005 # From your old lr_mit_scanpath_frozen
   milestones: [10, 20, 30, 35, 40]
-  batch_size: 2
-  grad_acc_steps: 1
+  batch_size: 1
+  grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
   
   # --- CHECKPOINT CHAINING ---
   # Loads the model trained in the MIT spatial stage.
-  resume_ckpt: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/final_best_val.pth"
+  resume_ckpt: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/step-0002.pth"
 
   # --- Model- and Data-specific parameters ---
   extra:
@@ -41,9 +41,9 @@ stage:
     mask_dir: 'masks/mit1003/sam_vitl_k64_mit'
 
 # --- Global Run Settings ---
-compile: true
+compile: false
 seed: 42
-num_workers: 'auto'
+num_workers: 4
 
 # --- Global Path Configuration ---
 paths:

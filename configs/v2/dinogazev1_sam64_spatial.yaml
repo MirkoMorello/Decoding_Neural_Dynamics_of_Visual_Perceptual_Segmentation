@@ -12,15 +12,15 @@ stage:
   # --- Hyperparameters for this stage ---
   lr: 0.00005 # From your old lr_mit_spatial
   milestones: [10, 20, 30, 35]
-  batch_size: 2
-  grad_acc_steps: 1
+  batch_size: 1
+  grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
   
   # --- CHECKPOINT CHAINING ---
   # This path is now predictable based on the 'kind' and 'name' of the previous stage.
   #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
-  resume_ckpt : "experiments/dinogaze_spade_v1_sam64/step-0004.pth"
+  resume_ckpt : "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/step-0004.pth"
   # --- Model- and Data-specific parameters ---
   extra:
     # Model parameters (can be the same or different from pre-training)
@@ -40,7 +40,7 @@ stage:
 # --- Global Run Settings ---
 compile: false
 seed: 42
-num_workers: 'auto'
+num_workers: 6
 
 # --- Global Path Configuration ---
 paths:
