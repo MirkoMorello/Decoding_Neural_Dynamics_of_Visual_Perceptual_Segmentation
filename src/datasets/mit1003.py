@@ -14,6 +14,7 @@ from src.data import (
     FixationDatasetWithSegmentation, FixationMaskTransform,
     convert_stimuli, convert_fixation_trains, ImageDatasetSampler
 )
+from torch.utils.data.distributed import DistributedSampler
 
 # Define a constant for the project root to resolve relative paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
@@ -102,7 +103,7 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
 
     train_ll, val_ll = None, None
     if ddp_ctx.is_master:
-        baseline_cache_dir = cfg.paths["train_dir"] / "MIT1003_baseline_cache"
+        baseline_cache_dir = cfg.paths["dataset_dir"] / "MIT1003_baseline_cache"
         baseline_cache_dir.mkdir(exist_ok=True, parents=True)
         train_ll_cache = baseline_cache_dir / f'train_ll_fold{fold}.pkl'
         val_ll_cache = baseline_cache_dir / f'val_ll_fold{fold}.pkl'
@@ -158,17 +159,17 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
         train_dataset = DatasetClass(stim_train, fix_train, centerbias, **ds_kwargs)
         val_dataset = DatasetClass(stim_val, fix_val, centerbias, **ds_kwargs)
 
-    # --- Step 4. Create DataLoaders with shape-aware sampling (CORRECTED) ---
-    logger.info("Creating DataLoaders with DDP-aware ImageDatasetSampler for both train and validation.")
+    # --- Step 4. Create DataLoaders ---
+    logger.info("Creating DataLoaders to match the old script's behavior.")
+    logger.warning("Using standard DistributedSampler for validation, which may be unstable.")
 
-    # 4a. Create the TRAIN loader
+    # 4a. Create the TRAIN loader (This part is IDENTICAL to the old script, which used ImageDatasetSampler)
     train_batch_sampler = ImageDatasetSampler(
         data_source=train_dataset,
         batch_size=cfg.stage.batch_size,
         shuffle=True,
-        drop_last=True,  # Recommended for DDP to prevent hangs on uneven data splits
+        drop_last=True,
     )
-    
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_batch_sampler,
@@ -177,21 +178,32 @@ def prepare_mit1003(cfg, ddp_ctx, logger):
         persistent_workers=cfg.num_workers > 0
     )
 
-    # 4b. Create the VALIDATION loader
-    # Using the same sampler here solves the crash during validation.
-    val_batch_sampler = ImageDatasetSampler(
-        data_source=val_dataset,
-        batch_size=cfg.stage.batch_size, 
-        shuffle=False,                       # No need to shuffle validation data
-        drop_last=False,                     # Process all validation samples
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_sampler=val_batch_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        persistent_workers=cfg.num_workers > 0
-    )
+    # 4b. Create the VALIDATION loader (This now matches the old script's unstable method)
+    if ddp_ctx.enabled:
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=ddp_ctx.world,  # Correct attribute
+            rank=ddp_ctx.rank,          # Correct attribute
+            shuffle=False,
+            drop_last=False
+        )
+        # The dataloader needs shuffle=False because the sampler handles it
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.stage.batch_size,
+            sampler=val_sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=cfg.num_workers > 0
+        )
+    else: # Single-GPU case
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.stage.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=cfg.num_workers > 0
+        )
 
     return train_loader, val_loader, baseline_ll
