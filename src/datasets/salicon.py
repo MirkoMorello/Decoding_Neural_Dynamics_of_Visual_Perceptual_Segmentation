@@ -138,7 +138,7 @@ def prepare_salicon(cfg, ddp_ctx, logger):
 
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if ddp_ctx.enabled else None
     val_loader = DataLoader(
-        val_dataset, batch_size=cfg.stage.batch_size * 2,
+        val_dataset, batch_size=cfg.stage.batch_size,
         shuffle=False, sampler=val_sampler,
         num_workers=cfg.num_workers, pin_memory=True,
         persistent_workers=cfg.num_workers > 0
