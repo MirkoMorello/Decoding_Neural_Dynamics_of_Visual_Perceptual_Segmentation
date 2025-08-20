@@ -3,7 +3,6 @@
 Multi-GPU-ready training script for DinoGaze with DINOv2 backbone,
 SPADE normalization, and dynamic semantic embeddings from segmentation masks.
 This version has been refactored for clarity, modularity, and includes scanpath training stages.
-CORRECTED VERSION to fix MIT data pipeline discrepancies.
 """
 import os
 import sys

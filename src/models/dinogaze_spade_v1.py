@@ -119,7 +119,7 @@ class DinoGazeSpade(nn.Module):
         
         return saliency_log_density
 
-# --- BUILDER FUNCTION (Corrected) ---
+# --- BUILDER FUNCTION ---
 
 @register_model("dinogaze_spade_v1")
 def build(cfg):
