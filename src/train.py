@@ -54,6 +54,8 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
+torch.set_float32_matmul_precision('high')
+
 # -----------------------------------------------------------------------------
 #  0.  Small helper: reproducibility  -----------------------------------------
 # -----------------------------------------------------------------------------
@@ -180,7 +182,10 @@ from src.training import _train as train_loop  # ← reuse your proven routine
 
 
 def train_stage(run_cfg: RunCfg) -> None:
-
+    """
+    Manages the setup and execution of a single training stage, incorporating
+    the correct "Load-then-Freeze" logic for fine-tuning.
+    """
     ddp = _DDPCtx()
     log_level = logging.INFO if ddp.is_master else logging.WARNING
     logging.basicConfig(
@@ -195,34 +200,105 @@ def train_stage(run_cfg: RunCfg) -> None:
 
     _fix_seed(run_cfg.seed + ddp.rank)
 
-    # ------------------------------------------------------------------
-    #  Build model + dataset via registries
-    # ------------------------------------------------------------------
+    # --- 1. Build Model via Registry ---
+    logger.info("Building model on CPU...")
     if run_cfg.stage.model_key not in MODEL_REGISTRY:
         raise KeyError(f"Model '{run_cfg.stage.model_key}' not registered")
     model = MODEL_REGISTRY[run_cfg.stage.model_key](run_cfg)
 
+    # --- 2. Handle Fine-Tuning: "Load-then-Freeze" ---
+    # This block handles loading weights from a previous stage *before* freezing anything.
+    is_finetuning_from_ckpt = run_cfg.stage.resume_ckpt and Path(run_cfg.stage.resume_ckpt).exists()
+    
+    if is_finetuning_from_ckpt:
+        logger.info(f"Fine-tuning mode detected. Loading weights from: {run_cfg.stage.resume_ckpt}")
+        
+        # --- LOAD ---
+        # Load the checkpoint onto the CPU model.
+        ckpt = torch.load(run_cfg.stage.resume_ckpt, map_location='cpu', weights_only=False)
+        # Be flexible: checkpoint could be the state_dict itself or a dict containing it.
+        model_state_dict = ckpt.get('model', ckpt) 
+        
+        # Load weights with strict=False to ignore missing keys (e.g., new scanpath head)
+        # and unexpected keys (e.g., old optimizer params not part of the model).
+        missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
+        if ddp.is_master:
+            logger.info(f"Loaded weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+
+        # --- FREEZE ---
+        # Apply freezing logic *after* the correct weights have been loaded.
+        if run_cfg.stage.extra.get('freeze_saliency_network', False):
+            if hasattr(model, 'saliency_network'):
+                for param in model.saliency_network.parameters():
+                    param.requires_grad = False
+                logger.info("Saliency network has been frozen AFTER loading weights.")
+            else:
+                logger.warning("Config requested freezing, but `saliency_network` not found on model.")
+
+    # --- 3. Move to GPU, Wrap with DDP ---
+    model.to(ddp.device)
     if ddp.enabled:
-        model.to(ddp.device)
-        model = DDP(model, device_ids=[ddp.device.index], find_unused_parameters=True)
-    else:
-        model = model.to(ddp.device)
+        # If parts of the model are frozen, DDP needs `find_unused_parameters=True`
+        # to avoid errors when it doesn't see gradients for the frozen layers.
+        find_unused = run_cfg.stage.extra.get('freeze_saliency_network', False)
+        model = DDP(model, device_ids=[ddp.device.index], find_unused_parameters=find_unused)
+        if ddp.is_master:
+            logger.info(f"Wrapped model with DDP (find_unused_parameters={find_unused})")
 
-    if run_cfg.compile:
-        model = torch.compile(model, mode="reduce-overhead")
-
-    # dataset --------------------------------------------------------------------------------------------------------
+    # --- 4. Build Dataset & Optimizer (needed before potential warmup) ---
+    if ddp.is_master: logger.info("Building dataset...")
     if run_cfg.stage.dataset_key not in DATA_REGISTRY:
         raise KeyError(f"Dataset '{run_cfg.stage.dataset_key}' not registered")
     train_dl, val_dl, baseline_ll = DATA_REGISTRY[run_cfg.stage.dataset_key](run_cfg, ddp, logger)
 
-    # optim / sched --------------------------------------------------------------------------------------------------
+    if ddp.is_master: logger.info("Creating optimizer and scheduler...")
     optim, sched = make_optim_and_sched(model, run_cfg.stage)
 
+    # --- 5. Compile and Warmup ---
+    if run_cfg.compile:
+        if ddp.is_master: logger.info("Compiling model with torch.compile...")
+        model = torch.compile(model, mode="reduce-overhead")
+
+        # --- WARMUP STEP to compile the training graph before any inference ---
+        if ddp.is_master:
+            logger.info("Running a single-batch training warmup to compile the backward pass graph...")
+        try:
+            warmup_batch = next(iter(train_dl))
+            
+            # Prepare batch for model call
+            model_call_args = []
+            model_call_kwargs = {k: v.to(ddp.device, non_blocking=True) for k, v in warmup_batch.items() if isinstance(v, torch.Tensor)}
+            if 'image' in model_call_kwargs: model_call_args.append(model_call_kwargs.pop('image'))
+            if 'centerbias' in model_call_kwargs: model_call_args.append(model_call_kwargs.pop('centerbias'))
+
+            # Perform a single forward/backward pass
+            optim.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda'):
+                from src.metrics import log_likelihood # Assuming this is your loss metric
+                log_density = model(*model_call_args, **model_call_kwargs)
+                target_mask = model_call_kwargs.get('fixation_mask')
+                if isinstance(target_mask, torch.sparse.Tensor): target_mask = target_mask.to_dense()
+                loss = -log_likelihood(log_density, target_mask, weights=model_call_kwargs.get('weight'))
+
+            dummy_scaler = torch.cuda.amp.GradScaler(enabled=(ddp.device.type == 'cuda'))
+            dummy_scaler.scale(loss).backward()
+            optim.zero_grad(set_to_none=True) # Reset grads immediately, we don't want to step
+            if ddp.is_master: logger.info("Warmup successful. Compiled graph is ready.")
+        except Exception:
+            logger.error("The model warmup step failed. This indicates a potential issue.", exc_info=True)
+            raise # Re-raise the exception to stop the run
+
+    # --- 6. Call the Generic Training Loop ---
     train_sampler_for_loop = (
         train_dl.batch_sampler if hasattr(train_dl, "batch_sampler") and train_dl.batch_sampler is not None
         else train_dl.sampler if hasattr(train_dl, "sampler") else None
     )
+    
+    # We pass `startwith=run_cfg.stage.resume_ckpt` if it's NOT a fine-tuning run.
+    # If it IS a fine-tuning run, we pass `None` because we have already handled
+    # the initial load. The train_loop will then manage its own resumption for
+    # the current stage if it gets interrupted.
+    startwith_for_loop = None if is_finetuning_from_ckpt else run_cfg.stage.resume_ckpt
     
     train_loop(
         this_directory=run_cfg.paths["train_dir"] / run_cfg.stage.kind / run_cfg.stage.name,
@@ -236,12 +312,13 @@ def train_stage(run_cfg: RunCfg) -> None:
         gradient_accumulation_steps=run_cfg.stage.grad_acc_steps,
         minimum_learning_rate=run_cfg.stage.min_lr,
         validation_epochs=run_cfg.stage.val_every,
-        startwith=run_cfg.stage.resume_ckpt,
+        startwith=startwith_for_loop,
         device=ddp.device,
         is_distributed=ddp.enabled,
         is_master=ddp.is_master,
         logger=logging.getLogger("trainer"),
         train_sampler=train_sampler_for_loop,
+        is_finetuning_run=is_finetuning_from_ckpt
     )
 
     ddp.cleanup()
