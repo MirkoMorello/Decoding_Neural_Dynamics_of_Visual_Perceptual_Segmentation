@@ -6,13 +6,13 @@ sequence:
   - type: single
     # A unique name to identify this stage's output checkpoint.
     name: salicon_pretrain
-    config_path: "configs/salicon_pretrain_v1.yaml"
+    config_path: "configs/dinogazev1_sam64_salicon.yaml"
 
   # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
   - type: loop
     name: mit_spatial_finetune
     num_folds: 10
-    config_path: "configs/mit_spatial_finetune_v1.yaml" # This is your base config for this stage
+    config_path: "configs/dinogazev1_sam64_spatial.yaml"
     # The orchestrator will use the checkpoint from the 'salicon_pretrain' stage as input for each fold.
     input_checkpoint_from: salicon_pretrain
 
@@ -20,7 +20,7 @@ sequence:
   - type: loop
     name: mit_scanpath_frozen
     num_folds: 10
-    config_path: "configs/mit_scanpath_frozen_v1.yaml"
+    config_path: "configs/dinogazev1_sam64_scanpath_frozen.yaml"
     # The orchestrator will use the corresponding spatial checkpoint as input for each fold.
     # It dynamically finds the output from 'mit_spatial_finetune' for the same fold number.
     input_checkpoint_from: mit_spatial_finetune
