@@ -616,11 +616,12 @@ def restore_from_checkpoint(model: torch.nn.Module,
                 cuda_rng_state = checkpoint_content['cuda_rng_state']
                 # Ensure it's a list of ByteTensors
                 if isinstance(cuda_rng_state, list):
-                    casted_rng_state = [s.to(dtype=torch.uint8) for s in cuda_rng_state] # Cast each tensor
+                    # For DDP, get_rng_state_all() returns a list of tensors
+                    casted_rng_state = [s.cpu().to(dtype=torch.uint8) for s in cuda_rng_state]
                     torch.cuda.set_rng_state_all(casted_rng_state)
-                else: # Handle older single-tensor format if necessary
-                    torch.cuda.set_rng_state(cuda_rng_state.to(dtype=torch.uint8)) # Cast the single tensor
-                logger.info("CUDA RNG states restored.")
+                else: 
+                    # For a single GPU, it might be a single tensor
+                    torch.cuda.set_rng_state(cuda_rng_state.cpu().to(dtype=torch.uint8))
             except Exception as e:
                 logger.warning(f"Could not restore CUDA RNG states. Error: {e}")
 
