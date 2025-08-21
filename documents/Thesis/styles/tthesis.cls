@@ -9,7 +9,8 @@
 \usepackage[english]{babel}
 
 %\usepackage[latin9]{inputenc}
-\usepackage[latin1]{inputenc}
+\usepackage[utf8]{inputenc}
+
 \usepackage{lmodern} % Latin Modern font
 \usepackage[T1]{fontenc}
 

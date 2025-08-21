@@ -6,10 +6,39 @@
 %
 % toOl: the % symbol can be used for comments like C-style //
 %
-
 \epigraph{\enquote{A design of any kind shows its real value when taking beyond its original limits.}}{\emph{Tom Jennings}}
 
-Some few conventions (and an example of nested item list):
+\section{The Challenge of Predicting Human Gaze}
+\label{sec:intro_challenge}
+
+In every moment of waking life, our eyes dart across the visual world, selecting small regions to process in high detail. This sequence of fixations and rapid eye movements, known as a \textit{scanpath}, is a fundamental aspect of visually-guided behaviour. We make these selections unconsciously, a few times per second, guided by a complex interplay of low-level visual features, high-level scene semantics, and our own internal goals \cite{kummerer2023predicting}.
+
+The task of computationally modeling and predicting these gaze patterns is a cornerstone problem in vision science and artificial intelligence. A model that can accurately predict where a person will look has immediate applications in fields as diverse as human-computer interaction, medical image analysis, and autonomous driving. More fundamentally, such a model serves as a powerful tool for science, offering a quantitative and falsifiable hypothesis about the mechanisms of human attention.
+
+\section{From Spatial Saliency to Scanpath Dynamics}
+\label{sec:intro_taxonomy}
+
+The broad challenge of gaze prediction can be divided into two primary sub-problems, both of which are central to this thesis. The first, and most widely studied, is **spatial saliency prediction**. This task aims to predict the overall spatial distribution of fixations on a static image, effectively answering the question: "Where are people most likely to look in general?" The output is a single map highlighting the most attractive regions of an image.
+
+A more complex and dynamic problem is **scanpath prediction**. Here, the goal is to predict the location of the *next* fixation, given not only the image but also the history of previous fixations. This requires modeling the temporal dependencies and oculomotor biases inherent in human viewing behaviour, moving from a static prediction to a sequential one.
+
+\section{Thesis Contribution}
+\label{sec:intro_contribution}
+
+While deep learning has led to significant progress in fixation prediction, state-of-the-art models still fall short of explaining all the predictable variance in human gaze patterns \cite{kummerer2023predicting, kummerer2022deepgaze}. This thesis argues that a key limitation of current models is their implicit and often indirect use of high-level semantic information.
+
+To address this gap, we introduce \textbf{DinoGaze}, a new probabilistic model for both spatial saliency and scanpath prediction. The core contribution of our work is a novel architecture that explicitly integrates two powerful sources of information:
+\begin{enumerate}
+    \item \textbf{Rich Visual Features} from the DINOv2 vision transformer, a backbone trained with modern self-supervised learning methods.
+    \item \textbf{Explicit Semantic Guidance} from pre-computed image segmentation maps, which are injected directly into the network's normalization layers.
+\end{enumerate}
+By combining these elements, DinoGaze is designed to make more context-aware and accurate predictions. We demonstrate through extensive experiments on standard benchmarks that our approach sets a new state of the art in spatial saliency prediction and provides a strong baseline for the more challenging task of scanpath modeling.
+
+\section{Outline of the Thesis}
+\label{sec:intro_outline}
+
+The remainder of this thesis is structured as follows. \textbf{Chapter 2} provides a review of the background literature, covering the theoretical foundations of probabilistic gaze modeling, the evolution of deep learning-based saliency models, and the key architectural concepts our work builds upon. \textbf{Chapter 3} presents the detailed architecture of the DinoGaze model. \textbf{Chapter 4} describes our experimental methodology, datasets, and evaluation metrics. \textbf{Chapter 5} presents our results and analysis. Finally, \textbf{Chapter 6} concludes with a summary of our findings and a discussion of future research directions.
+
 
 \begin{itemize}
 \item In a \texttt{.tex} file, text lines can have variable length.
