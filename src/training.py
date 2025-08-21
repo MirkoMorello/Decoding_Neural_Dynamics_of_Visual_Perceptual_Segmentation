@@ -996,6 +996,8 @@ def _train(this_directory, model,
         _run_val_and_log_epoch_state(epoch_to_run, avg_train_loss_this_epoch)
         
         # Early stopping logic based on validation LL
+        should_stop = torch.tensor(0, dtype=torch.int, device=device)
+
         if is_master:
             # This logic checks if the validation Log-Likelihood ('LL') has failed to improve for 2 consecutive
             # validation runs. 'val_metrics_history' is populated by _run_val_and_log_epoch_state.
@@ -1025,10 +1027,18 @@ def _train(this_directory, model,
                         epochs_without_ll_improvement = 0
             
             if epochs_without_ll_improvement >= 2:
-                logger.info(
-                    "STOPPING EARLY: Validation LL has not improved for 2 consecutive validation runs."
-                )
-                break  # Exit the main training loop.
+                logger.info("STOPPING EARLY: Validation LL has not improved for 2 consecutive validation runs.")
+                # Master process sets its flag to 1
+                should_stop.fill_(1)
+        
+        # 2. If in DDP mode, broadcast the decision from Rank 0 to all other ranks.
+        if is_distributed:
+            dist.broadcast(should_stop, src=0)
+        
+        # 3. All processes check the synchronized flag. If it's 1, they all break the loop.
+        if should_stop.item() == 1:
+            break
+
 
         if not np.isnan(avg_train_loss_this_epoch):
             try:
@@ -1077,7 +1087,7 @@ def _train(this_directory, model,
                     
                     # Also save the model-only state for easy inference later
                     final_best_val_model_path = output_dir_path / 'final_best_val_model.pth'
-                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu')
+                    best_ckpt_data = torch.load(best_epoch_ckpt_path_final, map_location='cpu', weights_only=False)
                     model_state_dict_to_save = _extract_model_state_dict_from_checkpoint(best_ckpt_data, logger)
                     if model_state_dict_to_save:
                         torch.save(model_state_dict_to_save, str(final_best_val_model_path))
