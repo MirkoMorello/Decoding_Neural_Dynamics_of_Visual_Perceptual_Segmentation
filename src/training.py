@@ -967,6 +967,9 @@ def _train(this_directory, model,
 
     if is_master: logger.info(f"--- Starting Training Loop from Epoch {current_epoch_step + 1} ---")
     
+    # Initialize a patience counter for early stopping.
+    epochs_without_ll_improvement = 0
+    
     epoch_to_run = current_epoch_step + 1
 
     while optimizer.param_groups[0]['lr'] >= minimum_learning_rate:
@@ -991,6 +994,41 @@ def _train(this_directory, model,
 
         _run_val_and_log_epoch_state(epoch_to_run, avg_train_loss_this_epoch)
         
+        # Early stopping logic based on validation LL
+        if is_master:
+            # This logic checks if the validation Log-Likelihood ('LL') has failed to improve for 2 consecutive
+            # validation runs. 'val_metrics_history' is populated by _run_val_and_log_epoch_state.
+            ll_history = val_metrics_history.get('LL', [])
+            
+            # We need at least two scores in the history to make a comparison.
+            if len(ll_history) >= 2:
+                # Higher LL is better. "Not improving" means current LL <= previous LL.
+                last_ll = ll_history[-1]
+                previous_ll = ll_history[-2]
+
+                # Ignore comparison if either value is NaN (e.g., from a failed validation run).
+                if not np.isnan(last_ll) and not np.isnan(previous_ll):
+                    if last_ll <= previous_ll:
+                        epochs_without_ll_improvement += 1
+                        logger.warning(
+                            f"Validation LL did not improve from previous run ({previous_ll:.4f} -> {last_ll:.4f}). "
+                            f"Early stopping patience: {epochs_without_ll_improvement}/2."
+                        )
+                    else:
+                        # Improvement was detected, so reset the counter.
+                        if epochs_without_ll_improvement > 0:
+                            logger.info(
+                                f"Validation LL improved ({previous_ll:.4f} -> {last_ll:.4f}). "
+                                "Resetting early stopping patience counter."
+                            )
+                        epochs_without_ll_improvement = 0
+            
+            if epochs_without_ll_improvement >= 2:
+                logger.info(
+                    "STOPPING EARLY: Validation LL has not improved for 2 consecutive validation runs."
+                )
+                break  # Exit the main training loop.
+
         if not np.isnan(avg_train_loss_this_epoch):
             try:
                 lr_scheduler.step()
