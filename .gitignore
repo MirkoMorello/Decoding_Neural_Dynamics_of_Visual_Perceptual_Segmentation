@@ -18,6 +18,7 @@ __pycache__/
 *.lof
 *.lot
 *.nav
+thesis.pdf
 
 # C extensions
 *.so
