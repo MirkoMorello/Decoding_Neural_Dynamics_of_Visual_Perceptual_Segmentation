@@ -76,7 +76,7 @@ def run_stage(config_path: str, overrides: dict, nproc_per_node: int):
 def main():
     """Top-level function to run experiments defined in a master config."""
     parser = argparse.ArgumentParser(description="Orchestrator for multi-stage gaze prediction experiments.")
-    parser.add_argument("--master-config", type=str, default="configs/pipeline.yaml", help="Path to the master YAML file listing all experiments to run.")
+    parser.add_argument("--master-config", type=str, default="configs/v2/pipeline.yaml", help="Path to the master YAML file listing all experiments to run.")
     parser.add_argument("--nproc_per_node", type=int, default=1, help="Number of GPUs/processes. >1 enables DDP.")
     args = parser.parse_args()
 
