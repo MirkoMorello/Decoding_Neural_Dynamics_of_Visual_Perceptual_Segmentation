@@ -4,7 +4,7 @@ import subprocess
 import argparse
 import logging
 from pathlib import Path
-import copy
+import os
 import sys
 
 # Configure logging
@@ -55,21 +55,15 @@ def run_stage(config_path: str, overrides: dict, nproc_per_node: int):
 
     logging.info(f"Executing command: {' '.join(command)}")
 
-    # --- Real-time output streaming and filtering ---
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    error_keywords = ["Traceback", "Error", "Exception", "FATAL", "failed"]
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1" # Ensure real-time output for tqdm compatibility
 
-    for line in iter(process.stdout.readline, ''):
-        if nproc_per_node > 1:
-            is_error_line = any(keyword.lower() in line.lower() for keyword in error_keywords)
-            if "[RANK 0]" in line or is_error_line:
-                sys.stdout.write(line)
-        else:
-            sys.stdout.write(line)
-
-    process.wait()
-    if process.returncode != 0:
-        raise subprocess.CalledProcessError(process.returncode, command)
+    # By default, subprocess.run connects the child's stdout/stderr to the parent's.
+    try:
+        subprocess.run(command, env=env, check=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Stage '{stage_name}' failed with exit code {e.returncode}.")
+        raise # Re-raise the exception to stop the orchestration
     
     logging.info(f"STAGE COMPLETED: {stage_name}")
 
