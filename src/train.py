@@ -187,7 +187,7 @@ def train_stage(run_cfg: RunCfg) -> None:
     the correct "Load-then-Freeze" logic for fine-tuning.
     """
     ddp = _DDPCtx()
-    log_level = logging.INFO if ddp.is_master else logging.WARNING
+    log_level = logging.INFO if ddp.is_master else logging.ERROR
     logging.basicConfig(
         level=log_level,
         format=f"[%(asctime)s][RANK {ddp.rank}][%(name)s][%(levelname)s] - %(message)s",
