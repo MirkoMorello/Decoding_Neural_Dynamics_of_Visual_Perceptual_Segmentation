@@ -740,7 +740,7 @@ def _train(this_directory, model,
         logger.info(f"Output directory for this run: {output_dir_path}")
         output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    final_checkpoint_path = output_dir_path / 'final.pth'
+    final_checkpoint_path = output_dir_path / 'final_best_val.pth'
     finished_training_flag_val = 0
     if is_master and final_checkpoint_path.exists():
         logger.info(f"Final checkpoint {final_checkpoint_path} found. Training assumed complete for this directory.")
