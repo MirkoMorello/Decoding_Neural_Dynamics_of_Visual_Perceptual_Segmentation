@@ -85,6 +85,7 @@ class StageCfg:
     grad_acc_steps: int = 1
     min_lr: float = 1e-7
     val_every: int = 1
+    early_stopping_patience: int = 3       # New parameter with a default of 3
     resume_ckpt: str | None = None
     extra: Dict[str, Any] = _dc.field(default_factory=dict)
 
@@ -147,12 +148,7 @@ def _auto_import_modules():
     to ensure their builders are registered.
     """
     logger = logging.getLogger("AutoImport")
-    
-    # Get the directory of the current file (train.py)
-    # This will be /path/to/project/src/
     current_dir = Path(__file__).parent
-    
-    # Define the subdirectories to scan, relative to the current file's directory
     subdirs_to_scan = ["models", "datasets"]
     
     for subdir in subdirs_to_scan:
@@ -198,7 +194,8 @@ def train_stage(run_cfg: RunCfg) -> None:
         logger.info("DDP: world=%s rank=%s local_rank=%s", ddp.world, ddp.rank, ddp.local_rank)
         logger.info("Logging configured: Master rank will log INFO, other ranks will log WARNING and above.")
 
-    _fix_seed(run_cfg.seed + ddp.rank)
+    fold_number = run_cfg.stage.extra.get('fold', 0)
+    _fix_seed(run_cfg.seed + ddp.rank + fold_number)
 
     # --- 1. Build Model via Registry ---
     logger.info("Building model on CPU...")
@@ -312,6 +309,7 @@ def train_stage(run_cfg: RunCfg) -> None:
         gradient_accumulation_steps=run_cfg.stage.grad_acc_steps,
         minimum_learning_rate=run_cfg.stage.min_lr,
         validation_epochs=run_cfg.stage.val_every,
+        early_stopping_patience=run_cfg.stage.early_stopping_patience,
         startwith=startwith_for_loop,
         device=ddp.device,
         is_distributed=ddp.enabled,
@@ -382,6 +380,7 @@ def _load_cfg(path: str) -> RunCfg:
             grad_acc_steps = stage_raw.get("grad_acc_steps", 1),
             min_lr = stage_raw.get("min_lr", 1e-7),
             val_every = stage_raw.get("val_every", 1),
+            early_stopping_patience = stage_raw.get("early_stopping_patience", 3),
             resume_ckpt = stage_raw.get("resume_ckpt"),
             extra       = stage_raw.get("extra", {}),
 
