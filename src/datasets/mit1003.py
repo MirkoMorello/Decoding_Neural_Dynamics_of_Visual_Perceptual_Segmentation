@@ -19,61 +19,86 @@ from torch.utils.data.distributed import DistributedSampler
 # Define a constant for the project root to resolve relative paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 
+
 def _get_mit_data(cfg, ddp_ctx, logger):
     """
     Handles the acquisition and caching of MIT1003 stimuli and scanpaths.
-    This centralized function prevents redundant downloads and conversions.
+    This version correctly separates the download and load steps for pysaliency.
     """
-    # Use a more specific cache directory to avoid conflicts
     mit_converted_path = cfg.paths["dataset_dir"] / "MIT1003_converted_cache"
     stimuli_cache = mit_converted_path / "stimuli.pkl"
     scanpaths_cache = mit_converted_path / "scanpaths.pkl"
     
+    # --- 1. Master creates the cache directory if it doesn't exist ---
     if ddp_ctx.is_master:
         mit_converted_path.mkdir(parents=True, exist_ok=True)
     ddp_ctx.barrier()
-    
-    # Check if both caches exist. If so, load from them.
-    if stimuli_cache.exists() and scanpaths_cache.exists():
-        if ddp_ctx.is_master:
-            logger.info(f"Loading cached converted MIT1003 data from {mit_converted_path}")
-        with open(stimuli_cache, "rb") as f:
-            stimuli_resized = cpickle.load(f)
-        with open(scanpaths_cache, "rb") as f:
-            scanpaths_resized = cpickle.load(f)
-        return stimuli_resized, scanpaths_resized
 
-    # If caches don't exist, perform the conversion.
-    if ddp_ctx.is_master:
-        logger.info("No cached MIT1003 data found, starting conversion...")
+    # --- 2. Check for stimuli cache ---
+    if stimuli_cache.exists():
+        if ddp_ctx.is_master:
+            logger.info(f"Loading cached converted MIT1003 stimuli from {stimuli_cache}")
+    else:
+        # --- Stimuli cache is missing, must generate it ---
+        if ddp_ctx.is_master:
+            logger.info("Cached stimuli not found. Starting raw data acquisition and conversion.")
+            
+            logger.info(f"Ensuring raw MIT1003 data is downloaded to {cfg.paths['dataset_dir']}...")
+            pysaliency.get_mit1003(location=str(cfg.paths["dataset_dir"]))
+            logger.info("Raw data download/check complete.")
+            
+            # Step 2b: Now, load the raw data from the HDF5 file (which is guaranteed to exist).
+            stimuli_orig, _ = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(
+                location=str(cfg.paths["dataset_dir"]),
+                replace_initial_invalid_fixations=True
+            )
+            logger.info("Raw MIT1003 stimuli loaded. Converting...")
+            
+            stimuli_resized = convert_stimuli(stimuli_orig, mit_converted_path, ddp_ctx.is_master, ddp_ctx.enabled, ddp_ctx.device, logger)
+            
+            with atomic_save(str(stimuli_cache), text_mode=False, overwrite_part=True) as f:
+                cpickle.dump(stimuli_resized, f)
+            logger.info("Stimuli conversion complete and cached.")
+            
+        ddp_ctx.barrier() # All processes wait for master to finish writing the cache
     
-    stimuli_orig, fixations_orig = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(
-        location=str(cfg.paths["dataset_dir"]),
-        replace_initial_invalid_fixations=True
-    )
-    
-    # All processes run conversion logic, but only master writes.
-    stimuli_resized = convert_stimuli(stimuli_orig, mit_converted_path, ddp_ctx.is_master, ddp_ctx.enabled, ddp_ctx.device, logger)
-    scanpaths_resized = convert_fixation_trains(stimuli_orig, fixations_orig, ddp_ctx.is_master, logger)
-    
-    if ddp_ctx.is_master:
-        with atomic_save(str(stimuli_cache), text_mode=False, overwrite_part=True) as f:
-            cpickle.dump(stimuli_resized, f)
-        with atomic_save(str(scanpaths_cache), text_mode=False, overwrite_part=True) as f:
-            cpickle.dump(scanpaths_resized, f)
-    
-    # All processes wait for the master to finish writing before proceeding.
-    ddp_ctx.barrier()
-    
-    # Re-read from cache to ensure all processes have identical data.
-    # This avoids potential minor discrepancies if conversion logic had non-deterministic elements.
+    # --- 3. All processes now load the stimuli cache (guaranteed to exist) ---
     with open(stimuli_cache, "rb") as f:
         stimuli_resized = cpickle.load(f)
+
+    # --- 4. Check for scanpaths cache ---
+    if scanpaths_cache.exists():
+        if ddp_ctx.is_master:
+            logger.info(f"Loading cached converted MIT1003 scanpaths from {scanpaths_cache}")
+    else:
+        # --- Scanpaths cache is missing, must generate it ---
+        if ddp_ctx.is_master:
+            logger.info("Cached scanpaths not found. Starting raw data acquisition and conversion.")
+
+            # We don't need the download call again here, because if we've reached this point,
+            # the stimuli block above has already ensured the raw data exists.
+            stimuli_orig, fixations_orig = pysaliency.external_datasets.mit.get_mit1003_with_initial_fixation(
+                location=str(cfg.paths["dataset_dir"]),
+                replace_initial_invalid_fixations=True
+            )
+            logger.info("Raw MIT1003 fixations loaded. Converting...")
+
+            scanpaths_resized = convert_fixation_trains(stimuli_orig, fixations_orig, ddp_ctx.is_master, logger)
+            
+            with atomic_save(str(scanpaths_cache), text_mode=False, overwrite_part=True) as f:
+                cpickle.dump(scanpaths_resized, f)
+            logger.info("Scanpaths conversion complete and cached.")
+        
+        ddp_ctx.barrier()
+        
+    # --- 5. All processes now load the scanpaths cache (guaranteed to exist) ---
     with open(scanpaths_cache, "rb") as f:
         scanpaths_resized = cpickle.load(f)
+
+    if ddp_ctx.is_master:
+        logger.info("MIT1003 data preparation complete.")
         
     return stimuli_resized, scanpaths_resized
-
 
 @register_data("MIT1003")
 def prepare_mit1003(cfg, ddp_ctx, logger):
