@@ -718,6 +718,7 @@ def _train(this_directory, model,
            validation_epochs=1,
            startwith=None,
            device=None,
+           early_stopping_patience=3,
            is_distributed=False, is_master=True,
            logger=None,
            train_sampler=None,
@@ -1015,7 +1016,7 @@ def _train(this_directory, model,
                         epochs_without_ll_improvement += 1
                         logger.warning(
                             f"Validation LL did not improve from previous run ({previous_ll:.4f} -> {last_ll:.4f}). "
-                            f"Early stopping patience: {epochs_without_ll_improvement}/2."
+                            f"Early stopping patience: {epochs_without_ll_improvement}/{early_stopping_patience}."
                         )
                     else:
                         # Improvement was detected, so reset the counter.
@@ -1026,8 +1027,8 @@ def _train(this_directory, model,
                             )
                         epochs_without_ll_improvement = 0
             
-            if epochs_without_ll_improvement >= 2:
-                logger.info("STOPPING EARLY: Validation LL has not improved for 2 consecutive validation runs.")
+            if epochs_without_ll_improvement >= early_stopping_patience:
+                logger.info("STOPPING EARLY: Validation LL has not improved for {early_stopping_patience} consecutive validation runs.")
                 # Master process sets its flag to 1
                 should_stop.fill_(1)
         
