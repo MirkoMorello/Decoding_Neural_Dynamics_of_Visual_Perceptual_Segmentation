@@ -33,6 +33,11 @@ def run_stage(config_path: str, overrides: dict, nproc_per_node: int):
     Streams output in real-time, filtering for Rank 0 messages in DDP mode.
     """
     stage_name = overrides.get('stage.name', 'N/A')
+    final_checkpoint_path = get_output_checkpoint_path(config_path, overrides)
+    if final_checkpoint_path.exists():
+        logging.info(f"--- SKIPPING STAGE: {stage_name} ---")
+        logging.info(f"Final checkpoint already exists at: {final_checkpoint_path}")
+        return # Exit the function immediately
     logging.info("="*80)
     logging.info(f"STARTING STAGE: {stage_name}")
     logging.info(f"Using base config: {config_path}")
@@ -77,29 +82,35 @@ def main():
     with open(args.master_config, 'r') as f:
         master_config = yaml.safe_load(f)
 
-    # This dictionary will store the output paths of completed stages
-    checkpoint_store = {}
+    # This will only hold the single, static checkpoint path from the pre-training stage.
+    salicon_checkpoint_path = None
+
+    # Get the base train directory once from the first config listed.
+    # Assumes all stages use the same top-level experiment directory.
+    first_config_path = master_config['sequence'][0]['config_path']
+    with open(first_config_path, 'r') as f:
+        base_train_dir = Path(yaml.safe_load(f).get('paths', {}).get('train_dir', './experiments'))
 
     for stage in master_config['sequence']:
         stage_type = stage['type']
-        stage_name = stage['name']
         config_path = stage['config_path']
         
-        # Load the base name from the config file to construct fold names
+        # Load the kind and base_name from the specific config file for this stage.
         with open(config_path, 'r') as f:
-             base_stage_name = yaml.safe_load(f).get('stage', {}).get('name', 'base_name')
+             stage_config = yaml.safe_load(f).get('stage', {})
+             stage_kind = stage_config.get('kind')
+             base_stage_name = stage_config.get('name')
 
         if stage_type == 'single':
             overrides = {'stage.name': base_stage_name}
             run_stage(config_path, overrides, args.nproc_per_node)
-            checkpoint_store[stage_name] = get_output_checkpoint_path(config_path, overrides)
+            
+            # Store the path of the pre-training checkpoint.
+            salicon_checkpoint_path = get_output_checkpoint_path(config_path, overrides)
 
         elif stage_type == 'loop':
             input_stage_name = stage['input_checkpoint_from']
-            base_input_ckpt_path = checkpoint_store.get(input_stage_name)
-            if not base_input_ckpt_path:
-                raise ValueError(f"Checkpoint for input stage '{input_stage_name}' not found. Ensure it runs before this stage.")
-
+            
             for fold in range(stage['num_folds']):
                 fold_name = f"{base_stage_name}_fold{fold}"
                 overrides = {
@@ -107,19 +118,22 @@ def main():
                     'stage.extra.fold': fold
                 }
 
-                # Determine the correct input checkpoint for this fold
                 if input_stage_name == 'mit_spatial_finetune':
-                    # Scanpath depends on the spatial stage of the *same fold*
-                    spatial_fold_overrides = {'stage.name': f"{base_stage_name.replace('scanpath_frozen', 'spatial_finetune')}_fold{fold}"}
-                    # We need the config path of the spatial stage to calculate this
-                    spatial_config_path = next(s['config_path'] for s in master_config['sequence'] if s['name'] == 'mit_spatial_finetune')
-                    overrides['stage.resume_ckpt'] = get_output_checkpoint_path(spatial_config_path, spatial_fold_overrides)
-                else:
-                    # Spatial always depends on the single pre-train stage
-                    overrides['stage.resume_ckpt'] = base_input_ckpt_path
+                    spatial_kind = 'mit_spatial_finetune'
+                    spatial_base_name = base_stage_name.replace('scanpath_frozen', 'spatial_finetune')
+                    spatial_fold_name = f"{spatial_base_name}_fold{fold}"
+                    
+                    # The path is simply: <train_dir>/<spatial_kind>/<spatial_fold_name>/final_best_val.pth
+                    input_ckpt_path = base_train_dir / spatial_kind / spatial_fold_name / 'final_best_val.pth'
+                    
+                    overrides['stage.resume_ckpt'] = str(input_ckpt_path)
 
+                else: # This is the spatial stage, depending on the salicon pre-train.
+                    if not salicon_checkpoint_path:
+                        raise ValueError("SALICON pre-training must be run before the MIT stages.")
+                    overrides['stage.resume_ckpt'] = str(salicon_checkpoint_path)
+                
                 run_stage(config_path, overrides, args.nproc_per_node)
-                # We don't strictly need to store loop checkpoints unless another stage depends on them
         
         else:
              logging.error(f"Unknown stage type '{stage_type}' in master config.")
