@@ -970,7 +970,6 @@ def _train(this_directory, model,
     if is_master: logger.info(f"--- Starting Training Loop from Epoch {current_epoch_step + 1} ---")
     
     # Initialize a patience counter for early stopping.
-    epochs_without_ll_improvement = 0
     
     epoch_to_run = current_epoch_step + 1
 
@@ -996,47 +995,47 @@ def _train(this_directory, model,
 
         _run_val_and_log_epoch_state(epoch_to_run, avg_train_loss_this_epoch)
         
-        # Early stopping logic based on validation LL
+        # --- Early Stopping Logic ---
         should_stop = torch.tensor(0, dtype=torch.int, device=device)
-
         if is_master:
-            # This logic checks if the validation Log-Likelihood ('LL') has failed to improve for 2 consecutive
-            # validation runs. 'val_metrics_history' is populated by _run_val_and_log_epoch_state.
-            ll_history = val_metrics_history.get('LL', [])
+            best_val_epoch_num = -1
+            validation_metric_col = f'validation_{validation_metric}'
             
-            # We need at least two scores in the history to make a comparison.
-            if len(ll_history) >= 2:
-                # Higher LL is better. "Not improving" means current LL <= previous LL.
-                last_ll = ll_history[-1]
-                previous_ll = ll_history[-2]
+            if validation_metric_col in progress_df.columns:
+                # Get the series of scores, converting non-numeric to NaN and dropping them
+                valid_scores = pd.to_numeric(progress_df[validation_metric_col], errors='coerce').dropna()
 
-                # Ignore comparison if either value is NaN (e.g., from a failed validation run).
-                if not np.isnan(last_ll) and not np.isnan(previous_ll):
-                    if last_ll <= previous_ll:
-                        epochs_without_ll_improvement += 1
-                        logger.warning(
-                            f"Validation LL did not improve from previous run ({previous_ll:.4f} -> {last_ll:.4f}). "
-                            f"Early stopping patience: {epochs_without_ll_improvement}/{early_stopping_patience}."
-                        )
-                    else:
-                        # Improvement was detected, so reset the counter.
-                        if epochs_without_ll_improvement > 0:
-                            logger.info(
-                                f"Validation LL improved ({previous_ll:.4f} -> {last_ll:.4f}). "
-                                "Resetting early stopping patience counter."
+                if not valid_scores.empty:
+                    higher_is_better = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU', 'AUC_GPU']
+                    
+                    # Find the best score
+                    current_best_score = valid_scores.max() if higher_is_better else valid_scores.min()
+                    
+                    # Find the epoch of the last occurrence of the best score
+                    best_epoch_series = progress_df.loc[progress_df[validation_metric_col] == current_best_score, 'epoch']
+                    if not best_epoch_series.empty:
+                        # Get the most recent epoch that has this best score
+                        best_val_epoch_num = best_epoch_series.max()
+
+                        # Calculate epochs since this best epoch
+                        epochs_since_best = epoch_to_run - best_val_epoch_num
+                        
+                        logger.info(f"Best validation score for '{validation_metric}' was {current_best_score:.4f} at epoch {best_val_epoch_num}.")
+                        logger.info(f"Epochs since last best validation score: {epochs_since_best}/{early_stopping_patience}.")
+
+                        if epochs_since_best >= early_stopping_patience:
+                            logger.warning(
+                                f"EARLY STOPPING: Validation metric '{validation_metric}' has not improved for "
+                                f"{epochs_since_best} epochs (patience={early_stopping_patience}). "
+                                f"Best score was {current_best_score:.4f} at epoch {best_val_epoch_num}."
                             )
-                        epochs_without_ll_improvement = 0
-            
-            if epochs_without_ll_improvement >= early_stopping_patience:
-                logger.info("STOPPING EARLY: Validation LL has not improved for {early_stopping_patience} consecutive validation runs.")
-                # Master process sets its flag to 1
-                should_stop.fill_(1)
+                            should_stop.fill_(1)
         
-        # 2. If in DDP mode, broadcast the decision from Rank 0 to all other ranks.
+        # Broadcast the stopping decision from master to all other processes
         if is_distributed:
             dist.broadcast(should_stop, src=0)
         
-        # 3. All processes check the synchronized flag. If it's 1, they all break the loop.
+        # All processes check the flag and break if necessary
         if should_stop.item() == 1:
             break
 
