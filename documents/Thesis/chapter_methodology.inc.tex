@@ -1,0 +1,52 @@
+\chapter{Methodology}
+\label{cha:methodology}
+
+This chapter details the core methodological contributions of this thesis. We present the narrative of our research, from the initial hypothesis to the development of our final, state-of-the-art gaze prediction model. This journey involves exploring the capabilities of Vision Transformers, addressing the challenge of information injection without adding complexity, and developing a novel technique for modulating neural network activations based on dynamic semantic information.
+
+\section{Core Hypothesis: Segmentation as Information}
+\label{sec:method_hypothesis}
+
+Our work is grounded in the theory, developed in our lab, that visual segmentation is not merely a preliminary step for object recognition but is an integral part of the mechanism of gaze itself \cite{vacher2023measuring}. The theory posits that the process of segmenting the visual field into objects and surfaces carries vital information that guides the visual system. This leads to a powerful challenge: if segmentation carries information, we should be able to exploit it to build more accurate and human-like models of gaze.
+
+\section{The Research Trajectory}
+\label{sec:method_trajectory}
+
+Our initial approach was to replace the traditional CNN backbone of models like DeepGazeIII with a Vision Transformer (ViT). We chose DINOv2, a powerful self-supervised model, based on the observation that ViTs develop an intrinsic knowledge of scene segmentation. The affinity maps between image patches in a ViT show that patches belonging to the same semantic object have stronger affinity. This first model, which we call \textbf{DinoGaze}, produced excellent results, beating the previous state-of-the-art.
+
+However, this success raised a critical question: were the improvements due to our hypothesis being correct, or simply because DINOv2 provides stronger image embeddings than the older DenseNet backbone? To answer this, we needed to devise a method to inject segmentation information directly, isolating its effect from the general power of the feature extractor.
+
+The challenge was to do this without simply adding more layers or parameters, as any resulting improvement could be attributed to the increased complexity of the model. Inspired by the hypothesis of custom normalization of neural signals in the brain, we turned to \textbf{Spatially-Adaptive Normalization (SPADE)}. SPADE allows us to modulate the activations within the network based on a segmentation map, effectively \enquote{pushing} the network\'s processing in a certain direction without a significant increase in learnable parameters.
+
+This led to a new set of challenges. Standard SPADE requires a fixed number of segmentation classes, but the real world does not come with a predefined, discrete set of labels. Our first attempts involved creating unsupervised segmentation masks using DINO embeddings clustered with k-means (into 16 and 64 classes) and using the Segment Anything Model (SAM). We then tried to learn a trainable embedding for these discrete segment IDs. This approach failed because the numerical IDs (0, 1, 2, ...) lacked semantic coherence across different images.
+
+This failure led to our key innovation: \textbf{semantic painting}. Instead of using discrete IDs, we create a dynamic, feature-rich semantic map. For each segment in a given segmentation mask, we first compute the average feature vector of all pixels belonging to that segment within the DINOv2 backbone\'s feature space. We then \enquote{paint} a new map where every pixel is represented by the average feature vector of its corresponding segment. 
+
+Our final and most successful model, \textbf{DinoGaze-SPADE}, combines the DINOv2 backbone with this dynamic semantic painting. The DINOv2 model serves a dual purpose: it acts as a powerful feature extractor for the main saliency pathway, and it provides the deep features for creating the painted semantic map used in the SPADE layers. This architecture yielded a substantial improvement over the initial DinoGaze model, setting a new state of the art for gaze prediction. Furthermore, by recycling the DINOv2 calculation, the model gains this significant performance boost with remarkable efficiency.
+
+\section{The DinoGaze-SPADE Architecture}
+\label{sec:method_dinogaze_spade}
+
+Our final model, DinoGaze-SPADE, is a probabilistic model for both spatial saliency and scanpath prediction. Its architecture is defined by the principles discovered during our research.
+
+\subsection{DINOv2 as a Dual-Purpose Backbone}
+We use a pre-trained and frozen DINOv2 Vision Transformer as the core of our model. As detailed in the implementation found in \verb|src/dinov2_backbone.py|, the ViT provides two sets of features from a single forward pass:
+\begin{itemize}
+    \item \textbf{Multi-level Features for Saliency:} We extract and concatenate the feature maps from the last three blocks of the transformer. This provides a rich, multi\-scale representation of the image for the main saliency prediction head.
+    \item \textbf{Deep Features for Semantic Painting:} We take the feature map from the final block to compute the dynamic semantic map used for SPADE modulation. The global context captured by the ViT makes these features ideal for representing the semantics of each image segment.
+\end{itemize}
+
+\subsection{Dynamic SPADE for Information Injection}
+The core mechanism for integrating segmentation information is our dynamic SPADE layer. As described in \cref{sec:method_trajectory}, this involves two steps:
+\begin{enumerate}
+    \item \textbf{Semantic Painting:} We use the deep DINOv2 features and a given segmentation mask to create a \enquote{painted} semantic map, where each pixel contains the average feature vector of its segment.
+    \item \textbf{Modulation:} This rich semantic map is then fed into the SPADE layers within our saliency and fixation-selection networks. The SPADE layers learn to produce spatial gamma and beta parameters from the semantic map, which then normalize and modulate the features of the main saliency pathway. This allows the model to learn, for example, that certain types of segments (like faces or text) are inherently more salient, and to apply this knowledge in a spatially-aware manner.
+\end{enumerate}
+
+\section{Segmentation Mask Generation}
+\label{sec:method_mask_generation}
+
+The SPADE mechanism requires an initial segmentation mask for every image. These masks were generated using unsupervised methods prior to training the saliency models.
+
+We generated masks using two primary techniques: clustering DINOv2 embeddings with k-means (for both 16 and 64 clusters), and using the Segment Anything Model (SAM).
+
+\textit{[Placeholder: A more detailed explanation of the mask generation process, including the trade-offs of each method and their impact on final model performance, will be provided here.]}

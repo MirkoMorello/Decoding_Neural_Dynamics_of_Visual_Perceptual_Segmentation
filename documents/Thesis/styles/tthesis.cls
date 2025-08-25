@@ -73,6 +73,7 @@ frame=lines,
 basicstyle=\linespread{1.0}\ttfamily\footnotesize
 }
 
+\usepackage[hidelinks]{hyperref}
 \usepackage{cleveref}
 
 \newcommand{\printtitle}{\@title}

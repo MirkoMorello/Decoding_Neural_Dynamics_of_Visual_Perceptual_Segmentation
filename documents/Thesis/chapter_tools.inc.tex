@@ -5,4 +5,38 @@
 
 \epigraph{\enquote{I believe that inside every tool is a hammer.}}{\emph{Adam Savage}}
 
-This chapter describes the tools and frameworks used in the thesis.
+The implementation of the models and experiments described in this thesis relies on a collection of open-source software and frameworks. This chapter provides an overview of the key tools used, from the deep learning framework that forms the core of our models to the utilities for data management and document preparation. Our selection of tools was guided by the principles of reproducibility, efficiency, and community support.
+
+\section{Deep Learning and Computation}
+The core of our research involves the implementation and training of large-scale neural networks. The following tools were essential for this task.
+
+\paragraph{PyTorch.} All models were implemented using \href{https://pytorch.org/}{PyTorch}, a leading open-source deep learning framework. Its imperative programming style and dynamic computation graph (Define-by-Run) greatly facilitate research and development, allowing for flexible model architectures and easier debugging compared to static graph frameworks.
+
+\paragraph{Distributed Data Parallel (DDP).} To accelerate the training process, we leveraged multi-GPU training using PyTorch's native Distributed Data Parallel module. As detailed in \cref{sec:data_pipeline}, our training pipeline is fully DDP-aware, enabling efficient scaling of experiments across multiple processing units.
+
+\paragraph{Automatic Mixed Precision (AMP).} We utilized PyTorch's Automatic Mixed Precision capabilities to further speed up training and reduce GPU memory consumption. AMP allows for the use of both full-precision (FP32) and half-precision (FP16) floating-point numbers during training, with minimal impact on model accuracy.
+
+\section{Data Management and Processing}
+Handling large-scale saliency datasets efficiently is critical for our research.
+
+\paragraph{pysaliency.} We used the \href{https://github.com/matthias-k/pysaliency}{pysaliency} library for the initial loading and handling of standard saliency benchmarks, including \textbf{SALICON} and \textbf{MIT1003}. This library provides a convenient interface for accessing stimuli and fixation data.
+
+\paragraph{LMDB.} To mitigate I/O bottlenecks, especially in a distributed training environment, we implemented a caching system using the \textbf{Lightning Memory-Mapped Database (LMDB)}. As described in \cref{sec:data_pipeline}, our data pipeline serializes pre-processed images and centerbias maps into an LMDB, which offers high-performance read access.
+
+\paragraph{NumPy and Pillow.} The \href{https://numpy.org/}{NumPy} and \href{https://python-pillow.org/}{Pillow} libraries are fundamental components of our data pipeline, used for numerical computations and a wide range of image processing tasks, respectively.
+
+\section{Experiment Management}
+
+\paragraph{Pixi.} To ensure a fully reproducible software environment, we used \href{https://pixi.sh/}{Pixi}. It is a cross-platform package manager and workflow tool that allows us to define and lock all project dependencies, including both Python packages and system-level libraries, in the \texttt{pixi.toml} file.
+
+\paragraph{YAML and Custom Orchestrator.} Our experiments often consist of multiple stages, such as pre-training on one dataset followed by fine-tuning on another. To manage this complexity, we developed a custom orchestration script (\texttt{src/orchestrator.py}). This script reads a master configuration file written in \href{https://yaml.org/}{YAML}, which defines the sequence of experiments, their specific configurations, and the dependencies between them (e.g., using the checkpoint from one stage as input for the next).
+
+\paragraph{TensorBoard.} For monitoring and visualizing training progress, we used \href{https://www.tensorflow.org/tensorboard}{TensorBoard}. Our training loop logs key metrics such as loss, learning rate, and validation scores, allowing for real-time analysis of model performance.
+
+\section{Document Preparation}
+
+\paragraph{LaTeX.} This thesis was typeset using \LaTeX, the de facto standard for scientific and technical document preparation, valued for its high-quality typography and robust handling of complex document structures, equations, and references.
+
+\paragraph{Make.} The process of compiling the \LaTeX\ source code, converting figures, and generating the final PDF document is automated using a \texttt{Makefile}, ensuring a consistent and reproducible build process.
+
+\paragraph{BibTeX.} Bibliographic information and citations are managed using BibTeX, which facilitates the formatting and inclusion of references in the document.

@@ -6,3 +6,62 @@
 \epigraph{\enquote{Sometimes, the elegant implementation is just a function. Not a method. Not a class. Not a framework. Just a function.}}{\emph{John Carmack}}
 
 This chapter shows the details of the implementation of the work.
+
+\section{Data Pipeline and Preprocessing}
+\label{sec:data_pipeline}
+
+A robust and efficient data pipeline is crucial for training deep learning models. Our implementation, primarily located in \texttt{src/data.py}, is designed to handle large datasets and complex data types, including images, fixation data, and segmentation masks.
+
+\subsection{Dataset Handling}
+
+The pipeline supports multiple saliency datasets, including \textbf{SALICON} and \textbf{MIT1003}. We use the \texttt{pysaliency} library for initial dataset loading and management. The core of our data handling is a set of custom PyTorch \texttt{Dataset} classes:
+
+\begin{itemize}
+    \item \textbf{ImageDataset:} The base class for handling image-based spatial saliency datasets. It manages the loading of stimuli and their corresponding fixation maps.
+    \item \textbf{FixationDataset:} A specialized class for scanpath prediction, which loads individual fixations and their history.
+    \item \textbf{ImageDatasetWithSegmentation} and \textbf{FixationDatasetWithSegmentation:} These classes extend the base dataset classes to support the loading of segmentation masks, which are crucial for our SPADE-based models.
+\end{itemize}
+
+\subsection{Efficient Data Caching with LMDB}
+
+To accelerate data loading, especially in a distributed training setting, we implemented a caching mechanism using the \textbf{Lightning Memory-Mapped Database (LMDB)}. As detailed in \texttt{src/data.py}, our pipeline automatically creates an LMDB cache for each dataset. This has several advantages:
+
+\begin{itemize}
+    \item \textbf{Speed:} LMDB provides fast, memory-mapped access to the data, significantly reducing the I/O bottleneck during training.
+    \item \textbf{Efficiency:} It is particularly effective for handling a large number of small files, which is common in saliency datasets.
+    \item \textbf{DDP-Aware:} The LMDB creation process is designed to be DDP-aware. The master process creates the cache, while all other processes wait, ensuring data consistency across all workers.
+\end{itemize}
+
+\subsection{Shape-Aware Batching}
+
+Saliency datasets often contain images of different sizes. To handle this efficiently, we implemented a custom \texttt{ImageDatasetSampler}. This sampler groups images of the same shape into batches, minimizing the amount of padding required and thus improving GPU memory utilization and training speed.
+
+\section{Training and Experiment Orchestration}
+\label{sec:orchestration}
+
+Our training infrastructure is designed for flexibility, reproducibility, and scalability. The core components are the training loop and the experiment orchestrator.
+
+\subsection{The Training Loop}
+
+The main training loop, located in \texttt{src/training.py}, is a generic and powerful component that can be used for any of the models in this project. It includes several key features:
+
+\begin{itemize}
+    \item \textbf{Distributed Data Parallel (DDP):} The training loop is fully compatible with DDP, allowing for efficient multi-GPU training.
+    \item \textbf{Automatic Mixed Precision (AMP):} We use AMP to accelerate training and reduce memory consumption, with minimal impact on model performance.
+    \item \textbf{Gradient Accumulation:} This feature allows for the use of large effective batch sizes, even with limited GPU memory.
+    \item \textbf{Advanced Early Stopping:} As a methodological improvement, we modified the early stopping logic to be based on the last best validation epoch, rather than a fixed number of recent epochs. This provides a more robust criterion for stopping the training process.
+\end{itemize}
+
+\subsection{Experiment Orchestration}
+
+To manage the complexity of our experiments, which often involve multiple stages (e.g., pre-training followed by fine-tuning), we developed an experiment orchestrator, \texttt{src/orchestrator.py}. This script reads a master YAML configuration file that defines a sequence of training stages. For each stage, the orchestrator:
+
+\begin{itemize}
+    \item \textbf{Manages Configuration:} It handles the configuration for each stage, including model and dataset selection, hyperparameters, and any overrides.
+    \item \textbf{Handles Checkpoints:} It automatically manages checkpoints between stages, for example, using the output of a pre-training stage as the input for a fine-tuning stage.
+    \item \textbf{Ensures Reproducibility:} By defining the entire experimental pipeline in a single configuration file, the orchestrator ensures that our results are fully reproducible.
+\end{itemize}
+
+\subsection{Model and Data Registry}
+
+To maintain a clean and extensible codebase, we implemented a registry system (\texttt{src/registry.py}). This system uses decorators to register model and dataset builder functions. This allows us to easily add new models and datasets to the project without modifying the main training script. For example, a new model can be added by creating a new file in the \texttt{src/models} directory and decorating the builder function with \texttt{@register\_model("my\_new\_model")}.
