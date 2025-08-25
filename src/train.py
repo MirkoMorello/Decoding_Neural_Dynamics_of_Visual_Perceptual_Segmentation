@@ -237,7 +237,7 @@ def train_stage(run_cfg: RunCfg) -> None:
     if ddp.enabled:
         # If parts of the model are frozen, DDP needs `find_unused_parameters=True`
         # to avoid errors when it doesn't see gradients for the frozen layers.
-        find_unused = run_cfg.stage.extra.get('freeze_saliency_network', False)
+        find_unused = run_cfg.stage.extra.get('freeze_saliency_network', True)
         model = DDP(model, device_ids=[ddp.device.index], find_unused_parameters=find_unused)
         if ddp.is_master:
             logger.info(f"Wrapped model with DDP (find_unused_parameters={find_unused})")
