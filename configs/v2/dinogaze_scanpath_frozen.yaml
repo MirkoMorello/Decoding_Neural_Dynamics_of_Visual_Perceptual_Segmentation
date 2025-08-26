@@ -24,7 +24,7 @@ stage:
   # --- Model- and Data-specific parameters ---
   extra:
     # Model parameters
-    requires_segmentation: true
+    requires_segmentation: false
     is_scanpath_stage: true             # Tells the builder to create a scanpath model
     freeze_saliency_network: true       # Tells the builder to freeze the saliency head
     included_fixations: [-1, -2, -3, -4] # Scanpath history length
@@ -38,7 +38,6 @@ stage:
     
     # Data parameters for the MIT1003 builder
     fold: 0
-    mask_dir: 'masks/mit1003/sam_vitl_k64_mit'
 
 # --- Global Run Settings ---
 compile: false

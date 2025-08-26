@@ -19,7 +19,7 @@ stage:
   
   # --- Model-specific parameters passed to the builder function ---
   extra:
-    requires_segmentation: true
+    requires_segmentation: false
     is_scanpath_stage: false
     freeze_saliency_network: false
 
@@ -37,10 +37,6 @@ stage:
     # Finalizer settings
     finalizer_initial_sigma: 8.0
     finalizer_learn_sigma: true
-
-    # Mask Paths for the SALICON Data Builder
-    salicon_train_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_train'
-    salicon_val_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_val'
 
     # Scanpath history to take into account
 

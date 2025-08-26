@@ -22,7 +22,7 @@ stage:
   # --- Model- and Data-specific parameters --d-
   extra:
     # Model parameters (can be the same or different from pre-training)
-    requires_segmentation: true
+    requires_segmentation: false
     dino_model_name: 'dinov2_vitl14'
     dino_patch_size: 14
     dino_layers_for_main_path: [-3, -2, -1]
@@ -33,7 +33,6 @@ stage:
     
     # Data parameters for the MIT1003 builder
     fold: 0
-    mask_dir: 'masks/mit1003/sam_vitl_k64_mit'
 
 # --- Global Run Settings ---
 compile: false
