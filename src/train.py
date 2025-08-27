@@ -137,7 +137,7 @@ class _DDPCtx:
 
 def make_optim_and_sched(model: torch.nn.Module, cfg: StageCfg):
     params = [p for p in model.parameters() if p.requires_grad]
-    optim = torch.optim.Adam(params, lr=cfg.lr)
+    optim = torch.optim.Adam(params, lr=cfg.lr, fused=True)
     sched = torch.optim.lr_scheduler.MultiStepLR(optim, milestones=list(cfg.milestones))
     return optim, sched
 
@@ -271,7 +271,7 @@ def train_stage(run_cfg: RunCfg) -> None:
             # Perform a single forward/backward pass
             optim.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda'):
-                from src.metrics import log_likelihood # Assuming this is your loss metric
+                from src.metrics import log_likelihood
                 log_density = model(*model_call_args, **model_call_kwargs)
                 target_mask = model_call_kwargs.get('fixation_mask')
                 if isinstance(target_mask, torch.sparse.Tensor): target_mask = target_mask.to_dense()
