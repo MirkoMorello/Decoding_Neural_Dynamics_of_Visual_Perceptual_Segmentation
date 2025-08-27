@@ -125,7 +125,7 @@ def build(cfg):
     # 1. Build the DINOv2 backbone
     dino_model_name = extra.get("dino_model_name", "dinov2_vitl14")
     features_module = DinoV2Backbone(
-        layers=extra.get("dino_layers", [-3, -2, -1]),
+        layers=extra.get("dino_layers_for_main_path", [-3, -2, -1]),
         model_name=dino_model_name,
         freeze=True
     )
@@ -162,8 +162,6 @@ def build(cfg):
             logger.warning("  - 'included_fixations' is set but 'is_scanpath_stage' is false. History will not be used.")
             included_fixations = None
 
-    readout_factor = extra.get("dino_patch_size", 14)
-
     # 3. Assemble the final model
     model = DinoGaze(
         features=features_module,
@@ -171,7 +169,7 @@ def build(cfg):
         scanpath_network=scanpath_net,
         fixation_selection_network=fixsel_net,
         downsample=extra.get("downsample", 1.0),
-        readout_factor=readout_factor,
+        readout_factor=extra.get("dino_patch_size", 14),
         saliency_map_factor=extra.get("saliency_map_factor", 4),
         included_fixations=included_fixations
     )

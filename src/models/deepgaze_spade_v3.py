@@ -122,7 +122,7 @@ class DeepgazeSpadeV3(nn.Module):
             # The standard fixation selection network takes a tuple of tensors
             final_readout = self.fixation_selection_network((saliency_output, scanpath_out))
         else:
-            final_readout = self.fixation_selection_network((saliency_output,))
+            final_readout = self.fixation_selection_network((saliency_output, None))
         
         return self.finalizer(final_readout, centerbias)
 
@@ -131,7 +131,7 @@ class DeepgazeSpadeV3(nn.Module):
         self.densenet_features.eval()
         self.dino_features.eval()
 
-@register_model("hybrid_spade_dynamic")
+@register_model("deepgaze_spade_v3")
 def build(cfg):
     extra = cfg.stage.extra
     

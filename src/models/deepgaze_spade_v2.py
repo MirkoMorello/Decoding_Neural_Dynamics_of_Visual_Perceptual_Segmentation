@@ -114,7 +114,7 @@ class DeepgazeSpadeV2(nn.Module):
                 scanpath_out = self.scanpath_network(scanpath_features_resized)
             final_readout = self.fixation_selection_network((saliency_output, scanpath_out))
         else:
-            final_readout = self.fixation_selection_network((saliency_output,))
+            final_readout = self.fixation_selection_network((saliency_output, None))
         
         return self.finalizer(final_readout, centerbias)
 
@@ -122,7 +122,7 @@ class DeepgazeSpadeV2(nn.Module):
         super().train(mode)
         self.features.eval()
 
-@register_model("densenet_spade_dynamic")
+@register_model("deepgaze_spade_v2")
 def build(cfg):
     extra = cfg.stage.extra
     

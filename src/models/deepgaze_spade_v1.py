@@ -83,7 +83,7 @@ class DeepgazeSpadeV1(nn.Module):
             final_readout = self.fixation_selection_network((saliency_out, scanpath_out))
         else:
             # --- SPATIAL-ONLY MODE ---
-            final_readout = self.fixation_selection_network((saliency_out,))
+            final_readout = self.fixation_selection_network((saliency_out, None))
         
         return self.finalizer(final_readout, centerbias)
 
@@ -91,7 +91,7 @@ class DeepgazeSpadeV1(nn.Module):
         super().train(mode)
         self.features.eval()
 
-@register_model("densenet_spade_static")
+@register_model("deepgaze_spade_v1")
 def build(cfg):
     """Builds DeepGazeIII with DenseNet and STATIC SPADE."""
     extra = cfg.stage.extra
@@ -112,7 +112,6 @@ def build(cfg):
     )
     
     if extra.get("is_scanpath_stage", False):
-        # This correctly builds the modern scanpath network
         scanpath_net = build_scanpath_network()
         fixsel_net = build_fixation_selection_network(scanpath_features=16)
         included_fixations = extra.get("included_fixations")
