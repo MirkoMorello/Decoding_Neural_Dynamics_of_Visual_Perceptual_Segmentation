@@ -9,133 +9,213 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo
 
 
-class LayerNorm(nn.GroupNorm):
+
+class LayerNorm(nn.Module):
+    r"""Applies Layer Normalization over a mini-batch of inputs as described in
+    the paper `Layer Normalization`_ .
+
+    .. math::
+        y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
+
+    The mean and standard-deviation are calculated separately over the last
+    certain number dimensions which have to be of the shape specified by
+    :attr:`normalized_shape`.
+    :math:`\gamma` and :math:`\beta` are learnable affine transform parameters of
+    :attr:`normalized_shape` if :attr:`elementwise_affine` is ``True``.
+
+    .. note::
+        Unlike Batch Normalization and Instance Normalization, which applies
+        scalar scale and bias for each entire channel/plane with the
+        :attr:`affine` option, Layer Normalization applies per-element scale and
+        bias with :attr:`elementwise_affine`.
+
+    This layer uses statistics computed from input data in both training and
+    evaluation modes.
+
+    Args:
+        normalized_shape (int or list or torch.Size): input shape from an expected input
+            of size
+
+            .. math::
+                [* \times \text{normalized\_shape}[0] \times \text{normalized\_shape}[1]
+                    \times \ldots \times \text{normalized\_shape}[-1]]
+
+            If a single integer is used, it is treated as a singleton list, and this module will
+            normalize over the last dimension which is expected to be of that specific size.
+        eps: a value added to the denominator for numerical stability. Default: 1e-5
+        elementwise_affine: a boolean value that when set to ``True``, this module
+            has learnable per-element affine parameters initialized to ones (for weights)
+            and zeros (for biases). Default: ``True``.
+
+    Shape:
+        - Input: :math:`(N, *)`
+        - Output: :math:`(N, *)` (same shape as input)
+
+    Examples::
+
+        >>> input = torch.randn(20, 5, 10, 10)
+        >>> # With Learnable Parameters
+        >>> m = nn.LayerNorm(input.size()[1:])
+        >>> # Without Learnable Parameters
+        >>> m = nn.LayerNorm(input.size()[1:], elementwise_affine=False)
+        >>> # Normalize over last two dimensions
+        >>> m = nn.LayerNorm([10, 10])
+        >>> # Normalize over last dimension of size 10
+        >>> m = nn.LayerNorm(10)
+        >>> # Activating the module
+        >>> output = m(input)
+
+    .. _`Layer Normalization`: https://arxiv.org/abs/1607.06450
     """
-    A wrapper for torch.nn.GroupNorm that matches the original custom
-    LayerNorm's initialization signature and behavior.
-    
-    This implementation normalizes across all channels and spatial dimensions (C, H, W)
-    as a single group, and applies a learnable per-channel affine transformation.
-    This is mathematically the closest stable equivalent to the original implementation.
-    """
+    __constants__ = ['features', 'weight', 'bias', 'eps', 'center', 'scale']
+
     def __init__(self, features, eps=1e-12, center=True, scale=True):
-        # The key is setting num_groups=1.
-        # `features` is the number of channels.
-        # The `affine` argument in GroupNorm controls both center (bias) and scale (weight).
-        # Note: GroupNorm does not allow disabling only one of them.
-        if not (center and scale):
-            # This is a rare case, but if you need it, you can handle it.
-            # For now, we assume both are desired if either is.
-            # If you hit an error here, it means you have a use case like center=True, scale=False
-            # which GroupNorm doesn't directly support, but we can address that if needed.
-            pass
+        super(LayerNorm, self).__init__()
+        self.features = features
+        self.eps = eps
+        self.center = center
+        self.scale = scale
 
-        super().__init__(num_groups=1, num_channels=features, eps=eps, affine=(center or scale))
+        if self.scale:
+            self.weight = nn.Parameter(torch.Tensor(self.features))
+        else:
+            self.register_parameter('weight', None)
 
+        if self.center:
+            self.bias = nn.Parameter(torch.Tensor(self.features))
+        else:
+            self.register_parameter('bias', None)
 
-def gaussian_filter_1d(tensor, dim, sigma, truncate=4, kernel_size=None, padding_mode='replicate', padding_value=0.0):
-    """
-    A torch.compile-friendly 1D Gaussian filter.
-    Assumes kernel_size is a pre-computed Python integer.
-    """
-    # sigma is the learnable tensor, as it should be.
-    sigma = torch.as_tensor(sigma, device=tensor.device, dtype=tensor.dtype)
+        self.reset_parameters()
 
-    # We no longer calculate kernel_size from sigma here. We expect an integer.
-    if kernel_size is None:
-        # This path is now for non-learnable cases or legacy use.
-        # It will still cause a graph break if sigma is a tensor.
-        # Our new code path avoids this by always providing an integer kernel_size.
-        size_tensor = 2 * torch.ceil(truncate * sigma) + 1
-        kernel_size_int = size_tensor.long().item()
-    else:
-        # This is the path our modified GaussianFilterNd will take.
-        # kernel_size is already an integer. No .item(), no graph break!
-        kernel_size_int = kernel_size
-    
-    # The rest of the function proceeds without any graph breaks.
-    padding_val = (kernel_size_int - 1) // 2
-    padding = (padding_val, padding_val)
+    def reset_parameters(self):
+        if self.scale:
+            nn.init.ones_(self.weight)
 
-    mean = (kernel_size_int - 1) / 2
-    grid = torch.arange(kernel_size_int, device=tensor.device, dtype=tensor.dtype) - mean
+        if self.center:
+            nn.init.zeros_(self.bias)
 
-    # create gaussian kernel from grid using the LEARNABLE sigma
-    kernel = torch.exp(-0.5 * (grid / sigma) ** 2)
-    kernel = kernel / kernel.sum()
+    def adjust_parameter(self, tensor, parameter):
+        return torch.repeat_interleave(
+            torch.repeat_interleave(
+                parameter.view(-1, 1, 1),
+                repeats=tensor.shape[2],
+                dim=1),
+            repeats=tensor.shape[3],
+            dim=2
+        )
 
-    # Reshape for conv1d
-    kernel = kernel.view(1, 1, kernel_size_int)
+    def forward(self, input):
+        normalized_shape = (self.features, input.shape[2], input.shape[3])
+        weight = self.adjust_parameter(input, self.weight)
+        bias = self.adjust_parameter(input, self.bias)
+        return F.layer_norm(
+            input, normalized_shape, weight, bias, self.eps)
 
-    # The original implementation had some complex reshaping; let's simplify for clarity
-    # and ensure it's correct for conv1d.
-
-    # 1. Prepare tensor for 1D convolution along the specified dim
-    # (B, C, H, W) -> move dim to be last -> (B, C, W, H) if dim=2
-    tensor_permuted = tensor.movedim(dim, -1)
-    original_shape = tensor_permuted.shape
-    # Flatten leading dims -> (B*C*W, H)
-    tensor_reshaped = tensor_permuted.reshape(-1, original_shape[-1])
-    # Add channel dim for conv1d -> (B*C*W, 1, H)
-    tensor_reshaped = tensor_reshaped.unsqueeze(1)
-
-    # 2. Pad and convolve
-    padded_tensor = F.pad(tensor_reshaped, padding, padding_mode, padding_value)
-    convolved_tensor = F.conv1d(padded_tensor, kernel)
-
-    # 3. Reshape back to original
-    # (B*C*W, 1, H) -> (B*C*W, H)
-    convolved_tensor = convolved_tensor.squeeze(1)
-    # (B*C*W, H) -> (B, C, W, H)
-    output_permuted = convolved_tensor.view(original_shape)
-    # (B, C, W, H) -> (B, C, H, W)
-    output = output_permuted.movedim(-1, dim)
-
-    assert output.shape == tensor.shape
-    return output
+    def extra_repr(self):
+        return '{features}, eps={eps}, ' \
+            'center={center}, scale={scale}'.format(**self.__dict__)
 
 
 class GaussianFilterNd(nn.Module):
-    def __init__(self, dims, sigma, truncate=4, kernel_size=None, padding_mode='replicate', padding_value=0.0,
-                 trainable=False):
-        super(GaussianFilterNd, self).__init__()
+    """
+    A differentiable N-dimensional Gaussian filter that is fast, GPU-only,
+    and supports a learnable sigma with a dynamically changing effective kernel size.
+
+    This implementation avoids CPU-GPU synchronization by using a fixed-size
+    convolution with a dynamically generated, masked kernel.
+    """
+
+    def __init__(self, dims, sigma, truncate=4.0, max_kernel_size=51, trainable=True):
+        """
+        Args:
+            dims ([int]): The dimensions of the input tensor to apply the filter to.
+                          e.g., for a (B, C, H, W) image, use dims=[2, 3].
+            sigma (float): The initial standard deviation of the Gaussian kernel.
+            truncate (float): The filter is truncated at this many standard deviations.
+                              The effective kernel size will be ~ 2 * truncate * sigma + 1.
+            max_kernel_size (int): The maximum possible kernel size. This must be large
+                                   enough to accommodate the largest expected sigma value.
+                                   It should be an odd number.
+            trainable (bool): If True, sigma is a learnable parameter.
+        """
+        super().__init__()
+        if max_kernel_size % 2 == 0:
+            raise ValueError("max_kernel_size must be an odd number.")
 
         self.dims = dims
-        # self.sigma remains a learnable parameter
-        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float32), requires_grad=trainable)
         self.truncate = truncate
+        self.max_kernel_size = max_kernel_size
 
-        # --- MODIFICATION START ---
-        # If kernel_size is not provided, calculate it ONCE during initialization
-        # and store it as a Python integer.
-        if kernel_size is None:
-            # Use the initial value of sigma for this calculation
-            initial_sigma = self.sigma.item() 
-            self.kernel_size = int(2 * math.ceil(truncate * initial_sigma) + 1)
-        else:
-            self.kernel_size = kernel_size
-        # --- MODIFICATION END ---
+        self.sigma = nn.Parameter(
+            torch.tensor(sigma, dtype=torch.float32), requires_grad=trainable
+        )
+        # Epsilon for numerical stability in normalization
+        self.register_buffer('eps', torch.tensor(1e-6))
 
-        # setup padding
-        self.padding_mode = padding_mode
-        self.padding_value = padding_value
+    def _gaussian_filter_1d(self, tensor, dim):
+        """Applies a 1D Gaussian filter along a specified dimension."""
+
+        # 1. Prepare for 1D convolution
+        # Permute the target dimension to the end for easier processing
+        tensor_permuted = tensor.movedim(dim, -1)
+        original_shape = tensor_permuted.shape
+        # Flatten all dimensions except the last one for conv1d
+        tensor_reshaped = tensor_permuted.reshape(-1, 1, original_shape[-1])
+
+        # 2. Create the dynamic Gaussian kernel on the fly (on the correct device)
+        # Use a fixed grid for the maximum kernel size
+        mean = (self.max_kernel_size - 1) / 2
+        grid = torch.arange(self.max_kernel_size, device=tensor.device, dtype=tensor.dtype) - mean
+
+        # Calculate the effective kernel size required for the current sigma
+        # This is a tensor, not a static integer
+        required_size_float = 2 * torch.ceil(self.truncate * self.sigma) + 1
+        
+        # Create a mask to zero out kernel values beyond the required size
+        kernel_radius = (required_size_float - 1) / 2
+        mask = (torch.abs(grid) <= kernel_radius).to(tensor.dtype)
+
+        # Calculate the Gaussian values across the entire max-sized grid
+        kernel_vals = torch.exp(-0.5 * (grid / self.sigma) ** 2)
+
+        # Apply the mask and normalize
+        kernel = kernel_vals * mask
+        kernel = kernel / (kernel.sum() + self.eps) # Add epsilon for stability
+        
+        # Reshape kernel for conv1d: (out_channels, in_channels, kW)
+        kernel = kernel.view(1, 1, self.max_kernel_size)
+
+        # 3. Pad and convolve
+        # Padding is now static, based on the fixed max_kernel_size
+        padding = (self.max_kernel_size - 1) // 2
+        padded_tensor = F.pad(tensor_reshaped, (padding, padding), mode='replicate')
+        convolved_tensor = F.conv1d(padded_tensor, kernel)
+
+        # 4. Reshape back to the original tensor shape
+        output_permuted = convolved_tensor.view(original_shape)
+        output = output_permuted.movedim(-1, dim)
+
+        return output
 
     def forward(self, tensor):
-        """Applies the gaussian filter to the given tensor"""
+        """Applies the N-dimensional Gaussian filter."""
+        # We clamp sigma to a small positive value to avoid division by zero
+        # or a kernel that is too small, which would be numerically unstable.
+        self.sigma.data.clamp_(min=0.1)
+
         for dim in self.dims:
-            tensor = gaussian_filter_1d(
-                tensor,
-                dim=dim,
-                sigma=self.sigma,  # Pass the learnable sigma tensor
-                truncate=self.truncate,
-                kernel_size=self.kernel_size, # Pass the static integer kernel size
-                padding_mode=self.padding_mode,
-                padding_value=self.padding_value,
-            )
+            tensor = self._gaussian_filter_1d(tensor, dim=dim)
 
         return tensor
+
+    def extra_repr(self):
+        return (f"dims={self.dims}, initial_sigma={self.sigma.item():.3f}, "
+                f"truncate={self.truncate}, max_kernel_size={self.max_kernel_size}, "
+                f"trainable={'sigma' in self._parameters}")
 
 
 class Conv2dMultiInput(nn.Module):
