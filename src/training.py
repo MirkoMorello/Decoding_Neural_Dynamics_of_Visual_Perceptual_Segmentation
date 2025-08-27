@@ -3,45 +3,28 @@
 # pylint: disable=not-callable, unused-import, import-error, no-name-in-module
 # E501: line too long
 
-from collections import defaultdict, OrderedDict # Added OrderedDict
+from collections import defaultdict, OrderedDict
 from datetime import datetime
 import os
-# import glob # Not used in the provided snippet, but might be in your full _train
-# import tempfile # Not used in the provided snippet
-# from torch.serialization import safe_globals # Not used
 
-from boltons.cacheutils import cached, LRU
-from boltons.fileutils import atomic_save #, mkdir_p # mkdir_p not used here but maybe in _train
+from boltons.fileutils import atomic_save
 import numpy as np
 import pandas as pd
-# import pysaliency # Not directly used in these functions
-# from pysaliency.filter_datasets import iterate_crossvalidation # Not used
-# from pysaliency.plotting import visualize_distribution # Not used
+
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import yaml # Not used here
 
-from torch import amp # For Automatic Mixed Precision
+from torch import amp
 import torchmetrics
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP # For type hinting
 from pathlib import Path
 import sys
 import warnings
-import contextlib # For model.no_sync()
+import contextlib
 
-# Assuming these are correctly imported from your project structure or deepgaze_pytorch
-# Adjust paths if these are in deepgaze_pytorch and training.py is in src
-try:
-    from .metrics import log_likelihood, nss, auc as auc_cpu_fn # Use your metrics
-    from src.modules import DeepGazeII # Example, if used
-    # If DeepGazeIII is also used for type hinting:
-    # from deepgaze_pytorch.modules import DeepGazeIII
-except ImportError:
-    # Fallback for direct execution or different structure
-    from src.metrics import log_likelihood, nss, auc as auc_cpu_fn
-    from src.modules import DeepGazeII
+from .metrics import log_likelihood, nss, auc_gpu as auc_cpu_fn # Use your metrics
+import torch.compiler
 
 import logging
 
@@ -88,6 +71,7 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None,
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
+            torch.compiler.cudagraph_mark_step_begin()
             try:
                 # --- Move batch to GPU & Pop data ---
                 image = batch.pop('image').to(device, non_blocking=True)
@@ -343,6 +327,7 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
     total_batches_in_epoch = len(dataset)
 
     for batch_idx, batch in enumerate(pbar):
+        torch.compiler.cudagraph_mark_step_begin()
         # Determine if DDP gradient sync should happen for this micro-batch
         # Sync if it's an accumulation step OR the very last micro-batch of the epoch
         is_accumulation_boundary = (batch_idx + 1) % gradient_accumulation_steps == 0
@@ -357,16 +342,15 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
 
         with sync_context:
             try:
-                # --- Move batch to GPU & Pop data ---
+                # Move batch to GPU & Pop data
                 image = batch.pop('image').to(device, non_blocking=True)
                 centerbias = batch.pop('centerbias').to(device, non_blocking=True)
                 fixation_mask = batch.pop('fixation_mask').to(device, non_blocking=True) # Target for loss
                 
-                # --- NEW: Pop segmentation_mask ---
+                # Pop segmentation_mask
                 segmentation_mask = batch.pop('segmentation_mask', None)
                 if segmentation_mask is not None:
                     segmentation_mask = segmentation_mask.to(device, non_blocking=True)
-                # --- END NEW ---
 
                 x_hist = batch.pop('x_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
                 y_hist = batch.pop('y_hist', torch.tensor([], device=device)).to(device, non_blocking=True)
@@ -444,10 +428,6 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
                     continue # Skip optimizer step for this cycle
             else: # Loss was NaN/Inf or None from previous error
                 if is_master: pbar.set_description(pbar_desc + " Invalid Loss - Skipping optim step")
-                # If this was supposed to be an accumulation step, we need to ensure optimizer.step isn't called
-                # with potentially corrupted gradients from previous micro-batches of this cycle.
-                # The `if is_accumulation_boundary or is_last_micro_batch_of_epoch:` below handles this.
-                # However, if an invalid loss occurs, we might want to zero grads for the current cycle.
                 if not needs_ddp_sync: optimizer.zero_grad(set_to_none=True)
 
 
@@ -735,7 +715,7 @@ def _train(this_directory, model,
             logger.addHandler(handler)
 
     if validation_metrics is None:
-        validation_metrics = ['IG', 'LL', 'AUC_CPU', 'NSS']
+        validation_metrics = ['IG', 'LL', 'AUC_CPU', 'NSS'] # Default metrics
 
     output_dir_path = Path(this_directory)
     if is_master:
@@ -1064,7 +1044,7 @@ def _train(this_directory, model,
         best_val_score_final = np.nan
         validation_metric_col_name_final = f'validation_{validation_metric}'
         if validation_metric_col_name_final in progress_df.columns and not progress_df[validation_metric_col_name_final].dropna().empty:
-            higher_is_better_final = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU', 'AUC_GPU']
+            higher_is_better_final = validation_metric.upper() in ['IG', 'NSS', 'AUC', 'AUC_CPU']
             valid_scores_series_final = pd.to_numeric(progress_df[validation_metric_col_name_final], errors='coerce').dropna()
             if not valid_scores_series_final.empty:
                 best_score_final = valid_scores_series_final.max() if higher_is_better_final else valid_scores_series_final.min()
