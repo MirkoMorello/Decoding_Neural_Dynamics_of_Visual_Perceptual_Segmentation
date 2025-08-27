@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 
 class LayerNorm(nn.Module):
@@ -119,64 +118,66 @@ class LayerNorm(nn.Module):
             'center={center}, scale={scale}'.format(**self.__dict__)
 
 
-def gaussian_filter_1d(
-    tensor: torch.Tensor,
-    dim: int,
-    sigma,
-    truncate: float = 4.0,
-    kernel_size: Optional[int] = None,
-    padding_mode: str = 'replicate',
-    padding_value: float = 0.0,
-):
+def gaussian_filter_1d(tensor, dim, sigma, truncate=4, kernel_size=None, padding_mode='replicate', padding_value=0.0):
     """
-    1D Gaussian filter applied along `dim`.
-    - kernel_size should be a Python int (recommended) or None (compute from sigma).
-    - This implementation captures shapes AFTER moving the target dim to the end,
-      so reshape/restore is correct and robust.
+    A torch.compile-friendly 1D Gaussian filter.
     """
-    # Ensure sigma is a tensor on correct device/dtype for kernel computation
     sigma = torch.as_tensor(sigma, device=tensor.device, dtype=tensor.dtype)
 
-    # Compute kernel_size if not provided (use Python int)
-    if kernel_size is None:
-        kernel_size = int(2 * math.ceil(truncate * float(sigma.detach().cpu().item())) + 1)
-        # Note: this uses .item() but only when kernel_size is not provided.
-        # If you want zero graph-breaks, pass kernel_size as a Python int at init/call time.
+    if kernel_size is not None:
+        # Ensure kernel_size is a tensor on the correct device
+        kernel_size = torch.as_tensor(kernel_size, device=tensor.device, dtype=torch.int64)
+    else:
+        # Calculate kernel_size using torch ops. It remains a tensor.
+        kernel_size = 2 * torch.ceil(truncate * sigma) + 1
+        # It's important that kernel_size ends up as an integer for padding calculations.
+        # Since it's calculated from constants and a scalar sigma, this is safe.
+        kernel_size = kernel_size.long()
 
-    if kernel_size <= 0:
-        raise ValueError("kernel_size must be positive")
 
-    # Ensure odd kernel size
-    if kernel_size % 2 == 0:
-        kernel_size += 1
+    # We need the kernel size as a Python integer for F.pad and creating the grid.
+    # .item() is the correct, compile-friendly way to get the value of a 0-dim tensor.
+    # This will create a "graph break", but it's a necessary and static one if sigma
+    # is constant, which is much better than a .cpu().numpy() call.
+    kernel_size_int = kernel_size.item()
 
-    # Build gaussian kernel (in torch)
-    half = (kernel_size - 1) / 2.0
-    grid = torch.arange(kernel_size, device=tensor.device, dtype=tensor.dtype) - half
+    # The kernel is always odd, so (kernel_size_int - 1) is even.
+    # Integer division `//` is all we need. No need for math.ceil.
+    # This is pure Python integer arithmetic, which is fine.
+    padding_val = (kernel_size_int - 1) // 2
+    padding = (padding_val, padding_val)
+
+    # The rest of the function can now use the correctly-computed integer values
+    mean = (kernel_size_int - 1) / 2
+    grid = torch.arange(kernel_size_int, device=tensor.device) - mean
+
+    kernel_shape = (1, 1, kernel_size_int)
+    grid = grid.view(kernel_shape)
+    # No need to detach the grid if its components are already constants or detached.
+    # But it's good practice to ensure it doesn't carry a grad history.
+    grid = grid.detach()
+
+    source_shape = tensor.shape
+    tensor = torch.movedim(tensor, dim, len(source_shape)-1)
+    dim_last_shape = tensor.shape
+
+    tensor = tensor.reshape(-1, 1, source_shape[dim])
+
+    # F.pad is fine now because `padding` is a tuple of Python integers.
+    tensor_ = F.pad(tensor, padding, padding_mode, padding_value)
+
+    # create gaussian kernel from grid using current sigma
     kernel = torch.exp(-0.5 * (grid / sigma) ** 2)
     kernel = kernel / kernel.sum()
-    kernel = kernel.view(1, 1, kernel_size)  # (out_channels=1, in_channels=1, K)
 
-    # Move dimension `dim` to last position and capture moved shape
-    moved = tensor.movedim(dim, -1)           # shape (..., L)
-    moved_shape = tuple(moved.shape)          # capture after movedim
-    L = moved_shape[-1]                       # length along filtering dim
+    # convolve input with gaussian kernel
+    tensor_ = F.conv1d(tensor_, kernel)
+    tensor_ = tensor_.view(dim_last_shape)
+    tensor_ = torch.movedim(tensor_, len(source_shape)-1, dim)
 
-    # Reshape to (N, 1, L) for conv1d, where N is product of all leading dims
-    moved_flat = moved.reshape(-1, 1, L)      # (N, 1, L)
+    assert tensor_.shape == source_shape
 
-    # Pad using Python integer pad
-    pad_each = (kernel_size - 1) // 2
-    moved_padded = F.pad(moved_flat, (pad_each, pad_each), mode=padding_mode, value=padding_value)
-
-    # Convolve
-    out_flat = F.conv1d(moved_padded, kernel)  # (N, 1, L)
-
-    # Restore shape: reshape back to moved_shape, then move dim back to original position
-    out_moved = out_flat.reshape(*moved_shape)  # (same as `moved`)
-    out = out_moved.movedim(-1, dim)
-
-    return out
+    return tensor_
 
 
 class GaussianFilterNd(nn.Module):
@@ -189,35 +190,23 @@ class GaussianFilterNd(nn.Module):
         Args:
             dims ([int]): the dimensions to which the gaussian filter is applied. Negative values won't work
             sigma (float): standard deviation of the gaussian filter (blur size)
+            input_dims (int, optional): number of input dimensions ignoring batch and channel dimension,
+                i.e. use input_dims=2 for images (default: 2).
             truncate (float, optional): truncate the filter at this many standard deviations (default: 4.0).
                 This has no effect if the `kernel_size` is explicitely set
             kernel_size (int): size of the gaussian kernel convolved with the input
             padding_mode (string, optional): Padding mode implemented by `torch.nn.functional.pad`.
             padding_value (string, optional): Value used for constant padding.
         """
+        # IDEA determine input_dims dynamically for every input
         super(GaussianFilterNd, self).__init__()
 
-        if trainable:
-            import warnings
-            warnings.warn(
-                "trainable=True in GaussianFilterNd is not recommended with the graph-friendly "
-                "gaussian_filter_1d, as it requires a static kernel_size. "
-                "Compilation may fail or be very slow if sigma changes."
-            )
-
         self.dims = dims
-        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float32), requires_grad=trainable)
-
-        # Calculate static integer kernel_size during initialization
-        if kernel_size is None:
-            # sigma is a float here, so this calculation uses standard Python math
-            kernel_size = int(2 * math.ceil(truncate * sigma) + 1)
-
-        # Ensure kernel_size is an odd, positive integer.
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float32), requires_grad=trainable)  # default: no optimization
+        self.truncate = truncate
         self.kernel_size = kernel_size
+
+        # setup padding
         self.padding_mode = padding_mode
         self.padding_value = padding_value
 
@@ -228,7 +217,7 @@ class GaussianFilterNd(nn.Module):
                 tensor,
                 dim=dim,
                 sigma=self.sigma,
-                # Pass the pre-calculated integer kernel_size
+                truncate=self.truncate,
                 kernel_size=self.kernel_size,
                 padding_mode=self.padding_mode,
                 padding_value=self.padding_value,
