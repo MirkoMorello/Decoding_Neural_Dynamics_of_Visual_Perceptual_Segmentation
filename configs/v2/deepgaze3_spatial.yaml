@@ -1,0 +1,41 @@
+#
+# STAGE 2: Fine-tune the pre-trained model on MIT1003 (spatial only).
+# FOLD 0
+#
+
+stage:
+  kind: "mit_spatial_finetune"
+  name: "deepgaze3"
+  model_key: "deepgaze3"
+  dataset_key: "MIT1003"
+  
+  # --- Hyperparameters for this stage ---
+  lr: 0.00005
+  milestones: [10, 20, 30, 35]
+  batch_size: 1
+  grad_acc_steps: 4
+  min_lr: 1.0e-7
+  val_every: 1
+
+  #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
+  #resume_ckpt : "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/step-0004.pth"
+  # --- Model- and Data-specific parameters --d-
+  extra:
+    # Model parameters (can be the same or different from pre-training)
+    requires_segmentation: false
+    finalizer_initial_sigma: 8.0
+    finalizer_learn_sigma: true
+    
+    # Data parameters for the MIT1003 builder
+    fold: 0
+
+# --- Global Run Settings ---
+compile: false
+seed: 42
+num_workers: 6
+
+# --- Global Path Configuration ---
+paths:
+  dataset_dir: "./data/pysaliency_datasets"
+  train_dir: "./experiments"
+  lmdb_dir: "./data/lmdb_caches"

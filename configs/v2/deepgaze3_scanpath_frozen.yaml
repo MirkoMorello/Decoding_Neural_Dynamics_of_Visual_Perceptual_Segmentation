@@ -1,0 +1,44 @@
+#
+# STAGE 3: Fine-tune the scanpath head on MIT1003 (saliency head frozen).
+# FOLD 0
+#
+
+stage:
+  kind: "mit_scanpath_frozen"
+  name: "deepgaze3"
+  model_key: "deepgaze3"
+  dataset_key: "MIT1003"
+  
+  # --- Hyperparameters for this stage ---
+  lr: 0.0005
+  milestones: [10, 20, 30, 35, 40]
+  batch_size: 1
+  grad_acc_steps: 4
+  min_lr: 1.0e-7
+  val_every: 1
+
+  #resume_ckpt: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/step-0002.pth"
+
+  # --- Model- and Data-specific parameters ---
+  extra:
+    # Model parameters
+    requires_segmentation: false
+    is_scanpath_stage: true             # Tells the builder to create a scanpath model
+    freeze_saliency_network: true       # Tells the builder to freeze the saliency head
+    included_fixations: [-1, -2, -3, -4] # Scanpath history length
+    finalizer_initial_sigma: 8.0
+    finalizer_learn_sigma: true
+    
+    # Data parameters for the MIT1003 builder
+    fold: 0
+
+# --- Global Run Settings ---
+compile: false
+seed: 42
+num_workers: 4
+
+# --- Global Path Configuration ---
+paths:
+  dataset_dir: "./data/pysaliency_datasets"
+  train_dir: "./experiments"
+  lmdb_dir: "./data/lmdb_caches"
