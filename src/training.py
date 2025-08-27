@@ -71,7 +71,6 @@ def eval_epoch(model, dataset, baseline_information_gain, device, metrics=None,
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
-            torch.compiler.cudagraph_mark_step_begin()
             try:
                 # --- Move batch to GPU & Pop data ---
                 image = batch.pop('image').to(device, non_blocking=True)
@@ -327,7 +326,6 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
     total_batches_in_epoch = len(dataset)
 
     for batch_idx, batch in enumerate(pbar):
-        torch.compiler.cudagraph_mark_step_begin()
         # Determine if DDP gradient sync should happen for this micro-batch
         # Sync if it's an accumulation step OR the very last micro-batch of the epoch
         is_accumulation_boundary = (batch_idx + 1) % gradient_accumulation_steps == 0
@@ -341,6 +339,7 @@ def train_epoch(model, dataset, optimizer, device, scaler, gradient_accumulation
             sync_context = model.no_sync()
 
         with sync_context:
+            torch.compiler.cudagraph_mark_step_begin()
             try:
                 # Move batch to GPU & Pop data
                 image = batch.pop('image').to(device, non_blocking=True)
