@@ -5,45 +5,60 @@
 
 \epigraph{\enquote{The wireless telegraph is not difficult to understand. The ordinary telegraph is like a very long cat. You pull the tail in New York, and it meows in Los Angeles. The wireless is the same, only without the cat.}}{\emph{Albert Einstein}}
 
-This chapter reviews the foundational concepts and prior work that form the basis of this thesis. We begin by defining the fundamental elements of human gaze behaviour before tracing the evolution of computational models designed to predict it. We will cover early bottom-up models, the transformative impact of deep learning, and provide a detailed analysis of DeepGaze III, the state-of-the-art model that serves as the primary benchmark and point of departure for our own contributions.
+This chapter reviews the foundational concepts and prior work that form the basis of this thesis. We begin by defining the fundamental elements of human gaze behaviour before tracing the evolution of computational models designed to predict it.
+We will cover early bottom-up models, the transformative impact of deep learning, the crucial shift toward probabilistic evaluation, and finally, the theoretical work on visual segmentation that directly motivates our novel approach.
 
 \section{Visual Fixations and Scanpaths}
 \label{sec:sota_fixations}
 
-The human visual system actively explores the environment through a continuous sequence of eye movements. This process is a sophisticated strategy to overcome the physical limitations of our eyes, which have a small, high-resolution central region called the \emph{fovea}, surrounded by a much larger, low-resolution periphery. To perceive a scene in detail, we must direct the fovea to points of interest. This behaviour is not static; it is highly dependent on the observer's task, as famously demonstrated by Yarbus \cite{yarbus1967eye}.
+The human visual system actively explores the environment through a continuous sequence of eye movements. This process is a sophisticated strategy to overcome the physical limitations of our eyes, which have a small, high-resolution central region called the \emph{fovea}, surrounded by a much larger, low-resolution periphery. To perceive a scene in detail, we must direct the fovea to points of interest. This behaviour is not random; it is highly dependent on the observer's task and internal goals, as famously demonstrated by Yarbus in his pioneering work \cite{yarbus1967}.
 
-This exploration is achieved through two primary types of eye movements:
+
+This active exploration is achieved through two primary types of eye movements:
 \begin{itemize}
-    \item \textbf{Fixations:} Periods, typically lasting 200-300 milliseconds, during which the eye is held relatively still. This stability allows the visual system to gather detailed information from the foveated region.
-    \item \textbf{Saccades:} Rapid, ballistic movements that shift the point of gaze from one fixation point to another. During a saccade, which can last from 30 to 120 milliseconds, visual sensitivity is suppressed.
+\item \textbf{Fixations:} Periods, typically lasting 200-300 milliseconds, during which the eye is held relatively still. This stability is essential, as it allows the visual system to gather detailed information from the foveated region.
+\item \textbf{Saccades:} Rapid, ballistic movements that shift the point of gaze from one fixation point to another. During a saccade, which can last from 30 to 120 milliseconds, visual sensitivity is suppressed in a process known as saccadic suppression.
 \end{itemize}
-The resulting sequence of fixations and saccades is known as a \textbf{scanpath}. The challenge of gaze prediction, as introduced in \cref{c:intro}, is to computationally model and predict these scanpaths.
+The resulting sequence of fixations and saccades is known as a \textbf{scanpath}. The challenge of gaze prediction, as introduced in \cref{c:intro}, is to computationally model and predict these scanpaths, capturing the underlying decisions that drive them.
+
 
 \section{The Evolution of Saliency Models}
 \label{sec:sota_evolution}
 
 \subsection{Early Computational Models}
-Early and highly influential work in computational modeling of attention was dominated by bottom-up, feature-driven approaches. The seminal model of Itti, Koch, and Niebur \cite{itti1998model} provided a computational implementation of Treisman's Feature Integration Theory. This model operates by first decomposing an input image into a set of low-level feature channels, such as color opponency (red-green, blue-yellow), intensity, and orientation at multiple spatial scales. 
-
+Early and highly influential work in the computational modeling of attention was dominated by bottom-up, feature-driven approaches. The seminal model of Itti, Koch, and Niebur \cite{itti1998} provided a direct computational implementation of Treisman's Feature Integration Theory. This model operates by first decomposing an input image into a set of low-level feature channels, such as color opponency (red-green, blue-yellow), intensity, and orientation at multiple spatial scales.
 For each feature, a \enquote{conspicuity map} is generated by identifying locations that stand out from their surroundings. These maps are then normalized and summed to create a single, master \textbf{saliency map}. This map represents the purely bottom-up, stimulus-driven \enquote{attractiveness} of each location. A winner-take-all network then selects the most salient location for the next fixation, and a mechanism called \enquote{inhibition of return} transiently suppresses the just-fixated location to encourage exploration of new areas.
 
 \subsection{The Deep Learning Revolution}
-With the advent of deep learning, the field of saliency prediction underwent a paradigm shift. Instead of relying on hand-crafted, low-level features, models began to leverage rich feature hierarchies learned by deep Convolutional Neural Networks (CNNs) pre-trained on large-scale object recognition datasets like ImageNet. This transfer learning approach massively boosted prediction performance \cite{kummerer2017understanding}.
+With the advent of deep learning, the field of saliency prediction underwent a paradigm shift. Instead of relying on hand-crafted, low-level features, models began to leverage the rich, hierarchical features learned by deep Convolutional Neural Networks (CNNs) pre-trained on large-scale object recognition datasets like ImageNet. This transfer learning approach massively boosted prediction performance by providing models with a much more sophisticated and semantically-aware representation of visual scenes \cite{kummerer2017deepgaze2}.
+Models like DeepGaze II \cite{kummerer2017deepgaze2} became the new standard. DeepGaze II used a pre-trained VGG network as a frozen backbone to extract features and a small, learned readout network to transform these features into a spatial saliency map. This purely spatial model, which predicts the overall fixation density on an image, set the stage for its more sophisticated successors.
 
-Models like DeepGaze II \cite{kummerer2017understanding} became the new standard. DeepGaze II used a pre-trained VGG network as a frozen backbone to extract features and a small, learned readout network to transform these features into a spatial saliency map. This purely spatial model, which predicts the overall fixation density on an image, set the stage for its more sophisticated successor, DeepGaze III.
+\section{Probabilistic Modeling: A Paradigm Shift in Evaluation}
+\label{sec:sota_probabilistic_distinction}
+A concurrent and equally important revolution occurred in how models were evaluated. Early metrics often treated saliency maps as simple images or rankings, leading to inconsistencies and difficulties in comparing model performance \cite{kummerer2023predicting}. The critical insight was to reframe fixation prediction as a problem of probabilistic density estimation.
+Instead of predicting a single map, a probabilistic model predicts a full probability distribution over all possible fixation locations. This is a more rigorous and powerful formulation because it allows the model to express uncertainty and provides a principled way to measure performance. This shift enabled the use of information-theoretic metrics, which have become the gold standard in the field. The two most important are:
+\begin{itemize}
+\item \textbf{Log-Likelihood (LL):} This metric directly measures how probable a model finds the actual human data. A higher LL means the model assigns a higher probability to the locations where people actually looked, indicating a better fit to the data.
+\item \textbf{Information Gain (IG):} This is the LL of the model minus the LL of a simple baseline model (typically a center-bias). It quantifies how much better the model is than a default strategy, measuring the actual "information" it provides about fixation locations.
+\end{itemize}
+This probabilistic framework moves the field from simply asking "which model ranks fixations higher?" to the more profound question, "which model provides a better probabilistic explanation for human gaze?" The detailed calculations for these metrics will be presented in \cref{c:results}.
 
-\subsection{The State of the Art: DeepGaze III}
+
+\section{The State of the Art: DeepGaze III}
 \label{sec:sota_deepgaze3}
-
-The direct predecessor and primary benchmark for our work is \textbf{DeepGaze III} \cite{kummerer2022deepgaze}, a state-of-the-art probabilistic model for predicting full human scanpaths. Unlike DeepGaze II, which only predicts spatial saliency, DeepGaze III is a generative model that captures the sequential dependency of fixations.
-
-\paragraph{Architecture.} DeepGaze III employs a modular architecture, as detailed in the paper and shown in its Figure 2. It consists of three main components:
+The direct predecessor and primary benchmark for our work is \textbf{DeepGaze III} \cite{kummerer2022deepgaze}, a state-of-the-art model that fully embraces the probabilistic paradigm to predict full human scanpaths. Unlike DeepGaze II, which only predicts spatial saliency, DeepGaze III is a generative model that captures the sequential dependency of fixations.
+\paragraph{Architecture.} DeepGaze III employs a modular architecture, as detailed in its publication. It consists of three main components:
 \begin{enumerate}
-    \item A \textbf{Spatial Priority Network}, which uses a frozen DenseNet-201 backbone to extract deep image features, producing a \emph{spatial priority map} that encodes the image-driven relevance of each location.
-    \item A \textbf{Scanpath Network}, which processes the viewing history. It takes the last four fixations and encodes them into a set of feature maps representing their location relative to every other point in the image (e.g., via Euclidean distance and coordinate differences).
-    \item A \textbf{Fixation Selection Network}, which combines the output of the spatial and scanpath networks to produce the final prediction.
+\item A \textbf{Spatial Priority Network}, which uses a frozen DenseNet-201 (a deep CNN) as its backbone to extract image features, producing a \emph{spatial priority map} that encodes the image-driven relevance of each location.
+\item A \textbf{Scanpath Network}, which processes the viewing history. It takes the last four fixations and encodes them into a set of feature maps representing their location relative to every other point in the image.
+\item A \textbf{Fixation Selection Network}, which combines the outputs of the spatial and scanpath networks to produce the final conditional probability distribution.
 \end{enumerate}
+\paragraph{Probabilistic Formulation.} Crucially, DeepGaze III models the conditional probability $p(f_i | f_{i-1}, ..., f_{i-4}, I)$, where $f_i$ is the current fixation and $I$ is the image. This rigorous formulation allows it to be trained using maximum likelihood and evaluated with information-theoretic metrics like LL and IG.
+DeepGaze III established a new state of the art on the MIT1003 and MIT300 benchmarks. However, despite its power, it has a key limitation that motivates this thesis: its understanding of semantics is \textbf{implicit}. The model learns to associate deep features from its CNN backbone with saliency, but it has no explicit representation of the objects and surfaces that structure the scene. The information from the image content and the scanpath history are combined in a relatively simple, late-fusion manner, leaving room for a more integrated and structurally-aware approach.
 
-\paragraph{Probabilistic Formulation.} Crucially, DeepGaze III is a probabilistic model. It does not just predict a single next fixation, but a full probability distribution over all possible next fixation locations. It models the conditional probability $p(f_i | f_{i-1}, ..., f_{i-4}, I)$, where $f_i$ is the current fixation and $I$ is the image. This allows the model to be trained using maximum likelihood and evaluated with rigorous information-theoretic metrics like Log-Likelihood (LL) and Information Gain (IG), as described in \cref{sec:sota_probabilistic_distinction}.
-
-DeepGaze III established a new state of the art on the MIT1003 and MIT300 benchmarks. Its modularity also allows for ablation studies that can disentangle the relative contributions of image content versus scanpath history. However, its reliance on a CNN backbone and its method of combining the content and history streams present an opportunity for improvement, which is the central motivation for this thesis.
+\section{The Missing Piece: Segmentation as a Guiding Principle}
+\label{sec:sota_segmentation_motivation}
+While models like DeepGaze III push the boundaries of prediction, they treat the visual scene as a collection of features. However, humans do not perceive a scene as a pixel grid; we perceive it as a composition of meaningful objects and surfaces. The process of parsing the visual field into these coherent units is known as \textbf{visual segmentation}.
+Recent theoretical and experimental work from our collaborators has challenged the traditional view of segmentation as merely a step towards object recognition. The work of Vacher et al. (2023) provides a rigorous framework for measuring human segmentation and demonstrates that it is an active, information-rich process that is fundamental to perception itself \cite{vacher2023measuring}. Their research suggests that the brain computes probabilistic segmentation maps, representing not just the boundaries of objects but also the uncertainty associated with those boundaries.
+This insight provides the conceptual key to unlocking the next level of gaze prediction. If the segmentation of the visual world into distinct entities is a core computational goal of the visual system, then it stands to reason that this process must fundamentally guide where we look. Gaze is the primary mechanism for gathering the information needed to resolve segmentation ambiguities. Therefore, the very structure of the segmented scene should inform the dynamics of the scanpath.
+This leads directly to the central hypothesis of this thesis: state-of-the-art gaze prediction models are limited because they lack an explicit mechanism to leverage segmentation information. Their semantic understanding is emergent and implicit. We propose that by designing an architecture that can \textbf{explicitly inject and utilize semantic segmentation information}, we can create a model that is not only more accurate but also more aligned with the underlying principles of human visual perception. This is the intellectual foundation upon which our DinoGaze model is built.
