@@ -1,52 +1,119 @@
 \chapter{Methodology}
 \label{cha:methodology}
 
-This chapter details the core methodological contributions of this thesis. We present the narrative of our research, from the initial hypothesis to the development of our final, state-of-the-art gaze prediction model. This journey involves exploring the capabilities of Vision Transformers, addressing the challenge of information injection without adding complexity, and developing a novel technique for modulating neural network activations based on dynamic semantic information.
-
-\section{Core Hypothesis: Segmentation as Information}
-\label{sec:method_hypothesis}
-
-Our work is grounded in the theory, developed in our lab, that visual segmentation is not merely a preliminary step for object recognition but is an integral part of the mechanism of gaze itself \cite{vacher2023measuring}. The theory posits that the process of segmenting the visual field into objects and surfaces carries vital information that guides the visual system. This leads to a powerful challenge: if segmentation carries information, we should be able to exploit it to build more accurate and human-like models of gaze.
-
-\section{The Research Trajectory}
+Grounded in the theory that visual segmentation is a core guiding principle for gaze \cite{vacher2023measuring}, this thesis set out to design a computational model that could explicitly test this relationship. 
+This chapter details the methodological journey undertaken to achieve this goal, moving from the high-level hypothesis established in the previous chapter to the concrete architecture of our final, state-of-the-art model. 
+We begin by laying the architectural foundations, contrasting the traditional CNN paradigm with the more recent Vision Transformer, before narrating the progression of our research and the technical innovations developed to overcome specific challenges.
+\section{Architectural Foundations: From Local Convolutions to Global Attention}
+\label{sec:method_foundations}
+The choice of a backbone architecture is a fundamental decision in designing any vision model. 
+The backbone's inherent properties—its biases, how it processes information, and the nature of the features it extracts—profoundly influence the model's capabilities. 
+Our work leverages a pivotal transition in computer vision from Convolutional Neural Networks (CNNs) to Vision Transformers (ViTs).
+\subsection{The CNN Paradigm and Its Inductive Biases}
+For nearly a decade, CNNs were the undisputed champions of computer vision tasks. 
+Architectures like DenseNet, used in DeepGazeIII, are built upon a set of core principles that are both powerful and, for our purposes, limiting.
+\paragraph{How CNNs Work.} A CNN processes an image through a hierarchy of layers. 
+The fundamental operation is the **convolution**, where a small matrix of weights, known as a kernel or filter, slides across the input image. 
+At each position, it computes a dot product between the kernel and the patch of the image it covers. 
+This has two critical consequences:
+\begin{itemize}
+\item \textbf{Local Receptive Fields:} Each neuron in a convolutional layer is connected only to a small, local region of the input from the previous layer. 
+It is fundamentally blind to the rest of the image.
+\item \textbf{Hierarchical Feature Extraction:} Early layers, with their small receptive fields, learn to detect simple features like edges, corners, and color gradients. 
+Subsequent layers perform convolutions on these feature maps, combining them to recognize more complex structures like textures, parts of objects (an eye, a wheel), and eventually, whole objects.
+\end{itemize}
+To manage computational complexity and build a degree of spatial invariance, CNNs also employ pooling layers (e.g., max-pooling), which downsample the feature maps by taking the maximum value over a local neighborhood.
+\paragraph{The Limitations of Locality and Feature Condensation.} The design of a CNN imparts a strong **inductive bias** towards locality. 
+It assumes that spatially close pixels are more related than distant ones. 
+While this is a reasonable assumption, the model must learn about long-range dependencies arduously, by gradually expanding its effective receptive field through many layers. 
+This can be inefficient for understanding the global context of a scene.
+Furthermore, these networks were primarily perfected for the task of image classification. 
+The ultimate goal of a model like DenseNet is to condense the entire spatial feature hierarchy into a single, compact vector of logits to make a final decision (e.g., "this image contains a cat"). 
+This architectural objective leads to feature condensation: the network is explicitly designed to discard precise spatial information in its final layers in favor of abstract, semantic content. 
+Even when fine-tuned for a task like saliency prediction, which is fundamentally spatial, the backbone retains this innate tendency to prioritize what is in the image over precisely where it is. 
+This makes it a suboptimal foundation for predicting fixation locations with high fidelity, fundamentally going against the requirements of tasks that demand fine-grained spatial awareness in a context where segmentation plays a crucial role.
+\subsection{The Vision Transformer Paradigm: A Global Perspective}
+Vision Transformers, inspired by their success in natural language processing, offer a fundamentally different approach to visual processing, one that is not constrained by local receptive fields.
+\paragraph{How ViTs Work.} Instead of a sliding kernel, a ViT processes an image as follows:
+\begin{enumerate}
+\item \textbf{Image Patching:} The input image is first divided into a grid of non-overlapping, fixed-size patches (e.g., 16x16 pixels). 
+Each patch is flattened into a vector.
+\item \textbf{Sequence Creation:} This series of patch vectors is treated like a sequence of words in a sentence. 
+To retain spatial information, a learnable **positional embedding** is added to each patch vector, explicitly encoding its original location in the grid.
+\item \textbf{Self-Attention:} The core of the ViT is the self-attention mechanism. 
+For each patch in the sequence, the network learns to compute three vectors: a \textbf{Query (Q)}, a \textbf{Key (K)}, and a \textbf{Value (V)}. 
+Intuitively, the Query vector for a patch asks, "Given my own content, which other parts of the image are most relevant to me?" This Query is then compared (via dot product) with the Key vector of *every other patch* in the image. 
+This comparison yields a set of "attention scores" that quantify the affinity between this patch and all others.
+\item \textbf{Contextualized Representation:} These scores are normalized (via softmax) to form a set of weights. 
+The final representation for our original patch is then computed as a weighted sum of the Value vectors of all patches in the image. 
+The result is a new vector for that patch that is now a sophisticated blend of its own information and contextual information from the entire image, weighted by semantic relevance.
+\end{enumerate}
+This process is repeated through multiple layers, allowing the model to build an increasingly abstract and context-aware understanding of the scene.
+\paragraph{Overcoming CNN Limitations.} The ViT architecture directly addresses the core limitations of CNNs. 
+Its receptive field is, by definition, **global from the very first layer**. 
+A patch representing a person's eye can directly attend to a patch representing their foot, without waiting for information to propagate through many intermediate layers. 
+This allows for a much more efficient and powerful way of modeling long-range dependencies.
+Most importantly for this thesis, the self-attention scores naturally reflect the semantic structure of the scene. 
+Patches belonging to the same object tend to have high attention scores with each other. 
+This means the ViT develops an emergent knowledge of segmentation as a core part of its processing \cite{oquab2023dinov2}.
+It learns to parse the scene into coherent objects not as a separate task, but as the fundamental mechanism by which it understands the image.
+This makes it a vastly superior architectural foundation for a model that seeks to test the hypothesis that segmentation guides gaze.
+\section{From Hypothesis to Architecture: A Narrative of Development}
 \label{sec:method_trajectory}
+Our research followed an iterative path of model development, evaluation, and refinement, built upon the architectural principles outlined above.
+\subsection{Step 1: Establishing the ViT as a Stronger Baseline}
+Our initial experiment was designed to empirically validate the theoretical advantages of the ViT architecture. 
+We created our first model, \textbf{DinoGaze}, by replacing the DenseNet CNN backbone of DeepGazeIII with a frozen DINOv2 Vision Transformer. 
+As detailed in our analysis of architectural foundations (\cref{sec:method_foundations}), we hypothesized that the global receptive field and emergent segmentation properties of the ViT would provide a superior set of features for saliency prediction.
+The results, presented in \cref{c:results}, confirmed this hypothesis, establishing a new state-of-the-art baseline. 
+However, this success created a critical ambiguity: were the improvements due to the ViT's implicit understanding of segmentation, or simply because it provides generically stronger image embeddings? To answer this, we needed a way to isolate the effect of explicit segmentation information.
 
-Our initial approach was to replace the traditional CNN backbone of models like DeepGazeIII with a Vision Transformer (ViT). We chose DINOv2, a powerful self-supervised model, based on the observation that ViTs develop an intrinsic knowledge of scene segmentation. The affinity maps between image patches in a ViT show that patches belonging to the same semantic object have stronger affinity. This first model, which we call \textbf{DinoGaze}, produced excellent results, beating the previous state-of-the-art.
-
-However, this success raised a critical question: were the improvements due to our hypothesis being correct, or simply because DINOv2 provides stronger image embeddings than the older DenseNet backbone? To answer this, we needed to devise a method to inject segmentation information directly, isolating its effect from the general power of the feature extractor.
-
-The challenge was to do this without simply adding more layers or parameters, as any resulting improvement could be attributed to the increased complexity of the model. Inspired by the hypothesis of custom normalization of neural signals in the brain, we turned to \textbf{Spatially-Adaptive Normalization (SPADE)}. SPADE allows us to modulate the activations within the network based on a segmentation map, effectively \enquote{pushing} the network\'s processing in a certain direction without a significant increase in learnable parameters.
-
-This led to a new set of challenges. Standard SPADE requires a fixed number of segmentation classes, but the real world does not come with a predefined, discrete set of labels. Our first attempts involved creating unsupervised segmentation masks using DINO embeddings clustered with k-means (into 16 and 64 classes) and using the Segment Anything Model (SAM). We then tried to learn a trainable embedding for these discrete segment IDs. This approach failed because the numerical IDs (0, 1, 2, ...) lacked semantic coherence across different images.
-
-This failure led to our key innovation: \textbf{semantic painting}. Instead of using discrete IDs, we create a dynamic, feature-rich semantic map. For each segment in a given segmentation mask, we first compute the average feature vector of all pixels belonging to that segment within the DINOv2 backbone\'s feature space. We then \enquote{paint} a new map where every pixel is represented by the average feature vector of its corresponding segment. 
-
-Our final and most successful model, \textbf{DinoGaze-SPADE}, combines the DINOv2 backbone with this dynamic semantic painting. The DINOv2 model serves a dual purpose: it acts as a powerful feature extractor for the main saliency pathway, and it provides the deep features for creating the painted semantic map used in the SPADE layers. This architecture yielded a substantial improvement over the initial DinoGaze model, setting a new state of the art for gaze prediction. Furthermore, by recycling the DINOv2 calculation, the model gains this significant performance boost with remarkable efficiency.
-
+\subsection{Step 2: The Challenge of Information Injection}
+The core challenge became devising a method to inject segmentation information directly, thereby isolating its effect from the general power of the feature extractor. 
+A naive approach would be to simply concatenate segmentation features with image features and feed them into additional network layers. 
+This, however, is a flawed methodology, as any resulting performance improvement could be attributed merely to the increased complexity and parameter count of the model, rather than the information content of the segmentation.
+Inspired by hypotheses of custom normalization of neural signals in the brain, we turned to \textbf{Spatially-Adaptive Normalization (SPADE)}. 
+SPADE provides an elegant solution to this problem. 
+It allows us to modulate the activations within the network's normalization layers based on an external semantic map. 
+This effectively "pushes" the network's processing in a certain direction guided by the segmentation, but crucially, does so with a negligible increase in learnable parameters.
+\subsection{Step 3: The Semantic Coherence Problem and the Key Innovation}
+This led to a new set of challenges. 
+Standard SPADE requires a fixed number of segmentation classes with consistent meanings (e.g., class 4 is always "tree"). 
+The real world, however, does not come with a predefined, discrete set of labels. 
+Our first attempts involved creating unsupervised segmentation masks and then learning a trainable embedding for each discrete segment ID (e.g., 0, 1, 2, ...). 
+This approach failed because the numerical IDs lacked semantic coherence; segment ID=5 in one image had no relationship to segment ID=5 in another.
+This failure led to our key innovation: \textbf{semantic painting}. 
+Instead of using meaningless discrete IDs, we create a dynamic, feature-rich semantic map. 
+For each segment in a given segmentation mask, we first compute the average feature vector of all pixels belonging to that segment within the DINOv2 backbone's deep feature space. 
+We then "paint" a new map where every pixel is represented by the average feature vector of its corresponding segment. 
+This creates a representation that is both spatially structured (respecting the segmentation mask) and semantically coherent (grounded in the rich DINOv2 feature space).
+This iterative process of hypothesis, experimentation, and refinement led directly to our final and most successful model: DinoGaze-SPADE.
 \section{The DinoGaze-SPADE Architecture}
 \label{sec:method_dinogaze_spade}
-
-Our final model, DinoGaze-SPADE, is a probabilistic model for both spatial saliency and scanpath prediction. Its architecture is defined by the principles discovered during our research.
-
+Our final model, DinoGaze-SPADE, is a probabilistic model for both spatial saliency and scanpath prediction. 
+Its architecture is the direct result of the principles discovered during our research.
 \subsection{DINOv2 as a Dual-Purpose Backbone}
-We use a pre-trained and frozen DINOv2 Vision Transformer as the core of our model. As detailed in the implementation found in \verb|src/dinov2_backbone.py|, the ViT provides two sets of features from a single forward pass:
+We use a pre-trained and frozen DINOv2 Vision Transformer as the core of our model. 
+As detailed in the implementation found in \verb|src/dinov2_backbone.py|, the ViT provides two sets of features from a single forward pass:
 \begin{itemize}
-    \item \textbf{Multi-level Features for Saliency:} We extract and concatenate the feature maps from the last three blocks of the transformer. This provides a rich, multi\-scale representation of the image for the main saliency prediction head.
-    \item \textbf{Deep Features for Semantic Painting:} We take the feature map from the final block to compute the dynamic semantic map used for SPADE modulation. The global context captured by the ViT makes these features ideal for representing the semantics of each image segment.
+\item \textbf{Multi-level Features for Saliency:} We extract and concatenate the feature maps from the last three blocks of the transformer. 
+This provides a rich, multi\-scale representation of the image for the main saliency prediction head.
+\item \textbf{Deep Features for Semantic Painting:} We take the feature map from the final block to compute the dynamic semantic map used for SPADE modulation. 
+The global context captured by the ViT makes these features ideal for representing the semantics of each image segment.
 \end{itemize}
-
+This dual-role design is highly efficient, as the expensive backbone computation is performed only once per image.
 \subsection{Dynamic SPADE for Information Injection}
-The core mechanism for integrating segmentation information is our dynamic SPADE layer. As described in \cref{sec:method_trajectory}, this involves two steps:
+The core mechanism for integrating segmentation information is our dynamic SPADE layer. 
+As described previously, this involves two steps:
 \begin{enumerate}
-    \item \textbf{Semantic Painting:} We use the deep DINOv2 features and a given segmentation mask to create a \enquote{painted} semantic map, where each pixel contains the average feature vector of its segment.
-    \item \textbf{Modulation:} This rich semantic map is then fed into the SPADE layers within our saliency and fixation-selection networks. The SPADE layers learn to produce spatial gamma and beta parameters from the semantic map, which then normalize and modulate the features of the main saliency pathway. This allows the model to learn, for example, that certain types of segments (like faces or text) are inherently more salient, and to apply this knowledge in a spatially-aware manner.
+\item \textbf{Semantic Painting:} We use the deep DINOv2 features and a given segmentation mask to create a "painted" semantic map, where each pixel contains the average feature vector of its segment.
+\item \textbf{Modulation:} This rich semantic map is then fed into the SPADE layers within our saliency and fixation-selection networks. 
+The SPADE layers learn to produce spatial gamma and beta parameters from the semantic map, which then normalize and modulate the features of the main saliency pathway. 
+This allows the model to learn, for example, that certain types of segments (like faces or text) are inherently more salient, and to apply this knowledge in a spatially-aware manner.
 \end{enumerate}
-
 \section{Segmentation Mask Generation}
 \label{sec:method_mask_generation}
-
-The SPADE mechanism requires an initial segmentation mask for every image. These masks were generated using unsupervised methods prior to training the saliency models.
-
+The SPADE mechanism requires an initial segmentation mask for every image. 
+As this thesis focuses on the use of segmentation information rather than its generation, these masks were generated using existing unsupervised methods prior to training the saliency models.
 We generated masks using two primary techniques: clustering DINOv2 embeddings with k-means (for both 16 and 64 clusters), and using the Segment Anything Model (SAM).
-
 \textit{[Placeholder: A more detailed explanation of the mask generation process, including the trade-offs of each method and their impact on final model performance, will be provided here.]}
