@@ -4,8 +4,8 @@
 
 stage:
   kind: "salicon_pretrain"
-  name: "dinogaze"
-  model_key: "dinogaze"
+  name: "deepgaze_spade_v1_sam64"
+  model_key: "deepgaze_spade_v1"
   dataset_key: "SALICON"
   
   # --- Hyperparameters for this stage ---
@@ -16,10 +16,13 @@ stage:
   min_lr: 1.0e-7
   val_every: 1
   resume_ckpt: null # No resume for the first pre-training stage (unless interrupted)
+
+  early_stopping_patience: 3
+
   
   # --- Model-specific parameters passed to the builder function ---
   extra:
-    requires_segmentation: false
+    requires_segmentation: true
     is_scanpath_stage: false
     freeze_saliency_network: false
 
@@ -38,6 +41,10 @@ stage:
     finalizer_initial_sigma: 8.0
     finalizer_learn_sigma: true
 
+    # Mask Paths for the SALICON Data Builder
+    salicon_train_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_train'
+    salicon_val_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_val'
+
     # Scanpath history to take into account
 
 
@@ -45,7 +52,7 @@ stage:
 # --- Global Run Settings ---
 compile: false
 seed: 43
-num_workers: 4
+num_workers: 'auto'
 
 # --- Path Configuration ---
 paths:

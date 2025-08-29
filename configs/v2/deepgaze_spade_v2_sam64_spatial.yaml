@@ -5,8 +5,8 @@
 
 stage:
   kind: "mit_spatial_finetune"
-  name: "dinogaze_spade_v1_sam64" # Name includes the fold for clarity
-  model_key: "dinogaze_spade_v1"
+  name: "deepgaze_spade_v2_sam64" # Name includes the fold for clarity
+  model_key: "deepgaze_spade_v2"
   dataset_key: "MIT1003"
   
   # --- Hyperparameters for this stage ---
@@ -22,11 +22,11 @@ stage:
   # This path is now predictable based on the 'kind' and 'name' of the previous stage.
   #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
   #resume_ckpt : "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/step-0004.pth"
+  
   # --- Model- and Data-specific parameters ---
   extra:
     # Model parameters (can be the same or different from pre-training)
     requires_segmentation: true
-    is_scanpath_stage: false
     dino_model_name: 'dinov2_vitl14'
     dino_patch_size: 14
     dino_layers_for_main_path: [-3, -2, -1]
@@ -41,7 +41,6 @@ stage:
 
 # --- Global Run Settings ---
 compile: false
-#seed: 65423547395
 seed: 42
 num_workers: 'auto'
 

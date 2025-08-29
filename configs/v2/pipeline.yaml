@@ -1,26 +1,220 @@
 # This master file defines a sequence of experiments by pointing to specific config files.
 # The orchestrator will run each stage, injecting necessary overrides like fold and checkpoints.
 
+
 sequence:
+
+
+############# Dinogaze
+
   # Stage 1: Run the SALICON pre-training once.
   - type: single
-    # A unique name to identify this stage's output checkpoint.
     name: salicon_pretrain
-    config_path: "configs/dinogazev1_sam64_salicon.yaml"
+    config_path: "configs/v2/dinogaze_salicon.yaml"
 
   # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
   - type: loop
     name: mit_spatial_finetune
     num_folds: 10
-    config_path: "configs/dinogazev1_sam64_spatial.yaml"
-    # The orchestrator will use the checkpoint from the 'salicon_pretrain' stage as input for each fold.
+    config_path: "configs/v2/dinogaze_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/dinogaze_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v1 sam16
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v1_sam16_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v1_sam16_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v1_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v2 sam16
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v2_sam16_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v2_sam16_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v2_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v3 sam16
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v3_sam16_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v3_sam16_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v3_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v1 sam64
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v1_sam64_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v1_sam64_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v1_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v2 sam64
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v2_sam64_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v2_sam64_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v2_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Deepgaze Spade v3 sam64
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/deepgaze_spade_v3_sam64_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/deepgaze_spade_v3_sam64_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze_spade_v3_sam16_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+
+############# Deepgaze
+
+  # # Stage 1: Run the SALICON pre-training once.
+  # - type: single
+  #   name: salicon_pretrain
+  #   config_path: "configs/v2/deepgaze3_salicon.yaml"
+
+  # # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_spatial_finetune
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze3_spatial.yaml"
+  #   input_checkpoint_from: salicon_pretrain
+
+  # # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/deepgaze3_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Dinogaze Spade v1 sam16
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/dinogazev1_sam16_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/dinogazev1_sam16_spatial.yaml"
+    input_checkpoint_from: salicon_pretrain
+
+  # # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
+  # - type: loop
+  #   name: mit_scanpath_frozen
+  #   num_folds: 10
+  #   config_path: "configs/v2/dinogazev1_sam64_scanpath_frozen.yaml"
+  #   input_checkpoint_from: mit_spatial_finetune
+
+############# Dinogaze Spade v1 sam64
+
+  # Stage 1: Run the SALICON pre-training once.
+  - type: single
+    name: salicon_pretrain
+    config_path: "configs/v2/dinogazev1_sam64_salicon.yaml"
+
+  # Stage 2: Loop over the MIT Spatial fine-tuning config 10 times.
+  - type: loop
+    name: mit_spatial_finetune
+    num_folds: 10
+    config_path: "configs/v2/dinogazev1_sam64_spatial.yaml"
     input_checkpoint_from: salicon_pretrain
 
   # Stage 3: Loop over the MIT Scanpath fine-tuning config 10 times.
   - type: loop
     name: mit_scanpath_frozen
     num_folds: 10
-    config_path: "configs/dinogazev1_sam64_scanpath_frozen.yaml"
-    # The orchestrator will use the corresponding spatial checkpoint as input for each fold.
-    # It dynamically finds the output from 'mit_spatial_finetune' for the same fold number.
+    config_path: "configs/v2/dinogazev1_sam64_scanpath_frozen.yaml"
     input_checkpoint_from: mit_spatial_finetune
+
+
+#############

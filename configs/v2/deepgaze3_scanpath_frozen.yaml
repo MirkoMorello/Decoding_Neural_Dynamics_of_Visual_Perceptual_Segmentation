@@ -16,7 +16,8 @@ stage:
   grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
-
+  early_stopping_patience: 2
+  
   #resume_ckpt: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/step-0002.pth"
 
   # --- Model- and Data-specific parameters ---

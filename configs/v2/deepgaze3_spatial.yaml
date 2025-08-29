@@ -16,6 +16,7 @@ stage:
   grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
+  early_stopping_patience: 3
 
   #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
   #resume_ckpt : "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/step-0004.pth"

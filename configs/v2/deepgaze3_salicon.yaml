@@ -15,6 +15,8 @@ stage:
   grad_acc_steps: 4
   min_lr: 1.0e-7
   val_every: 1
+  early_stopping_patience: 3
+  
   resume_ckpt: null # No resume for the first pre-training stage (unless interrupted)
   
   # --- Model-specific parameters passed to the builder function ---

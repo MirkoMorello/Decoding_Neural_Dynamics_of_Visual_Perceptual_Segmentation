@@ -13,7 +13,7 @@ stage:
   lr: 0.00005 # From your old lr_mit_spatial
   milestones: [10, 20, 30, 35]
   batch_size: 1
-  grad_acc_steps: 4
+  grad_acc_steps: 2
   min_lr: 1.0e-7
   val_every: 1
   

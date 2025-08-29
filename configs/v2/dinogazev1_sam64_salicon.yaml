@@ -12,10 +12,13 @@ stage:
   lr: 0.0001
   milestones: [15, 20, 25, 30, 35]
   batch_size: 4
-  grad_acc_steps: 4
+  grad_acc_steps: 2
   min_lr: 1.0e-7
   val_every: 1
   resume_ckpt: null # No resume for the first pre-training stage (unless interrupted)
+
+  early_stopping_patience: 3
+
   
   # --- Model-specific parameters passed to the builder function ---
   extra:
@@ -49,7 +52,7 @@ stage:
 # --- Global Run Settings ---
 compile: false
 seed: 43
-num_workers: 4
+num_workers: 'auto'
 
 # --- Path Configuration ---
 paths:

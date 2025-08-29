@@ -1,32 +1,34 @@
 #
-# STAGE 2: Fine-tune the pre-trained model on MIT1003 (spatial only).
+# STAGE 3: Fine-tune the scanpath head on MIT1003 (saliency head frozen).
 # FOLD 0
 #
 
 stage:
-  kind: "mit_spatial_finetune"
-  name: "dinogaze_spade_v1_sam64" # Name includes the fold for clarity
-  model_key: "dinogaze_spade_v1"
+  kind: "mit_scanpath_frozen"
+  name: "deepgaze_spade_v3_sam64"
+  model_key: "deepgaze_spade_v3"
   dataset_key: "MIT1003"
   
   # --- Hyperparameters for this stage ---
-  lr: 0.00005 # From your old lr_mit_spatial
-  milestones: [10, 20, 30, 35]
+  lr: 0.0005 # From your old lr_mit_scanpath_frozen
+  milestones: [10, 20, 30, 35, 40]
   batch_size: 1
   grad_acc_steps: 2
   min_lr: 1.0e-7
   val_every: 1
-  early_stopping_patience: 3
+  early_stopping_patience: 2
   
   # --- CHECKPOINT CHAINING ---
-  # This path is now predictable based on the 'kind' and 'name' of the previous stage.
-  #resume_ckpt: "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/final_best_val.pth"
-  #resume_ckpt : "experiments/salicon_pretrain/dinogaze_spade_v1_sam64/step-0004.pth"
+  # Loads the model trained in the MIT spatial stage.
+  #resume_ckpt: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/step-0002.pth"
+
   # --- Model- and Data-specific parameters ---
   extra:
-    # Model parameters (can be the same or different from pre-training)
+    # Model parameters
     requires_segmentation: true
-    is_scanpath_stage: false
+    is_scanpath_stage: true             # Tells the builder to create a scanpath model
+    freeze_saliency_network: true       # Tells the builder to freeze the saliency head
+    included_fixations: [-1, -2, -3, -4] # Scanpath history length
     dino_model_name: 'dinov2_vitl14'
     dino_patch_size: 14
     dino_layers_for_main_path: [-3, -2, -1]
@@ -37,11 +39,10 @@ stage:
     
     # Data parameters for the MIT1003 builder
     fold: 0
-    mask_dir: 'masks/mit1003/sam_vitl_k64_mit' # A single mask directory for the whole dataset
+    mask_dir: 'masks/mit1003/sam_vitl_k64_mit'
 
 # --- Global Run Settings ---
 compile: false
-#seed: 65423547395
 seed: 42
 num_workers: 'auto'
 
