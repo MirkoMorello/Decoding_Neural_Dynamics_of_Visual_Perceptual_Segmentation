@@ -3,8 +3,6 @@ Model definition and builder for DeepGazeIII with DenseNet and STATIC SPADE.
 
 This model uses a DenseNet-201 backbone for the main saliency pathway.
 SPADE modulation is achieved via a learnable nn.Embedding layer.
-This modular version correctly handles both spatial and scanpath stages and uses
-a learnable scanpath encoding via FlexibleScanpathHistoryEncoding.
 """
 import torch
 import torch.nn as nn

@@ -136,7 +136,7 @@ def build(cfg):
     
     main_path_channels = 2048
     semantic_path_channels = 128
-    sem_idx = extra.get("densenet_semantic_feature_layer_idx", -1)
+    sem_idx = extra.get("densenet_semantic_feature_layer_idx", 1)
 
     saliency_net = SaliencyNetworkSPADEDynamic(
         input_channels_main_path=main_path_channels,
