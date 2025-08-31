@@ -5,7 +5,7 @@
 
 stage:
   kind: "mit_spatial_finetune"
-  name: "deepgaze_spade_v1_sam16" # Name includes the fold for clarity
+  name: "deepgaze_spade_v1_sam64" # Name includes the fold for clarity
   model_key: "deepgaze_spade_v1"
   dataset_key: "MIT1003"
   
