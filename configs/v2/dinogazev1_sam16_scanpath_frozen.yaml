@@ -5,7 +5,7 @@
 
 stage:
   kind: "mit_scanpath_frozen"
-  name: "dinogaze_spade_v1_sam64"
+  name: "dinogaze_spade_v1_sam16"
   model_key: "dinogaze_spade_v1"
   dataset_key: "MIT1003"
   
@@ -39,7 +39,7 @@ stage:
     
     # Data parameters for the MIT1003 builder
     fold: 0
-    mask_dir: 'masks/mit1003/sam_vitl_k64_mit'
+    mask_dir: 'masks/mit1003/sam_vitl_k16_mit'
 
 # --- Global Run Settings ---
 compile: false

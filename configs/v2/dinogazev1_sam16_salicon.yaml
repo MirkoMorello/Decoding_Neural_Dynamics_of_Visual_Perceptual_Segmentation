@@ -4,7 +4,7 @@
 
 stage:
   kind: "salicon_pretrain"
-  name: "dinogaze_spade_v1_sam64"
+  name: "dinogaze_spade_v1_sam16"
   model_key: "dinogaze_spade_v1"
   dataset_key: "SALICON"
   
@@ -34,15 +34,15 @@ stage:
     dino_semantic_feature_layer_idx: -1
     
     # Segmentation and SPADE settings
-    num_total_segments: 64
+    num_total_segments: 16
 
     # Finalizer settings
     finalizer_initial_sigma: 8.0
     finalizer_learn_sigma: true
 
     # Mask Paths for the SALICON Data Builder
-    salicon_train_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_train'
-    salicon_val_mask_dir: 'masks/salicon/sam_vitb_k64_salicon_val'
+    salicon_train_mask_dir: 'masks/salicon/sam_vitb_k16_salicon_train'
+    salicon_val_mask_dir: 'masks/salicon/sam_vitb_k16_salicon_val'
 
     # Scanpath history to take into account
 

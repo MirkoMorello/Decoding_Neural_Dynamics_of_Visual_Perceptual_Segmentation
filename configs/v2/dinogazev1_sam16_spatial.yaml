@@ -5,7 +5,7 @@
 
 stage:
   kind: "mit_spatial_finetune"
-  name: "dinogaze_spade_v1_sam64" # Name includes the fold for clarity
+  name: "dinogaze_spade_v1_sam16" # Name includes the fold for clarity
   model_key: "dinogaze_spade_v1"
   dataset_key: "MIT1003"
   
@@ -31,13 +31,13 @@ stage:
     dino_patch_size: 14
     dino_layers_for_main_path: [-3, -2, -1]
     dino_semantic_feature_layer_idx: -1
-    num_total_segments: 64
+    num_total_segments: 16
     finalizer_initial_sigma: 8.0
     finalizer_learn_sigma: true
     
     # Data parameters for the MIT1003 builder
     fold: 0
-    mask_dir: 'masks/mit1003/sam_vitl_k64_mit' # A single mask directory for the whole dataset
+    mask_dir: 'masks/mit1003/sam_vitl_k16_mit' # A single mask directory for the whole dataset
 
 # --- Global Run Settings ---
 compile: false
