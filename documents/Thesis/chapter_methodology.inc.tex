@@ -5,6 +5,7 @@ Grounded in the theory that visual segmentation is a core guiding principle for 
 This chapter details the methodological journey undertaken to achieve this goal, moving from the high-level hypothesis established in the previous chapter to the concrete architecture of our final, state-of-the-art model. 
 We begin by laying the architectural foundations, contrasting the traditional CNN paradigm with the more recent Vision Transformer, before narrating the progression of our research and the technical innovations developed to overcome specific challenges.
 \section{Architectural Foundations: From Local Convolutions to Global Attention}
+
 \label{sec:method_foundations}
 The choice of a backbone architecture is a fundamental decision in designing any vision model. 
 The backbone's inherent properties—its biases, how it processes information, and the nature of the features it extracts—profoundly influence the model's capabilities. 
@@ -117,3 +118,15 @@ The SPADE mechanism requires an initial segmentation mask for every image.
 As this thesis focuses on the use of segmentation information rather than its generation, these masks were generated using existing unsupervised methods prior to training the saliency models.
 We generated masks using two primary techniques: clustering DINOv2 embeddings with k-means (for both 16 and 64 clusters), and using the Segment Anything Model (SAM).
 \textit{[Placeholder: A more detailed explanation of the mask generation process, including the trade-offs of each method and their impact on final model performance, will be provided here.]}
+
+
+% aggiungere alla sezione 2, dopo segmentation, menzionare risultati di cetta, mutual information, con un focus sulla relazione tra eye movements and segmentation maps. Empirical motivation for the model.
+% più enfasi sui risultati, molto importante, e anche metodologia
+% intro e conclusion pensa alle persone meno esperte, reach the audience
+% discussion al posto di conclusion, ripeterli in relazione alla letteratura, rispetto a quello che hanno fatto altri, come espande o estende il lavoro fatto prima da altri (deepgaze, letteratura sui modelli, saliency maps di Koch)
+% mancano molte citazione/bibliografia, ad esempio fixation and saccades, potresti citare 15/20 reference come minimo
+% nel capitolo 1, concludere con un breve riassunto dei contributi principali (quanti modelli, quali modelli funzionano meglio, qual'è quello principale)
+% passare methods dopo results?
+% ogni volta che si introduce un metodo, lo si motiva 
+% https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1011512
+% https://jov.arvojournals.org/article.aspx?articleid=2809407
