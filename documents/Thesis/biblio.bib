@@ -70,13 +70,58 @@
 
 @article{vacher2023measuring,
   title={Measuring uncertainty in human visual segmentation},
-  author={Vacher, Jonathan and Launay, Cl{\'e}ment and Mamassian, Pascal and Coen-Cagli, Riccardo},
-  journal={PLOS Computational Biology},
+  author={Vacher, Jonathan and Launay, C{\'e}line and Mamassian, Pascal and Coen-Cagli, Ruben},
+  journal={PLoS Computational Biology},
   volume={19},
   number={9},
   pages={e1011483},
   year={2023},
-  publisher={Public Library of Science},
-  doi={10.1371/journal.pcbi.1011483},
-  url={https://doi.org/10.1371/journal.pcbi.1011483}
+  publisher={Public Library of Science}
+}
+
+@inproceedings{deng2009imagenet,
+  author = {Jia Deng and Wei Dong and Richard Socher and Li-Jia Li and Kai Li and Li Fei-Fei},
+  title = {ImageNet: A large-scale hierarchical image database},
+  booktitle = {Computer Vision and Pattern Recognition, 2009. CVPR 2009. IEEE Conference on},
+  pages = {248--255},
+  year = {2009},
+  organization = {IEEE},
+  doi = {10.1109/CVPR.2009.5206848},
+  url = {https://ieeexplore.ieee.org/document/5206848}
+}
+
+@inproceedings{huang2017densely,
+  title={Densely connected convolutional networks},
+  author={Huang, Gao and Liu, Zhuang and Van Der Maaten, Laurens and Weinberger, Kilian Q},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={4700--4708},
+  year={2017}
+}
+
+@article{Brusco2025,
+  author = {Brusco, Concetta and Molholm, Sophie and Killian, Nathaniel and Coen-Cagli, Ruben},
+  title = {Quantifying spatiotemporal gaze dynamics using perceptual segmentation},
+  journal = {Journal of Vision},
+  volume = {25},
+  number = {9},
+  pages = {2778},
+  year = {2025},
+  doi = {10.1167/jov.25.9.2778},
+  url = {https://doi.org/10.1167/jov.25.9.2778}
+}
+
+@article{10.1371/journal.pcbi.1011512,
+    doi = {10.1371/journal.pcbi.1011512},
+    author = {Roth, Nicolas AND Rolfs, Martin AND Hellwich, Olaf AND Obermayer, Klaus},
+    journal = {PLOS Computational Biology},
+    publisher = {Public Library of Science},
+    title = {Objects guide human gaze behavior in dynamic real-world scenes},
+    year = {2023},
+    month = {10},
+    volume = {19},
+    url = {https://doi.org/10.1371/journal.pcbi.1011512},
+    pages = {1-39},
+    abstract = {The complexity of natural scenes makes it challenging to experimentally study the mechanisms behind human gaze behavior when viewing dynamic environments. Historically, eye movements were believed to be driven primarily by space-based attention towards locations with salient features. Increasing evidence suggests, however, that visual attention does not select locations with high saliency but operates on attentional units given by the objects in the scene. We present a new computational framework to investigate the importance of objects for attentional guidance. This framework is designed to simulate realistic scanpaths for dynamic real-world scenes, including saccade timing and smooth pursuit behavior. Individual model components are based on psychophysically uncovered mechanisms of visual attention and saccadic decision-making. All mechanisms are implemented in a modular fashion with a small number of well-interpretable parameters. To systematically analyze the importance of objects in guiding gaze behavior, we implemented five different models within this framework: two purely spatial models, where one is based on low-level saliency and one on high-level saliency, two object-based models, with one incorporating low-level saliency for each object and the other one not using any saliency information, and a mixed model with object-based attention and selection but space-based inhibition of return. We optimized each model’s parameters to reproduce the saccade amplitude and fixation duration distributions of human scanpaths using evolutionary algorithms. We compared model performance with respect to spatial and temporal fixation behavior, including the proportion of fixations exploring the background, as well as detecting, inspecting, and returning to objects. A model with object-based attention and inhibition, which uses saliency information to prioritize between objects for saccadic selection, leads to scanpath statistics with the highest similarity to the human data. This demonstrates that scanpath models benefit from object-based attention and selection, suggesting that object-level attentional units play an important role in guiding attentional processing.},
+    number = {10},
+
 }
