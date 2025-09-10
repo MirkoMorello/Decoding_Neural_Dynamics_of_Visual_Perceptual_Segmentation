@@ -1,15 +1,40 @@
 # configs/evaluation_mit1003_finetuned.yaml
+#
+# Evaluation configuration for the DINO-Gaze model on MIT1003,
+# set up for a 5-fold cross-validation analysis.
 
-model:
-  training_config: "configs/v2/dinogazev1_sam64_spatial.yaml"
-  checkpoint: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/final_best_val.pth"
-  model_key: "dinogaze_spade_v1"
-
-dataset:
-  name: "MIT1003"
-
+# --- General Settings for the Evaluation Run ---
 settings:
+  device: "cuda:0"
   batch_size: 1
   num_workers: 6
-  device: "cuda:0"
+  gpus: [0, 1] # Use GPU 0 and GPU 1. For a single GPU, use [0].
   mismatched_mask_seed: 123
+
+# --- Cross-Validation Control ---
+# This section enables the script to loop through multiple trained models (folds).
+cross_validation:
+  enabled: true
+  num_folds: 10 # IMPORTANT: Adjust this to the actual number of folds you trained (e.g., 5 for folds 0-4).
+
+  # Path templates where "{fold}" will be dynamically replaced by the fold number (0, 1, 2, ...).
+  # This tells the script where to find the checkpoint for each fold.
+  checkpoint_path_template: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold{fold}/final_best_val.pth"
+  
+  # Path to the base training config. The script will load this and then set the
+  # specific fold number for the dataset loader.
+  training_config_template: "configs/v2/dinogazev1_sam64_spatial.yaml"
+
+# --- Model and Dataset Information ---
+# This information is used for both single-run and cross-validation modes.
+model:
+  model_key: "dinogaze_spade_v1" # The key for the model in the MODEL_REGISTRY.
+  
+  # --- Fallback paths for single-run mode (when cross_validation.enabled is false) ---
+  # These are ignored during a cross-validation run but are required for backwards compatibility.
+  # We'll point them to fold 0 as a sensible default.
+  training_config: "configs/v2/dinogazev1_sam64_spatial.yaml"
+  checkpoint: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/final_best_val.pth"
+
+dataset:
+  name: "MIT1003" # The key for the dataset in the DATA_REGISTRY.
