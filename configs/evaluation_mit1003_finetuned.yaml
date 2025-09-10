@@ -1,0 +1,15 @@
+# configs/evaluation_mit1003_finetuned.yaml
+
+model:
+  training_config: "configs/v2/dinogazev1_sam64_spatial.yaml"
+  checkpoint: "experiments/mit_spatial_finetune/dinogaze_spade_v1_sam64_fold0/final_best_val.pth"
+  model_key: "dinogaze_spade_v1"
+
+dataset:
+  name: "MIT1003"
+
+settings:
+  batch_size: 1
+  num_workers: 6
+  device: "cuda:0"
+  mismatched_mask_seed: 123
