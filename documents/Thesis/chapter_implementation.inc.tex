@@ -12,9 +12,9 @@ This chapter provides the "how" that underpins the results presented in the subs
 Our research was conducted using a modern stack of open-source software and high-performance computing hardware, enabling rapid prototyping and large-scale, reproducible experiments.
 
 \subsection{Core Software Frameworks and Reproducibility}
-The entire codebase is built upon Python 3. The primary deep learning framework is **PyTorch**. A core challenge in modern computational science is ensuring that complex software environments are perfectly reproducible, not only over time but also across different hardware and operating systems. A minor difference in a library version can lead to subtle changes in numerical output, threatening the validity of results. This challenge was particularly acute for our project, which required deploying our training pipeline across multiple distinct high-performance computing clusters to accelerate experimentation.
+The entire codebase is built upon Python 3. The primary deep learning framework is \textbf{PyTorch} \cite{paszke2019pytorch}. A core challenge in modern computational science is ensuring that complex software environments are perfectly reproducible, not only over time but also across different hardware and operating systems. A minor difference in a library version can lead to subtle changes in numerical output, threatening the validity of results. This challenge was particularly acute for our project, which required deploying our training pipeline across multiple distinct high-performance computing clusters to accelerate experimentation.
 
-To solve this, we adopted **Pixi** as our environment and package manager. Unlike traditional approaches that may only specify top-level dependencies, Pixi creates a cryptographically secure "lock file" (`pixi.lock`) that captures the exact version of *every single package* in the environment, including all transitive dependencies, for each target platform (e.g., `linux-64`). This guarantees bit-for-bit reproducibility of the software stack.
+To solve this, we adopted \textbf{Pixi} as our environment and package manager. Unlike traditional approaches that may only specify top-level dependencies, Pixi creates a cryptographically secure "lock file" (`pixi.lock`) that captures the exact version of \textit{every single package} in the environment, including all transitive dependencies, for each target platform (e.g., `linux-64`). This guarantees bit-for-bit reproducibility of the software stack.
 
 Our entire environment is defined declaratively in a `pixi.toml` file. This file specifies:
 \begin{itemize}
@@ -41,29 +41,22 @@ The combination of these techniques was not an afterthought but a core part of o
 \subsection{Hardware and Computing Environment}
 All model training and evaluation was conducted across a heterogeneous set of high-performance computing resources, a necessity driven by the scale of our experiments and the realities of shared academic infrastructure.
 
-The primary workhorse for our large-scale, multi-day training runs was a SLURM-managed cluster node equipped with **four NVIDIA A100 (40GB) GPUs**. The large VRAM and high computational throughput of the A100s were essential for training our largest models, particularly DinoGaze-SPADE, using a sufficiently large batch size.
+The primary workhorse for our large-scale, multi-day training runs was a SLURM-managed cluster node equipped with \textbf{four NVIDIA A100 (40GB) GPUs}. The large VRAM and high computational throughput of the A100s were essential for training our largest models, particularly DinoGaze-SPADE, using a sufficiently large batch size.
 
 However, access to this primary resource was shared among multiple research groups and was not continuously available. To maintain momentum and accelerate the extensive prototyping, debugging, and ablation studies required by our research, we leveraged two additional, dedicated GPU servers:
 \begin{itemize}
-    \item A server with **four NVIDIA TITAN V GPUs**.
-    \item A workstation with **two NVIDIA GeForce RTX 3090 GPUs**.
+    \item A server with \textbf{four NVIDIA TITAN V GPUs}.
+    \item A workstation with \textbf{two NVIDIA GeForce RTX 3090 GPUs}.
 \end{itemize}
 
-The ability to seamlessly transition our experiments between these three distinct hardware environments was a critical component of our workflow. This was made possible by our rigorous approach to reproducibility. By using **Pixi** to create identical software environments and by fixing all sources of randomness (including Python, NumPy, and PyTorch random seeds for each DDP process), we could guarantee that a training run initiated on one machine could be reliably continued or replicated on another.
+The ability to seamlessly transition our experiments between these three distinct hardware environments was a critical component of our workflow. This was made possible by our rigorous approach to reproducibility. By using Pixi to create identical software environments and by fixing all sources of randomness (including Python, NumPy, and PyTorch random seeds for each DDP process), we could guarantee that a training run initiated on one machine could be reliably continued or replicated on another.
 
 This distributed, multi-cluster approach allowed us to parallelize our research efforts effectively. In total, the computational cost for training, fine-tuning, and evaluating the entire family of models presented in this thesis amounted to several thousand GPU-hours. This significant investment of computational resources underscores the complexity of the models and the thoroughness of the empirical validation performed.
 
 
 
 
-
-
-
-
-
-
-
-\section{Modular Codebase Design: A Framework for Rapid Experimentation}
+\section[Modular Experimentation Framework]{Modular Codebase Design: A Framework for Rapid Experimentation}
 \label{sec:impl_modular_design}
 
 The scientific narrative of this thesis is one of iterative model development, where each new architecture is a direct response to the results of its predecessor. To support this rapid cycle of hypothesis, implementation, and evaluation, we designed our codebase not as a monolithic script, but as a flexible and extensible framework. The core design philosophy was to enforce a strict \textbf{separation of concerns}, ensuring that the logic for defining models, handling data, and executing the training process were fully decoupled. This modularity was the key to efficiently exploring the vast design space of our research questions.
@@ -166,69 +159,130 @@ This principled structure makes the codebase easy to navigate, maintain, and, mo
 
 
 
-
-
-
-
 \section{Data Preparation and Pipeline}
 \label{sec:impl_data_pipeline}
-Robust and efficient data handling is critical, especially when working with large datasets and iterative training schedules. Our pipeline is designed to minimize I/O bottlenecks and transform raw datasets into tensors ready for GPU-accelerated training.
-
-\subsection{Initial Data Conversion and LMDB Caching}
-The raw MIT1003 and SALICON datasets are first processed into a standardized, cached format. For image data, this involves more than simple resizing. To achieve maximum I/O performance and avoid being bottlenecked by reading thousands of small image files from disk, we serialize the entire image dataset into a Lightning Memory-Mapped Database (LMDB). LMDB is a high-performance key-value store that allows for extremely fast, concurrent data reads with minimal memory overhead. This one-time conversion process creates a single large database file, which the PyTorch DataLoader can then access far more efficiently than the underlying filesystem, significantly accelerating the start-up and iteration time of our training runs. The human fixation data is separately serialized using pickle for efficient loading.
-
-\subsection{PyTorch Dataset Classes}
-We implement several torch.utils.data.Dataset classes to serve the specific needs of our models:
+Robust and efficient data handling is critical, especially when working with large datasets, variable image sizes, and iterative training schedules. A naive data pipeline that reads individual files from disk on-the-fly would create a severe I/O bottleneck, leaving expensive GPU resources idle. Our pipeline was therefore designed from the ground up to minimize these bottlenecks and transform raw datasets into a stream of tensors ready for GPU-accelerated training. This process involves several layers of optimization, from initial data serialization to sophisticated batch sampling strategies.
+\subsection{Offline Preprocessing: Caching for Performance}
+\label{sec:impl_caching}
+The raw MIT1003 and SALICON datasets consist of tens of thousands of individual image and data files. To avoid the immense overhead of repeatedly parsing these files, our framework relies on a one-time, offline preprocessing step that converts the datasets into highly optimized, cached formats. This conversion is handled by our dataset builder functions and is DDP-aware: the master process is responsible for creating the cache, while all other processes wait for its completion, ensuring data consistency.
 \begin{itemize}
-\item \textbf{ImageDataset / FixationDataset:} Base classes for spatial and scanpath prediction, respectively. They handle loading images, fixation maps, and computing the center-bias baseline.
-\item \textbf{...WithSegmentation Variants:} These subclasses extend the base datasets by additionally loading the corresponding pre-generated unsupervised segmentation mask for each image, making it available to the model during the forward pass.
+\item \textbf{Image and Center-Bias Caching with LMDB:} To achieve maximum I/O performance for image data, we serialize the entire collection of images and their corresponding pre-computed center-bias maps into a Lightning Memory-Mapped Database (LMDB). LMDB is a high-performance, transactional key-value store that allows for extremely fast, concurrent data reads with minimal memory overhead. By consolidating thousands of small files into a single, large database file, our PyTorch DataLoader can access the data far more efficiently than by interacting with the underlying filesystem, significantly accelerating the start-up and iteration time of our training runs.
+\item \textbf{Fixation and Scanpath Data Serialization:} The structured scanpath data, which is smaller and has a more complex relational structure, is separately serialized using pickle. This creates compact cache files (e.g., stimuli.pkl, scanpaths.pkl) that contain the pysaliency objects, which can be loaded into memory quickly at the start of a run.
 \end{itemize}
-\subsection{Custom Sampling for Training}
-For the training phase, especially on the MIT1003 dataset, we use a custom ImageDatasetSampler. Unlike a standard sampler that shuffles individual fixations, our sampler ensures that during each epoch, the model sees batches constructed from every image in the training set exactly once. This is a common practice in saliency research to ensure stable training and unbiased evaluation of image-level performance.
-\subsection{Distributed Data Parallel (DDP) Sampling}
-For multi-GPU training, the DistributedSampler is used to ensure each GPU receives a unique, non-overlapping shard of the data. For validation, this can introduce minor variance, as metrics are computed on a subset of the validation data on each GPU before being aggregated.
-
-
-
+\subsection{PyTorch Dataset Abstractions}
+\label{sec:impl_dataset_classes}
+At the core of the data pipeline are several torch.utils.data.Dataset classes, designed to abstract away the details of data retrieval and serve the specific needs of our different models.
+\begin{itemize}
+\item \textbf{Base Classes (ImageDataset and FixationDataset):} These serve as the foundation for spatial and scanpath prediction, respectively. The ImageDataset is responsible for retrieving a sample by index, which consists of an image, its pre-computed center-bias map, and the aggregated fixation map for all observers. The FixationDataset extends this by retrieving individual fixations along with their corresponding scanpath history (e.g., the coordinates of the previous four fixations). Both classes are designed to read directly from the optimized LMDB and pickle caches.
+\item \textbf{Segmentation-Aware Subclasses:} To facilitate our experiments with SPADE, we implemented `ImageDatasetWithSegmentation` and `FixationDatasetWithSegmentation`. These classes inherit all the functionality of their parents and add one critical step: they additionally load the corresponding pre-generated unsupervised segmentation mask for the requested image. To make this mask loading efficient, these classes are designed to read from our pre-compiled "mask banks"---large, memory-mapped files that consolidate thousands of individual mask files, using a header/payload system to handle the variable image sizes of the MIT1003 dataset. This ensures that adding segmentation information introduces minimal I/O overhead.
+\end{itemize}
+\subsection{Batch Sampling Strategies for Training and Evaluation}
+\label{sec:impl_sampling}
+The strategy for selecting and grouping data into batches is crucial for both training efficiency and correctness, especially in a distributed setting with variable-sized images.
+\paragraph{Custom Shape-Aware Sampling for Training.}
+A standard PyTorch RandomSampler is suboptimal for our needs, as it would create batches containing images of different sizes. This would require collating batches with significant padding, wasting GPU memory and computation. To solve this, we implemented a custom ImageDatasetSampler. This sampler first groups all indices in the dataset by their corresponding image shape. It then creates batches by sampling exclusively from within these shape-uniform groups. This strategy minimizes padding and maximizes GPU utilization. Furthermore, it is designed to ensure that during each epoch, the model sees batches constructed from every image in the training set exactly once, a common practice in saliency research to ensure stable training.
+\paragraph{Distributed Data Parallel (DDP) Sampling.}
+For multi-GPU training, simply wrapping the ImageDatasetSampler is insufficient. The standard DistributedSampler is required to ensure each GPU process receives a unique, non-overlapping shard of the data. However, this conflicts with the goal of shape-aware batching.
+We address this with a sophisticated two-level sampling strategy. First, the standard DistributedSampler is used to partition the full dataset and assign a unique subset of indices to each GPU rank. Then, our ImageDatasetSampler is instantiated on each GPU process independently, operating only on its assigned subset of data. This ensures both correct data sharding across GPUs and efficient, shape-aware batching within each individual GPU process.
 
 
 \section{Unsupervised Mask Generation Pipeline}
 \label{sec:impl_mask_generation}
-The generation of the segmentation masks used for SPADE is a critical offline preprocessing step. We implemented two separate, automated pipelines.
+
+The segmentation masks that serve as the conditional input for our SPADE-based models are a critical asset. As this thesis focuses on the \textit{use} of segmentation information rather than its generation, these masks were created in a large-scale, offline preprocessing step. We implemented two distinct, fully automated pipelines to generate these masks, each leveraging a different state-of-the-art unsupervised approach. Both pipelines were designed to be scalable and were executed on our multi-GPU cluster to process the tens of thousands of images across our datasets.
+
 \subsection{DINOv2 + k-means Pipeline}
-As implemented in scripts/generate\_masks\_Dinov2.py, this pipeline automates the following steps for each image:
+Our first pipeline generates segmentations that are intrinsically aligned with the feature space of our primary model. The process is conceptually a form of deep feature clustering:
+
 \begin{enumerate}
-\item Extracts deep feature vectors for each 14x14 patch using our DinoV2Backbone module.
-\item Flattens the patch features and applies sklearn.cluster.KMeans to assign a cluster ID (0 to k-1) to each patch.
-\item Reconstructs the low-resolution patch-label map and uses nearest-neighbor upsampling to create the final, full-resolution integer mask.
+    \item \textbf{Deep Feature Extraction:} For each input image, we perform a single forward pass through our frozen DINOv2 (ViT-L/14) backbone. We extract the patch tokens from the final transformer block, yielding a feature map of shape $(H_p, W_p, C)$, where $(H_p, W_p)$ are the number of 14x14 patches and $C$ is the feature dimension (1024).
+    \item \textbf{Feature Clustering:} The spatial feature map is flattened into a list of $N_p = H_p \times W_p$ patch vectors. We then apply the K-means algorithm to partition these vectors into a predefined number of clusters ($k=16$). Each patch is thus assigned a single integer cluster ID from 0 to $k-1$.
+    \item \textbf{Mask Reconstruction:} The resulting 1D array of patch labels is reshaped back into a low-resolution map of $(H_p, W_p)$. This map is then upsampled to the original image's full resolution using nearest-neighbor interpolation to create the final, crisp integer segmentation mask.
 \end{enumerate}
+The key advantage of this method is its self-consistency: the boundaries of the generated segments are, by definition, determined by the semantic similarities learned by the same DINOv2 model that will later use these masks for guidance.
+
 \subsection{Segment Anything Model (SAM) Pipeline}
-The SAM pipeline, implemented in scripts/generate\_masks\_SAM.py, is more complex due to the nature of SAM's output:
+Our second pipeline leverages the Segment Anything Model (SAM), a powerful, prompt-less foundation model for segmentation \cite{kirillov2023segment}. The SAM pipeline is more complex due to the exhaustive nature of SAM's output and required the development of a custom post-processing strategy to distill its results into a usable format.
+
 \begin{enumerate}
-\item The SamAutomaticMaskGenerator is run on each image, producing a list of hundreds of candidate binary masks.
-\item Our custom post-processing function filters these candidates based on a minimum area threshold.
-\item A form of Non-Maximum Suppression is applied, where masks with a high Intersection-over-Union (IoU) with an already-selected, higher-scoring mask are discarded to reduce redundancy.
-\item The top k remaining masks (e.g., 64) are selected and "painted" onto a blank integer map, each with a unique ID, to form the final segmentation mask.
+    \item \textbf{Exhaustive Mask Generation:} We use the `SamAutomaticMaskGenerator` on each image. This component exhaustively blankets the image with a grid of point prompts, generating a list of all potential objects and parts it can identify. This typically results in a list of several hundred candidate binary masks per image, many of which are redundant or overlapping.
+    \item \textbf{Filtering and Non-Maximum Suppression (NMS):} Our custom post-processing function first filters out very small, noisy masks based on a minimum pixel area threshold. The remaining candidates, sorted by their predicted quality score, are then subjected to a form of NMS. We iteratively process the list, and for each candidate mask, we discard any subsequent masks in the list that have a high Intersection-over-Union (IoU) with it (threshold set to 0.8). This step is crucial for eliminating highly redundant, near-identical masks (e.g., slightly different versions of the same car).
+    \item \textbf{Final Mask Assembly:} From the diverse set of masks that survive the NMS process, we select the top $k$ (e.g., 64) based on their quality score. These selected binary masks are then "painted" onto a blank integer map, each with a unique ID from 1 to $k$, to form the final, non-overlapping segmentation mask. The background is assigned the label 0.
 \end{enumerate}
+This pipeline capitalizes on the powerful, general-purpose segmentation capabilities of a large foundation model, providing an external and complementary source of structural information to our DINOv2-based system.
+
 \subsection{Mask Banking for Efficient Loading}
-To avoid the significant I/O bottleneck of loading thousands of individual mask files during training, we pre-process the generated masks into large, memory-mapped "bank" files. For datasets with variable image sizes like MIT1003, we use a header/payload system: a .npy header file stores the shape and byte offset for each mask, and a single .bin payload file contains the concatenated raw byte data. This allows for extremely fast, direct memory access to any mask without reading the entire file.
+Loading tens of thousands of individual image mask files during training would create a prohibitive I/O bottleneck. To solve this, we pre-processed the generated masks into large, memory-mapped "bank" files. This strategy allows for near-instantaneous, random access to any mask without the overhead of individual file operations. Given the variable image sizes in the MIT1003 dataset, we implemented a robust header/payload system:
+\begin{itemize}
+    \item A single `.bin` \textbf{payload file} contains the raw, concatenated byte data of all masks.
+    \item A corresponding `.npy` \textbf{header file} acts as an index, storing a small array where each row contains the shape (height, width) and byte offset for a specific mask within the payload file.
+\end{itemize}
+During training, the `Dataset` class memory-maps both files. To retrieve a mask, it simply reads the header to find the correct offset and shape, then performs a single, direct memory read from the payload file. This design was essential for achieving the high-throughput data loading required for efficient GPU utilization.
+
+
+
+
 \section{Training and Evaluation Orchestration}
 \label{sec:impl_orchestration}
-The complexity of our multi-stage, multi-fold experimental design necessitates a robust automation framework to ensure consistency and reproducibility.
-\subsection{The Experiment Orchestrator (orchestrator.py)}
-We developed a master script that drives the entire experimental pipeline. It reads a master pipeline.yaml file that defines the sequence of training stages to be executed. For each stage, the orchestrator:
+
+The complexity of our experimental design—involving multiple model architectures, a three-phase training protocol, and a 10-fold cross-validation scheme—made manual execution infeasible and prone to error. To address this, we developed a robust, automated framework to manage the entire experimental lifecycle, ensuring consistency, resilience to hardware failures, and complete reproducibility.
+
+\subsection{The Experiment Orchestrator (`orchestrator.py`)}
+The entire research program is driven by a single master script, `orchestrator.py`. This script acts as a high-level conductor, transforming a declarative definition of the entire experimental pipeline into a sequence of executable training jobs.
+
+\paragraph{Declarative Pipeline Definition.} The orchestrator is controlled by a master `pipeline.yaml` file, which defines the complete sequence of training stages. Each entry in this sequence specifies the type of stage (e.g., a single run or a cross-validation loop), the path to its specific configuration file, and its dependencies on previous stages. This declarative approach allows the entire experimental design to be version-controlled and easily modified.
+
+\paragraph{Automated Stage Management.} For each stage defined in the master pipeline, the orchestrator performs several critical tasks:
 \begin{enumerate}
-\item Parses the stage-specific configuration file (e.g., salicon\_pretrain.yaml).
-\item Applies any necessary dynamic overrides, such as the current cross-validation fold number.
-\item Critically, it identifies the best checkpoint path from a completed prerequisite stage and injects it as the resume\_ckpt argument for the current stage. This automates the "Load-then-Freeze" transfer learning logic.
-\item Invokes the main training script using torchrun for DDP or standard python for single-GPU runs.
+    \item \textbf{Configuration Parsing:} It parses the stage-specific configuration file (e.g., `dinogazev1\_sam1\_salicon\_pretrain.yaml` \cref{lst:yaml_example}) which contains all hyperparameters, model keys, and dataset keys for that run.
+    \item \textbf{Dynamic Overrides:} For cross-validation loops, it dynamically injects the current fold number into the configuration. This allows a single template config file to be used for all 10 folds.
+    \item \textbf{Dependency Management and Checkpoint Chaining:} The orchestrator's most crucial function is automating the "Load-then-Freeze" transfer learning logic. It identifies the best-performing checkpoint from a completed prerequisite stage (e.g., the `final\_best\_val.pth` from the SALICON pre-training) and automatically injects its path as the `resume\_ckpt` argument for the subsequent fine-tuning stage. This ensures a seamless and correct flow of weights between training phases.
+    \item \textbf{Execution Invocation:} Finally, it constructs and executes the correct command-line call, invoking the main training script using `torchrun` for DDP or standard `python` for single-GPU runs.
 \end{enumerate}
-\subsection{The Core Training Loop (`src/train.py` and `src/training.py`)}
-The main entry point, `train.py`, is a lightweight wrapper that parses the configuration and uses the registries to build the specified model and dataset. It then hands off control to the generic training loop in `training.py`. This core loop manages the entire training lifecycle and incorporates modern best practices for performance and stability:
+This orchestration system transforms a complex, multi-day workflow into a single, fire-and-forget command, which was essential for managing the hundreds of individual training runs required for this thesis.
+
+\subsection{The Core Training Loop}
+The main entry point for any single training job, `train.py`, is a lightweight wrapper that uses the registry pattern to build the specified model and dataset from the configuration. It then delegates control to the generic, battle-tested training loop in `src/training.py`. This core loop manages the entire training lifecycle and incorporates modern best practices for performance, stability, and resilience.
+
 \begin{itemize}
-    \item \textbf{Automatic Mixed Precision (AMP):} To accelerate training and reduce GPU memory consumption without sacrificing numerical precision, our training loop leverages PyTorch's built-in AMP capabilities via `torch.cuda.amp.autocast` and `GradScaler`. This allows the model to perform many operations, such as convolutions, in the faster half-precision (FP16) format, while maintaining critical operations like loss calculations in full precision (FP32).
-    \item **Gradient Accumulation:** To effectively train with large batch sizes that may not fit into the memory of a single GPU, the loop implements gradient accumulation. It performs several forward and backward passes on smaller "micro-batches" and accumulates their gradients before performing a single optimizer step, effectively simulating a much larger batch size.
-    \item **Epoch and Validation Cycles:** The loop manages the per-epoch iteration over the training data and triggers periodic evaluation on the validation set.
-    \item **Checkpointing and Logging:** It handles the saving of model, optimizer, and scheduler states at regular intervals and logs all relevant metrics to both the console and a TensorBoard instance for real-time monitoring.
-    \item **Early Stopping:** The loop includes an early stopping mechanism based on validation performance to prevent overfitting and terminate training efficiently once a model ceases to improve.
+    \item \textbf{Automatic Mixed Precision (AMP):} As stated previously, our training loop leverages PyTorch's built-in AMP capabilities via `torch.cuda.amp.autocast` and `GradScaler` to accelerate training and reduce GPU memory consumption without sacrificing numerical precision.
+
+    \item \textbf{Gradient Accumulation:} To ensure stable training and fair comparisons across different hardware, we needed to maintain a consistent effective batch size. However, the varying memory capacities of our GPU environments (A100s, TITAN Vs, RTX 3090s) or number of GPUs in each cluster meant that batch size is not fixed. We solved this by implementing gradient accumulation. The loop performs several forward and backward passes on smaller "micro-batches" and accumulates their gradients before performing a single optimizer step. For example, to simulate an effective batch size of 32, a system with 4 A100s might run with a per-GPU batch size of 8 and 1 accumulation step, while a system with 2 GPUs and less VRAM might use a batch size of 4 and 4 accumulation steps. This technique is known to be an effective strategy for simulating large batch sizes and stabilizing training for large models \cite{NIPS2012_c399862d}.
+
+    \item \textbf{Resilient Checkpointing:} Long training runs are susceptible to interruptions, such as cluster preemption or hardware failures. Our checkpointing strategy is designed for maximum resilience and automation. The logic, implemented within the `train\_stage` function of `train.py`, follows a clear priority order when a job starts, as illustrated as pseudocode in \cref{lst:checkpoint_logic}.
+    
+    \begin{lstlisting}[language=python,
+    caption={Pseudocode for the checkpoint resumption logic, illustrating the priority system for transfer learning versus recovering from an interruption.},
+    label={lst:checkpoint_logic},
+    float=tp]
+# Checkpoint logic inside train_stage()
+def determine_starting_checkpoint(stage_config, stage_output_dir):
+    # Priority 1: Check for a local checkpoint in the current stage's output directory
+    local_checkpoints = sorted(stage_output_dir.glob('step-*.pth'))
+    if local_checkpoints:
+        print(f"Resuming interrupted run from: {local_checkpoints[-1]}")
+        return local_checkpoints[-1] # Resume the local run
+
+    # Priority 2: If no local checkpoint, check for an external 'resume_ckpt'
+    # This is used for transfer learning between stages (e.g., fine-tuning)
+    elif stage_config.resume_ckpt:
+        print(f"Starting new fine-tuning stage from: {stage_config.resume_ckpt}")
+        return stage_config.resume_ckpt # Start a new stage from a previous one
+    
+    # Priority 3: No checkpoints found, start from scratch
+    else:
+        print("No checkpoints found. Starting training from random initialization.")
+        return None
+    \end{lstlisting}
+    
+    This ensures that an interrupted run will always pick up from where it left off, while a new fine-tuning stage will correctly load the weights from its designated prerequisite, as managed by the orchestrator.
+
+    \item \textbf{Comprehensive Logging:} All relevant metrics (training loss, validation scores, learning rate) are logged to both the console and a `pandas` DataFrame, which is saved as a CSV file after each epoch. This provides a detailed, parsable record of the training history. Additionally, all metrics are logged to a \textbf{TensorBoard} instance for real-time \cite{tensorflow2015-whitepaper}, interactive monitoring of training progress and model behavior.
+
+    \item \textbf{Dual-Condition Early Stopping:} To prevent overfitting and use computational resources efficiently, our training loop employs a dual-condition stopping strategy. Training continues until either of two conditions is met:
+    \begin{enumerate}
+        \item The learning rate, managed by a `MultiStepLR` scheduler, decays below a predefined minimum threshold (e.g., `1e-7`), indicating that the model has reached a plateau in the optimization landscape.
+        \item The primary validation metric (typically Log-Likelihood) fails to improve for a specified number of epochs, defined by the `early\_stopping\_patience` parameter.
+    \end{enumerate}
+    Upon termination, the script automatically identifies and saves the checkpoint corresponding to the best validation performance achieved during the entire run, ensuring that our final model represents the optimal state of convergence.
 \end{itemize}

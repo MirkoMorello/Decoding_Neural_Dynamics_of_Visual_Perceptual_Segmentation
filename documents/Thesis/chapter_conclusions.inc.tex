@@ -1,40 +1,46 @@
 %-------------------------------------------------------------------
-\chapter{Conclusions}
+\chapter{Discussion}
 \label{c:conc}
 %-------------------------------------------------------------------
 
 \epigraph{\enquote{Computer Science is no more about computers than astronomy is about telescopes.}}{\emph{E. W. Dijkstra}}
 
-This thesis embarked on an investigation into the fundamental relationship between visual scene segmentation and human gaze. Grounded in the theory that segmentation is an information-rich process that actively guides visual exploration, we sought to develop a new generation of computational gaze prediction models that explicitly leverage this information. This chapter summarizes the journey, synthesizes our principal findings, and outlines potential avenues for future work.
 
-\section{Summary of Contributions}
+This thesis set out to investigate a central hypothesis: that the accuracy of computational models of human gaze can be significantly improved by moving beyond a purely feature-based understanding of scenes to one that explicitly incorporates their structural composition. Through an iterative process of model development and rigorous empirical evaluation, we have presented a body of work that provides strong evidence in support of this claim. This chapter contextualizes our principal findings within the broader literature, discusses their implications, acknowledges the limitations of our approach, and outlines promising avenues for future research.
 
-We began by challenging the implicit nature of semantic understanding in existing state-of-the-art saliency models. While powerful, these models often treat the feature extractor as a black box. Our central contribution is a novel method for directly and efficiently injecting explicit segmentation information into a model's processing stream.
+\section{Summary of Contributions and Principal Findings}
+\label{sec:discussion_summary}
 
-Through a series of carefully designed experiments, we progressed from an initial, successful but ambiguous, ViT-based model to our final \textbf{DinoGaze-SPADE} architecture. The key innovation was the development of a \enquote{semantic painting} technique, which creates a dynamic, feature-rich representation of a scene's segmentation map. This map, when used to modulate the network's activations via Spatially-Adaptive Normalization (SPADE), allowed us to isolate and confirm the significant contribution of segmentation information to gaze prediction, independent of general improvements in feature extraction.
-
-\section{Principal Findings}
-
-The empirical results presented in \cref{c:results} lead to three principal findings:
+The core contribution of this thesis is the development and validation of \textbf{DinoGaze-SPADE}, a novel, state-of-the-art probabilistic architecture for scanpath prediction. Our research narrative unfolded through a series of controlled experiments, each yielding a key finding:
 
 \begin{enumerate}
-    \item \textbf{Vision Transformers provide a superior backbone for saliency modeling.} Our initial experiments showed that simply replacing the CNN backbone of a model like DeepGazeIII with a DINOv2 Vision Transformer yields a significant performance improvement. This establishes a new, stronger baseline for the field.
-    
-    \item \textbf{Dynamic SPADE is an effective mechanism for information injection.} Our core finding is that the direct injection of segmentation information via our dynamic SPADE mechanism provides a substantial performance boost on top of the already strong ViT backbone. This was validated through a series of ablation studies that ruled out alternative explanations, such as increased model complexity or the use of trivial embeddings. This result provides strong evidence for our central hypothesis: that explicit segmentation information can be exploited for more accurate gaze prediction.
-    
-    \item \textbf{The proposed architecture generalizes across tasks.} The performance benefits of the DinoGaze-SPADE model were not confined to static image saliency. The model also achieved state-of-the-art results on the more complex task of sequential scanpath prediction, demonstrating the fundamental and robust nature of our approach.
+    \item \textbf{A Superior Foundational Representation:} We first demonstrated that simply replacing the CNN backbone of the previous state-of-the-art model, `DeepGaze III`, with a DINOv2 Vision Transformer (`DinoGaze`) results in a substantial performance increase. This establishes that the global, context-aware features learned through self-supervision provide a more powerful and structurally-informed foundation for gaze prediction than the local, hierarchical features of classification-trained CNNs.
+
+    \item \textbf{A Novel Mechanism for Information Injection:} We introduced \textbf{"semantic painting,"} a new technique that solves the critical "semantic incoherence" problem, allowing for the effective injection of unsupervised segmentation masks into a network's processing stream via Spatially-Adaptive Normalization (SPADE).
+
+    \item \textbf{Validation of Explicit Segmentation Guidance:} We provided conclusive empirical evidence that this explicit structural guidance improves predictive performance. Our hybrid model (`DG-SPADE v3`) showed that a superior semantic "vocabulary" from DINOv2 could boost a weaker DenseNet backbone. Our final `DinoGaze-SPADE` model demonstrated that these architectural innovations generalize robustly to the challenging, sequential task of scanpath prediction, setting a new state of the art on the MIT1003 benchmark.
 \end{enumerate}
 
-\section{Future Work}
+\section{Relation to the State of the Art and Broader Implications}
+\label{sec:discussion_literature}
 
-This work opens up several exciting avenues for future research.
+Our work both builds upon and extends several key threads in the literature on visual attention modeling.
 
-\paragraph{Refining Segmentation Information.} Our model relies on segmentation maps generated by unsupervised methods. A promising direction would be to investigate the use of human-annotated segmentation data. Furthermore, the theoretical work that inspired this thesis deals with \emph{uncertainty} in segmentation. Future models could be designed to accept and utilize probabilistic segmentation maps, potentially leading to an even more nuanced and human-like understanding of a scene.
+\paragraph{An Extension of the DeepGaze Paradigm.} Our research can be seen as a direct extension of the probabilistic scanpath modeling paradigm established by `DeepGaze III` \cite{kummerer2022deepgaze}. While we retain its core probabilistic framework and modular structure (separating spatial and scanpath processing), our work addresses its primary limitation: the reliance on an implicit, feature-based representation of scene content. By introducing the ViT backbone and the SPADE mechanism, we have shown that making the model's understanding of scene structure more explicit leads to more accurate predictions of human attentional deployment.
 
-\paragraph{Exploring Other Top-Down Modalities.} The dynamic SPADE mechanism is a general tool for information injection. It could be adapted to modulate the network based on other forms of top-down information, such as task-specific instructions (e.g., \enquote{search for the car}) or high-level object labels, moving towards more comprehensive models of goal-directed attention.
+\paragraph{Bridging the Gap with Classic Saliency and Object-Based Attention.} Our findings also resonate with a long-standing dialogue in vision science that dates back to the earliest saliency models. The classic, bottom-up models of Itti, Koch, and Niebur were based on low-level feature contrast \cite{itti1998}, a purely space-based view of attention. Subsequent research has increasingly pointed to the importance of "proto-objects" and object-level units in guiding attention \cite{10.1371/journal.pcbi.1011512}. Our work provides a modern, deep learning-based validation of this object-centric view. By demonstrating that an explicit segmentation signal—an operational definition of "objects"—improves prediction, we provide strong computational evidence that the parsing of a scene into coherent units is a fundamental component of attentional guidance, not merely an epiphenomenon of feature saliency.
 
-\paragraph{Connecting to Neuroscience.} Our model offers a computationally explicit framework for how high-level semantic information (segmentation) can modulate visual processing. This framework could be used to generate testable hypotheses about the neural correlates of this process. Neuroimaging or electrophysiology studies could investigate whether brain activity in visual areas is modulated by segmentation in a way that is consistent with the SPADE mechanism.
+\paragraph{A Framework for Testing Theories of Perception.} Perhaps the most significant implication of our work is methodological. The `DinoGaze-SPADE` architecture is more than just a high-performing model; it is a flexible scientific tool. It provides a concrete framework for quantitatively testing theories about the relationship between perception and action. As highlighted by the foundational work of Vacher et al. (2023), it is now possible to measure an individual's subjective perceptual segmentation of a scene \cite{vacher2023measuring}. Our model provides the means to directly inject these personalized perceptual maps and measure their impact on gaze prediction, opening the door to a new generation of individualized models of visual attention.
 
-\paragraph{Model Distillation and Application.} While our final model is efficient, the DINOv2 backbone is still large. For real-world applications, such as in human-computer interaction, user experience design, or automotive safety systems, future work could focus on distilling the knowledge of the DinoGaze-SPADE model into a smaller, faster architecture that can be deployed on edge devices.
+\section{Limitations and Future Directions}
+\label{sec:discussion_future}
 
-In conclusion, this thesis has presented a novel and powerful architecture for gaze prediction. More importantly, it has provided strong empirical support for the theory that the segmentation of the visual world is not a separate, subsequent process, but is fundamentally intertwined with the dynamics of how and where we look.
+Despite its successes, our work has several limitations that point toward exciting avenues for future research.
+
+\paragraph{The Nature of Unsupervised Segmentation.} Our current approach relies on generic, unsupervised segmentation masks. While effective, these masks are not a perfect proxy for human perception and may contain artifacts or boundaries that are not meaningful to a human observer. The promising results from our collaborators (Brusco et al., 2025) suggest that the greatest gains are yet to be realized. The next logical and most exciting step is to replace our generic masks with the \textbf{Perceptual Segmentation Maps (PSMs)} measured from individual human observers using the Vacher et al. paradigm. This will allow us to move from population-level to truly \textbf{personalized gaze prediction}, testing the powerful hypothesis that knowing \textit{how a specific person sees the world} allows us to better predict \textit{where that specific person will look}.
+
+\paragraph{Beyond Static Images.} Our current models, like most in the field, operate on static images. Real-world vision is a dynamic process of interacting with a constantly changing environment. Extending the `DinoGaze-SPADE` architecture to video, where segmentation must be consistent across time (object tracking), is a non-trivial but crucial next step.
+
+\paragraph{Exploring Deeper Architectural Integration.} While SPADE is a powerful mechanism, it primarily modulates the saliency network. The scanpath and fixation selection networks remain standard modules. Future work could explore more deeply integrated architectures, such as using cross-attention mechanisms to allow the scanpath history to directly query the semantically segmented feature maps, potentially enabling the model to learn even more complex, context-dependent viewing strategies.
+
+In conclusion, this thesis has demonstrated the significant and quantifiable benefit of integrating explicit structural information into models of human gaze. By developing a new state-of-the-art architecture, we have not only advanced the predictive power of these models but have also provided a powerful new framework for the scientific investigation of the intricate link between visual perception and attention.

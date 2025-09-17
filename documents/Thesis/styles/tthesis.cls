@@ -13,6 +13,7 @@
 
 \usepackage{lmodern} % Latin Modern font
 \usepackage[T1]{fontenc}
+\usepackage{changepage}
 
 \usepackage{csquotes}
 
@@ -26,7 +27,7 @@
 	\makeindex
 \usepackage[binding=0.8cm]{styles/layaureo} % better handling of A4 format
 \usepackage{tocbibind} 
-\usepackage[labelfont=bf]{caption}[2004/07/16] % format of captions
+\usepackage[labelfont=bf,font=small]{caption}[2004/07/16] % format of captions
 \usepackage{subfig}
 
 % tables

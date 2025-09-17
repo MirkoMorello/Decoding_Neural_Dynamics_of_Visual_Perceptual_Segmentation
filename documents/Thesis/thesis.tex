@@ -3,7 +3,7 @@
 
 \newcommand{\dspic}{dsPIC$^{\text{\textregistered}}$ DSC}
 \newcommand{\dcbus}{DC-BUS\texttrademark }
-
+\usepackage{pdfpages}
 % change the reference to the desired frontpage
 \renewcommand{\frontpagefile}{frontpages/frontpage-ai4st.inc}
 
@@ -27,12 +27,15 @@ Dr. Ruben Coen-Cagli \\
 %-------------------------------------------------------------------
 
 % All "variable" data in the frontpage are set using the above commands.
-\printfrontpage
-
+%\printfrontpage
+\includepdf{titlepage/titlepage.pdf}
+\cleardoublepage
 %-------------------------------------------------------------------
 % Abstract
 %-------------------------------------------------------------------
-
+\frontmatter
+\pagenumbering{roman}
+\setcounter{page}{1}
 \input{abstract.inc}
 
 \chapter*{\mbox{}}
@@ -56,7 +59,7 @@ George Box
 % Acknowledgments
 %-------------------------------------------------------------------
 
-\input{acknowledgments.inc} j
+\input{acknowledgments.inc}
 
 %-------------------------------------------------------------------
 % Indexes
@@ -66,13 +69,15 @@ George Box
 \listoffigures
 \listoftables
 
-\mainmatter
+
 
 \input{chapter_acronyms.inc}
+\mainmatter
+
 \input{chapter_intro.inc}
 \input{chapter_sota.inc}
 \input{chapter_methodology.inc}
-\input{chapter_tools.inc}
+%\input{chapter_tools.inc}
 \input{chapter_implementation.inc}
 \input{chapter_results.inc}
 \input{chapter_conclusions.inc}

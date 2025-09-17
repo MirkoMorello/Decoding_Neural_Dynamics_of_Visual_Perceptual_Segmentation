@@ -1,0 +1,2 @@
+$lualatex = 'lualatex -shell-escape -file-line-error';
+$pdf_mode = 4;

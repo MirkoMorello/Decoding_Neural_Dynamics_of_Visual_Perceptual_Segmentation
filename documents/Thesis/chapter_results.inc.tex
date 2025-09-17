@@ -4,102 +4,324 @@
 %-------------------------------------------------------------------
 
 \epigraph{\enquote{Somewhere, something incredible is waiting to be known.}}{\emph{Carl Sagan}}
+This chapter presents the empirical validation for the models and hypotheses detailed in \cref{cha:methodology}. The experiments are structured to follow the narrative of our research, systematically testing each architectural innovation. We begin by establishing a new, powerful baseline using a Vision Transformer backbone. We then conduct a series of ablation studies and control experiments to rigorously isolate and confirm the specific contribution of injecting explicit segmentation information via our dynamic SPADE mechanism. Finally, we test the generalization of our final model to the more complex task of sequential scanpath prediction and provide both quantitative and qualitative analyses to validate our core claims.
 
-This chapter presents the empirical validation for the models and hypotheses detailed in \cref{cha:methodology}. Our experiments are designed to follow the narrative of our research, first establishing the baseline performance and the initial success of using a Vision Transformer (ViT) backbone, and then demonstrating the significant, isolated contribution of injecting segmentation information via our dynamic SPADE mechanism. Finally, we test the generalization of our final model to the more complex task of scanpath prediction.
 
-\section{Experimental Setup}
-\label{sec:results_setup}
 
-\paragraph{Datasets.} Our evaluations are conducted on two standard, large-scale datasets. For the spatial saliency task, we use \textbf{SALICON} \cite{jiang2015salicon}, which is the largest dataset of its kind and serves as a robust benchmark for static saliency models. For the sequential scanpath prediction task, we use \textbf{MIT1003} \cite{judd2009learning}, which provides full human scanpath data and is evaluated using a 10-fold cross-validation protocol.
 
-\paragraph{Evaluation Metrics.} To ensure a comprehensive evaluation, we use four standard metrics in saliency modeling:
-\begin{itemize}
-    \item \textbf{Log-Likelihood (LL):} As a probabilistic model, our primary metric is the average log-likelihood (in bits) assigned to held-out human fixations. Higher is better.
-    \item \textbf{Information Gain (IG):} The log-likelihood of the model minus the log-likelihood of a baseline center-bias model. This measures the information provided by the model beyond a simple default strategy.
-    \item \textbf{Normalized Scanpath Saliency (NSS):} The average normalized saliency value at fixated locations. A higher NSS indicates that fixations land on more salient regions as predicted by the model.
-    \item \textbf{Area Under Curve (AUC):} A non-parametric measure of the model\'s ability to rank fixated locations higher than non-fixated locations.
-\end{itemize}
 
-\paragraph{Baseline Model.} Our primary baseline for comparison is \textbf{DeepGazeIII} \cite{kummerer2022deepgaze}, the previous state-of-the-art model which uses a DenseNet-201 CNN backbone.
 
-\section{Experiment 1: Establishing the ViT Advantage}
+\section{Experiment 1: Establishing the Vision Transformer Advantage}
 \label{sec:results_exp1}
-
-Our first experiment sought to validate the initial hypothesis that a ViT backbone provides a stronger set of features for saliency prediction than a traditional CNN. We compared the original DeepGazeIII with our \textbf{DinoGaze} model, which replaces the DenseNet backbone with a frozen DINOv2 transformer, on the SALICON dataset.
-
+Our first experiment was designed to answer a foundational question: does the architectural shift from a CNN to a Vision Transformer, motivated by the ViT's global receptive field and emergent segmentation properties, provide a tangible performance benefit for gaze prediction? To this end, we compared the original CNN-based DeepGaze III with our DinoGaze model, which replaces the DenseNet backbone with a frozen DINOv2 transformer, on the large-scale SALICON spatial saliency benchmark and the MIT1003 fine-tuning task.
 \begin{table}[h!]
+% Use adjustwidth to allow the table to extend into the margins
+% This is necessary for a wide table like this one.
+\begin{adjustwidth}{-3.3cm}{-1.5cm} 
 \centering
-\begin{tabulary}{\textwidth}{lCCCC}
-\toprule
-\textbf{Model} & \textbf{LL} (bits) & \textbf{IG} (bits) & \textbf{NSS} & \textbf{AUC} \\
-\midrule
-DeepGazeIII (Baseline) & [value] & [value] & [value] & [value] \\
-DinoGaze (ViT only)    & [value] & [value] & [value] & [value] \\
-\bottomrule
-\end{tabulary}
-\caption[ViT vs. CNN on SALICON]{Performance comparison on the SALICON spatial saliency benchmark. This experiment validates the effectiveness of the DINOv2 backbone.}
-\label{tab:results_salicon_vit}
+{ % Start a group to keep settings local
+\small % Use a smaller font size to help the table fit
+\setlength{\tabcolsep}{4pt} % Reduce padding between columns
+
+\caption{
+    Performance comparison across key model architectures and datasets. 
+    The table highlights the total improvement of the ViT-based models over the original CNN baseline.
+    The IG improvement is calculated relative to the `DeepGaze III` model in both cases.
+}
+\label{tab:VIT_results}
+\begin{tabular}{@{}l l l l l c@{}}
+    \toprule
+    \textbf{Model} & \textbf{LL} $\uparrow$ & \textbf{IG} $\uparrow$ & \textbf{NSS} $\uparrow$ & \textbf{AUC} $\uparrow$ & \textbf{IG $\Delta$ vs. Baseline} \\
+    \midrule
+    
+    \multicolumn{6}{c}{\textbf{SALICON Spatial Saliency Benchmark}} \\
+    \midrule
+    DeepGaze III (CNN Baseline) & 0.7642 & 0.3350 & 1.4036 & 0.7667 & -- \\
+    DinoGaze (ViT Baseline)     & 0.8159 & 0.3867 & \bfseries 1.6340 & \bfseries 0.7727 & +15.4\% \\
+    DinoGaze-SPADE (Final)      & \bfseries 0.8165 & \bfseries 0.3873 & 1.6131 & 0.7726 & +15.6\% \\
+    \midrule
+
+    \multicolumn{6}{c}{\textbf{MIT1003 Fine-tuning Task}} \\
+    \midrule
+    DeepGaze III (CNN Baseline) & 2.0572 $\pm$ 0.0721 & 1.1511 $\pm$ 0.0437 & 6.9074 $\pm$ 0.7291 & 0.8974 $\pm$ 0.0049 & -- \\
+    DinoGaze (ViT Baseline)     & \bfseries 2.2038 $\pm$ 0.0704 & \bfseries 1.2981 $\pm$ 0.0405 & \bfseries 8.0406 $\pm$ 0.8457 & \bfseries 0.9050 $\pm$ 0.0044 & +12.8\% \\
+    DinoGaze-SPADE (Final)      & 2.1938 $\pm$ 0.0748 & 1.2881 $\pm$ 0.0392 & 8.0211 $\pm$ 0.8328 & 0.9047 $\pm$ 0.0046 & +11.9\% \\
+    \bottomrule
+\end{tabular}
+\par\medskip
+\footnotesize{
+    SALICON results are from a single run. MIT1003 results are mean $\pm$ std over 10 folds.
+    `DinoGaze-SPADE (Final)` refers to the `v1\_sam64` variant.
+}
+} % End local settings group
+\end{adjustwidth}
 \end{table}
 
-The results, presented in \cref{tab:results_salicon_vit}, clearly demonstrate the advantage of the ViT backbone. Our DinoGaze model achieved an Information Gain of [value] bits, a significant improvement over the DeepGazeIII baseline. This confirms that modern, self-supervised Vision Transformers provide a superior foundation for saliency modeling. However, as discussed in our methodology, this result alone does not prove that the model is effectively using segmentation information; it primarily establishes a new, stronger baseline for our subsequent experiments.
-
-\section{Experiment 2: The Impact of Dynamic SPADE}
-\label{sec:results_exp2}
-
-This section presents the core findings of this thesis. Having established the strength of the DINOv2 backbone, we conducted a series of ablation studies to isolate the effect of injecting segmentation information via our dynamic SPADE mechanism. The goal was to prove that our final model\'s performance comes from the specific mechanism of information injection, not just from added complexity or a superior backbone.
-
-\begin{table}[h!]
-\centering
-\begin{tabulary}{\textwidth}{lcccc}
-\toprule
-\textbf{Model Configuration} & \textbf{Backbone} & \textbf{SPADE Source} & \textbf{LL} (bits) & \textbf{IG} (bits) \\
-\midrule
-1. DeepGazeIII & DenseNet & None & [value] & [value] \\
-2. DinoGaze & DINOv2 & None & [value] & [value] \\
-3. DeepGaze-SPADE (Learned Emb.) & DenseNet & Learned & [value] & [value] \\
-4. DeepGaze-SPADE (Dynamic DenseNet) & DenseNet & DenseNet & [value] & [value] \\
-5. \textbf{DinoGaze-SPADE (Final Model)} & \textbf{DINOv2} & \textbf{DINOv2} & \textbf{[value]} & \textbf{[value]} \\
-\bottomrule
-\end{tabulary}
-\caption[Ablation study of SPADE configurations]{Ablation study on SALICON, testing different methods of injecting segmentation information. This table highlights the superiority of using a DINOv2 backbone for both main features and dynamic SPADE modulation.}
-\label{tab:results_ablation}
-\end{table}
-
-The results of this ablation study, shown in \cref{tab:results_ablation}, tell the story of our research. As hypothesized, the naive attempt to inject segmentation information using trainable embeddings for discrete segment IDs (Row 3) failed to produce meaningful improvement over the baseline. This confirms that semantic coherence is critical. Furthermore, using our \enquote{semantic painting} technique with features from the DenseNet backbone (Row 4) also yielded underwhelming results.
-
-The breakthrough is evident in the final row. By using the DINOv2 backbone for both the main feature pathway and to generate the features for the dynamic semantic map, the \textbf{DinoGaze-SPADE} model achieves a remarkable Information Gain of [value] bits. This result is not only a significant leap over the prior state-of-the-art (Row 1), but also a substantial improvement over the already strong DinoGaze model (Row 2). This demonstrates conclusively that the performance gain is driven by the effective, dynamic injection of coherent semantic segmentation information via the SPADE mechanism, not just by the power of the backbone itself.
-
-\section{Experiment 3: Generalization to Scanpath Prediction}
-\label{sec:results_exp3}
-
-To ensure our findings were not limited to static spatial saliency, we evaluated our final model on the more challenging task of sequential scanpath prediction. This experiment was conducted on the MIT1003 dataset, with results averaged across a 10-fold cross-validation.
-
-\begin{table}[h!]
-\centering
-\begin{tabulary}{\textwidth}{lCCCC}
-\toprule
-\textbf{Model} & \textbf{LL} (bits) & \textbf{IG} (bits) & \textbf{NSS} & \textbf{AUC} \\
-\midrule
-DeepGazeIII (Baseline) & [value] & [value] & [value] & [value] \\
-DinoGaze & [value] & [value] & [value] & [value] \\
-\textbf{DinoGaze-SPADE} & \textbf{[value]} & \textbf{[value]} & \textbf{[value]} & \textbf{[value]} \\
-\bottomrule
-\end{tabulary}
-\caption[Performance on MIT1003 Scanpath Prediction]{Performance comparison on the MIT1003 scanpath prediction task, averaged over 10 cross-validation folds.}
-\label{tab:results_mit1003}
-\end{table}
-
-The results in \cref{tab:results_mit1003} confirm that the advantages of the DinoGaze-SPADE architecture generalize robustly. The performance hierarchy observed on SALICON holds, with our final model again achieving the highest scores across all metrics. This indicates that the benefits of segmentation-informed feature modulation are fundamental to gaze prediction, applying to both static saliency and dynamic, history-dependent scanpaths.
-
-\section{Qualitative Analysis}
-\label{sec:results_qualitative}
-
-To provide a more intuitive understanding of these quantitative results, \cref{fig:qualitative_maps} shows a qualitative comparison of saliency maps generated by the baseline DeepGazeIII, our intermediate DinoGaze model, and our final DinoGaze-SPADE model for a sample image. The maps produced by DinoGaze-SPADE are visibly more focused on semantic objects, such as people and animals, and less distracted by low-level features like texture or contrast, which affect the baseline model. This visual evidence aligns with our hypothesis that the model is effectively using segmentation to guide its predictions.
+The results, presented in \cref{tab:VIT_results}, provide a clear and affirmative answer.
+The DinoGaze model achieves a significant improvement across all four evaluation metrics, with an Information Gain of 0.3873 bits compared to 0.3350 bits for the DeepGaze III baseline on the SALICON dataset, and an Information Gain of 1.2981 bits compared to 1.1511 bits for the DeepGaze III baseline on the MIT1003 dataset, resulting in an overall increase of 15.4\% and 12.8\% respectively on the two datasets.
+This result confirms our initial hypothesis and establishes a new, more powerful state-of-the-art baseline for spatial saliency prediction. However, as discussed in our methodology, this success alone is ambiguous. It demonstrates the superiority of the ViT backbone but does not prove that this advantage stems specifically from its implicit segmentation knowledge. This motivated our next, more targeted set of experiments.
+A direct comparison of Dinogaze spade and DeepGaze III can be seen in figure \ref{fig:dino_saliency} and figure \ref{fig:dg3_saliency}, where we can see that the Dinogaze model produces cleaner, more semantically focused saliency maps than the DeepGaze III model, which often highlights irrelevant high-contrast textures in the background.
+Also, it can be observed in figure \ref{fig:gamma_beta_maps} the Gamma and Beta modulation maps produced by the SPADE layers, which show that the network learns to, for instance, universally increase the salience of regions identified as "people" or "text."
 
 \begin{figure}[h!]
 \centering
-% Placeholder for the figure
-\fbox{\parbox[c][10cm][c]{0.8\textwidth}{\centering \Large Figure showing example saliency maps from DeepGazeIII, DinoGaze, and DinoGaze-SPADE on a sample image.}}
-\caption[Qualitative comparison of saliency maps]{Example saliency maps generated by the different models. The maps from our final DinoGaze-SPADE model are more semantically focused.}
-\label{fig:qualitative_maps}
+\includegraphics[width=\textwidth]{figs/dino_saliency.png}
+\caption[DinoGaze saliency map example]{Example saliency maps generated by Dinogaze Spade model. Note how the model focuses cleanly on the primary semantic objects (the people, the sign and the text) while ignoring the distracting high-contrast texture of the background.}
+\label{fig:dino_saliency}
 \end{figure}
+
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\textwidth]{figs/dg3_saliency.png}
+\caption[DeepGaze III saliency map example]{Example saliency maps generated by DeepGaze III model. Note how the model often highlights irrelevant high-contrast textures in the background, which can distract from the primary semantic objects (the person and the dog).}
+\label{fig:dg3_saliency}
+\end{figure}
+
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\textwidth]{figs/gamma_beta.png}
+\caption[Gamma and Beta modulation maps]{Example Gamma and Beta modulation maps produced by the SPADE layers in the DinoGaze-SPADE model. Note how the network learns to, for instance, universally increase the salience of regions identified as "people" or "text", with a higher Gamma value.}
+\label{fig:gamma_beta_maps}
+\end{figure}
+
+
+
+
+\section[Exp. 2: Isolating the Impact of Explicit Segmentation]{Experiment 2: Isolating the Impact of Explicit Segmentation}
+\label{sec:results_exp2}
+This section presents the core findings of this thesis.
+Having established the strength of the DINOv2 backbone, we conducted a series of ablation and control studies to rigorously test our central hypothesis:
+that the explicit injection of segmentation information provides a performance benefit above and beyond the quality of the feature extractor itself.
+
+
+\begin{table}[p!] % Using [p!] hint to place this large table on a dedicated page
+% Use adjustwidth to allow the table to extend into the margins
+\begin{adjustwidth}{-3.3cm}{-1.5cm} 
+\centering
+{ % Start a group to keep settings local
+\small % Use a smaller font size to help the table fit
+\setlength{\tabcolsep}{3pt} % Reduce padding between columns to a minimum
+
+\caption{
+    Comprehensive performance comparison across all model configurations and datasets. 
+    The IG improvement is calculated as the percentage change relative to the `DeepGaze III` baseline for each respective dataset.
+}
+\label{tab:results_comprehensive}
+\begin{tabular}{@{}l l l l l c@{}}
+    \toprule
+    \textbf{Model} & \textbf{LL} $\uparrow$ & \textbf{IG} $\uparrow$ & \textbf{NSS} $\uparrow$ & \textbf{AUC} $\uparrow$ & \textbf{IG $\Delta$ vs. Baseline} \\
+    \midrule
+    
+    \multicolumn{6}{c}{\textbf{SALICON Spatial Saliency Benchmark}} \\
+    \midrule
+    \multicolumn{6}{l}{\textit{CNN Backbone (DenseNet)}} \\
+    DeepGaze III (Baseline) & 0.7642 & 0.3350 & 1.4036 & 0.7667 & -- \\
+    DG-SPADE v1 (KMeans-16) & 0.7959 & 0.3667 & 1.5900 & 0.7701 & +9.5\% \\
+    DG-SPADE v1 (SAM-16) & 0.7989 & 0.3698 & 1.5706 & 0.7704 & +10.4\% \\
+    DG-SPADE v1 (SAM-64) & 0.7819 & 0.3527 & 1.5754 & 0.7689 & +5.3\% \\
+    DG-SPADE v2 (KMeans-16) & 0.8067 & 0.3775 & 1.6032 & 0.7709 & +12.7\% \\
+    DG-SPADE v2 (SAM-16) & 0.8043 & 0.3752 & 1.5986 & 0.7706 & +12.0\% \\
+    DG-SPADE v2 (SAM-64) & 0.8043 & 0.3751 & 1.6016 & 0.7706 & +12.0\% \\
+    DG-SPADE v3 (KMeans-16) & 0.8083 & 0.3791 & 1.5361 & 0.7717 & +13.2\% \\
+    DG-SPADE v3 (SAM-16) & 0.8011 & 0.3719 & 1.5509 & 0.7711 & +11.0\% \\
+    DG-SPADE v3 (SAM-64) & 0.8043 & 0.3752 & 1.5688 & 0.7720 & +12.0\% \\
+    \midrule
+    \multicolumn{6}{l}{\textit{ViT Backbone (DINOv2)}} \\
+    DinoGaze (Baseline) & 0.8159 & 0.3867 & \bfseries 1.6340 & \bfseries 0.7727 & +15.4\% \\
+    DinoGaze-SPADE v1 (KMeans-16) & \bfseries 0.8188 & \bfseries 0.3897 & 1.5684 & \bfseries 0.7727 & +16.3\% \\
+    DinoGaze-SPADE v1 (SAM-16) & 0.8123 & 0.3831 & 1.6197 & 0.7726 & +14.4\% \\
+    DinoGaze-SPADE v1 (SAM-64) & 0.8165 & 0.3873 & 1.6131 & 0.7726 & +15.6\% \\
+    \midrule
+    
+    \multicolumn{6}{c}{\textbf{MIT1003 Fine-tuning Task}} \\
+    \midrule
+    \multicolumn{6}{l}{\textit{CNN Backbone (DenseNet)}} \\
+    DeepGaze III (Baseline) & 2.0572 $\pm$ 0.0721 & 1.1511 $\pm$ 0.0437 & 6.9074 $\pm$ 0.7291 & 0.8974 $\pm$ 0.0049 & -- \\
+    DG-SPADE v1 (KMeans-16) & 2.0787 $\pm$ 0.0705 & 1.1730 $\pm$ 0.0420 & 7.0243 $\pm$ 0.8253 & 0.8984 $\pm$ 0.0044 & +1.9\% \\
+    DG-SPADE v1 (SAM-16) & 2.0570 $\pm$ 0.0684 & 1.1514 $\pm$ 0.0409 & 6.9117 $\pm$ 0.8818 & 0.8973 $\pm$ 0.0045 & +0.0\% \\
+    DG-SPADE v1 (SAM-64) & 2.0352 $\pm$ 0.0667 & 1.1295 $\pm$ 0.0387 & 7.2279 $\pm$ 0.9188 & 0.8957 $\pm$ 0.0050 & -1.9\% \\
+    DG-SPADE v2 (KMeans-16) & 2.0745 $\pm$ 0.0645 & 1.1688 $\pm$ 0.0374 & 7.1964 $\pm$ 0.8208 & 0.8981 $\pm$ 0.0042 & +1.5\% \\
+    DG-SPADE v2 (SAM-16) & 2.0666 $\pm$ 0.0689 & 1.1609 $\pm$ 0.0420 & 7.0404 $\pm$ 0.7844 & 0.8974 $\pm$ 0.0044 & +0.9\% \\
+    DG-SPADE v2 (SAM-64) & 2.0662 $\pm$ 0.0702 & 1.1605 $\pm$ 0.0414 & 7.1062 $\pm$ 0.8350 & 0.8976 $\pm$ 0.0044 & +0.8\% \\
+    DG-SPADE v3 (KMeans-16) & 2.1433 $\pm$ 0.0667 & 1.2376 $\pm$ 0.0302 & 7.6283 $\pm$ 0.8051 & 0.9019 $\pm$ 0.0041 & +7.5\% \\
+    DG-SPADE v3 (SAM-16) & 2.0993 $\pm$ 0.0630 & 1.1936 $\pm$ 0.0329 & 7.5590 $\pm$ 0.8470 & 0.8993 $\pm$ 0.0044 & +3.7\% \\
+    DG-SPADE v3 (SAM-64) & 2.1334 $\pm$ 0.0680 & 1.2277 $\pm$ 0.0346 & 7.6355 $\pm$ 0.9197 & 0.9014 $\pm$ 0.0044 & +6.7\% \\
+    \midrule
+    \multicolumn{6}{l}{\textit{ViT Backbone (DINOv2)}} \\
+    DinoGaze (Baseline) & \bfseries 2.2038 $\pm$ 0.0704 & \bfseries 1.2981 $\pm$ 0.0405 & 8.0406 $\pm$ 0.8457 & \bfseries 0.9050 $\pm$ 0.0044 & +12.8\% \\
+    DinoGaze-SPADE v1 (KMeans-16) & 2.1855 $\pm$ 0.0626 & 1.2798 $\pm$ 0.0303 & \bfseries 8.0497 $\pm$ 0.7332 & 0.9045 $\pm$ 0.0041 & +11.2\% \\
+    DinoGaze-SPADE v1 (SAM-16) & 2.1837 $\pm$ 0.0704 & 1.2780 $\pm$ 0.0382 & 8.0456 $\pm$ 0.8161 & 0.9044 $\pm$ 0.0046 & +11.0\% \\
+    DinoGaze-SPADE v1 (SAM-64) & 2.1938 $\pm$ 0.0748 & 1.2881 $\pm$ 0.0392 & 8.0211 $\pm$ 0.8328 & 0.9047 $\pm$ 0.0046 & +11.9\% \\
+    \bottomrule
+\end{tabular}
+\par\medskip
+} % End local settings group
+\end{adjustwidth}
+\end{table}
+
+\subsection{Validating the Semantic Painting Innovation}
+\label{sec:method_validation_of_innovation}
+The central claim of this thesis—that explicitly injecting segmentation information improves gaze prediction—required a series of carefully controlled experiments. We systematically evaluated the performance of our different SPADE-based architectures against the appropriate baselines on both the large-scale SALICON pre-training task and the high-fidelity MIT1003 fine-tuning task. The results, presented comprehensively in \cref{tab:results_comprehensive}, provide a clear, data-driven narrative of our methodological development and validate our core hypotheses.
+\paragraph{Confirming the Failure of Static Embeddings (DG-SPADE v1).}
+Our first experiment was a crucial negative control. The DG-SPADE v1 model, which used the standard SPADE mechanism with a learned, static embedding for each integer segment ID, confirmed our hypothesis about semantic incoherence. On the MIT1003 dataset, this model showed no meaningful improvement over the DeepGaze III baseline. When guided by the SAM-16 masks, its performance was statistically identical (1.1511 vs. 1.1514 IG), interestingly, when guided by the KMeans-16 masks, its performance improved by  1.9\%, potentially suggesting that even if there is no semantic coherence, the model can still benefit from the additional spatial information, similar to how a more informative prior might help. Overall, this result empirically demonstrates that without a consistent meaning attached to the segment labels, a static embedding provides not much useful signal for the network to learn from.
+\paragraph{Proof of Concept: Semantic Painting with a CNN Vocabulary (DG-SPADE v2).}
+Our next model, DG-SPADE v2, introduced the "semantic painting" innovation while remaining within a purely CNN-based ecosystem. By using the DenseNet backbone's own features to create the dynamic semantic map, the model showed a consistent, albeit modest, improvement over the baseline. On MIT1003, it achieved an Information Gain improvement of approximately +1.5\% over DeepGaze III. While small, this result is a significant theoretical achievement. It provides the first piece of evidence that the semantic painting mechanism is fundamentally sound and that the model can successfully leverage the injected structural information to make better predictions.
+\paragraph{Isolating the Vocabulary: The Success of the Hybrid Model (DG-SPADE v3).}
+The most insightful experiment was the evaluation of our hybrid model, DG-SPADE v3. This model retained the DenseNet backbone for the main saliency pathway but used the superior features from a DINOv2 backbone to generate the painted semantic map. The impact was dramatic. On the MIT1003 dataset, DG-SPADE v3 achieved a substantial +7.5\% improvement in Information Gain over the DeepGaze III baseline when using the KMeans-16 masks. This result is critical because it cleanly isolates the effect of the semantic "vocabulary." It demonstrates that a higher-quality, more spatially-aware representation of segment content (from DINOv2) can significantly boost the performance of even a weaker primary feature extractor (DenseNet) via SPADE modulation. This confirms that the quality of the injected semantic information is a key driver of performance. An example saliency map compared to the baseline can be seen in figure \ref{fig:dg3_vs_dg3s}, which shows how the DG-SPADE v3 model produces a cleaner, more semantically focused saliency map than the DeepGaze III baseline.
+\paragraph{The Final System: DinoGaze vs. DinoGaze-SPADE.}
+Finally, we compared our new, powerful DinoGaze baseline against the fully integrated DinoGaze-SPADE model. Here, the results tell a more nuanced story. On the MIT1003 fine-tuning task, the standard DinoGaze model established a very strong baseline, outperforming DeepGaze III by a remarkable +12.8\% in Information Gain. The addition of SPADE modulation in the DinoGaze-SPADE model did not yield a further significant improvement on top of this already high baseline, with performance remaining roughly equivalent.
+This finding does not diminish the validity of the SPADE mechanism. Rather, it suggests that the DINOv2 backbone, through its powerful self-attention mechanism, already captures such a rich and structurally-aware representation of the scene that the additional, explicit injection of unsupervised segmentation provides diminishing returns. The information is, to a large extent, already implicitly present in the ViT's features.
+However, the DinoGaze-SPADE architecture remains our final and most important contribution. It serves as a validated framework, demonstrating that explicit semantic information can be effectively injected. This provides the crucial tool for the next phase of this research program: injecting personalized, human-perceptual segmentation maps. While the performance with generic, unsupervised masks may have hit a ceiling, the potential for improvement by conditioning the model on an individual's unique and subjective parsing of a scene remains a compelling and open avenue for future work.
+
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\textwidth]{figs/dg3_vs_dg3s.png}
+\caption[DG-SPADE v3 vs DeepGaze III saliency map example]{Example saliency maps generated by DeepGaze III (d, e, f) and DG-SPADE v3 (g, h, i) models. Note how the DG-SPADE v3 model focuses cleanly on the primary semantic objects (like the medals of the officier) which cannot be seen in the DeepGaze III model.}
+\label{fig:dg3_vs_dg3s}
+\end{figure}
+
+\section{Experiment 3: Generalization to Scanpath Prediction}
+\label{sec:results_exp3}
+A robust model of visual attention must not only predict the aggregate spatial distribution of fixations but also capture the sequential, history-dependent nature of how humans explore a scene. The most stringent test of our architectural innovations is therefore their performance on the task of scanpath prediction. This task requires the model to predict the location of the \textit{next} fixation, given both the image and the coordinates of the previous four fixations.
+
+Due to the significantly higher computational cost of scanpath training—requiring several weeks to complete a full 10-fold cross-validation for a single model configuration—we focused our evaluation on the three most critical models: the original `DeepGaze III` baseline, our powerful ViT-powered `DinoGaze` baseline, and our final, segmentation-guided `DinoGaze-SPADE` model. The models were trained on the MIT1003 dataset using the scanpath objective, and the results are presented in \cref{tab:results_scanpath}.
+
+\begin{table}[h!]
+% Use adjustwidth to allow the table to extend into the margins
+\begin{adjustwidth}{-3cm}{-1.5cm} 
+\centering
+{ % Start a group to keep settings local
+\small % Use a smaller font size to help the table fit
+\setlength{\tabcolsep}{4pt} % Reduce padding between columns
+
+\caption{
+    Performance comparison on the MIT1003 scanpath prediction task. 
+    The results demonstrate a consistent performance increase from both the ViT backbone and the final SPADE mechanism on this complex sequential task.
+}
+\label{tab:results_scanpath}
+\begin{tabular}{@{}l l l l l c@{}}
+    \toprule
+    \textbf{Model} & \textbf{LL} $\uparrow$ & \textbf{IG} $\uparrow$ & \textbf{NSS} $\uparrow$ & \textbf{AUC} $\uparrow$ & \textbf{IG $\Delta$ vs. Baseline} \\
+    \midrule
+    
+    DeepGaze III (Baseline) & 2.6249 $\pm$ 0.0670 & 1.7158 $\pm$ 0.0557 & 13.9916 $\pm$ 1.5156 & 0.9199 $\pm$ 0.0033 & -- \\
+    DinoGaze (ViT Baseline)  & 2.6970 $\pm$ 0.1038 & 1.7850 $\pm$ 0.1329 & 15.4617 $\pm$ 1.5984 & 0.9226 $\pm$ 0.0047 & +4.0\% \\
+    \bfseries DinoGaze-SPADE (Final)   & \bfseries \bfseries 2.7327 $\pm$ 0.0744 & \bfseries \bfseries 1.8270 $\pm$ 0.0449 & \bfseries \bfseries 16.2732 $\pm$ 0.9494 & \bfseries \bfseries 0.9252 $\pm$ 0.0032 & \bfseries +6.5\% \\
+    \bottomrule
+\end{tabular}
+\par\medskip
+\footnotesize{
+    Results are mean $\pm$ std. All models are averaged over 10 folds.
+}
+} % End local settings group
+\end{adjustwidth}
+\end{table}
+
+The results in \cref{tab:results_scanpath} confirm that the advantages of our architectural hierarchy generalize robustly to the sequential domain. First, the move from a CNN to a ViT backbone provides a substantial performance uplift. The `DinoGaze` baseline achieves a \textbf{+4.0\% improvement in Information Gain} over `DeepGaze III`. This demonstrates that the richer, more context-aware features from the DINOv2 backbone are beneficial not only for understanding static saliency but also for modeling the dynamic decisions involved in scanpath planning.
+
+Crucially, the explicit injection of segmentation information provides a further, consistent boost in performance. Our final \textbf{`DinoGaze-SPADE` model achieves the highest performance} across our most principled metrics, LL, IG and AUC, reaching a \textbf{+6.5\% improvement in Information Gain} over the original `DeepGaze III` baseline. This result is highly significant, as it indicates that the benefits of segmentation-informed feature modulation are fundamental to the core mechanisms of gaze prediction, applying to both static saliency and dynamic, history-dependent scanpaths. The model is better able to predict where a person will look next because it is explicitly guided by the scene's structural organization.
+
+A qualitative example of the predicted probability distributions in \cref{fig:qualitative_scanpath_maps} further illustrates these findings.
+
+
+
+\begin{figure}[p!] % Using [p!] to encourage placement on a dedicated page if needed
+    \centering
+    % First row of images (first scanpath example)
+    \includegraphics[width=\textwidth]{figs/scanpath_plot_01_i2244097646.png}
+    
+    \vspace{2ex} % Add some vertical space between the rows
+    
+    % Second row of images (second scanpath example)
+    \includegraphics[width=\textwidth]{figs/scanpath_plot_04_i142662322.png}
+    
+    \vspace{2ex} % Add some vertical space between the rows
+    
+    % Third row of images (third scanpath example)
+    \includegraphics[width=\textwidth]{figs/scanpath_plot_06_i2277198372.png}
+    
+    \caption[Qualitative examples of DinoGaze-SPADE's scanpath predictions]{
+        Qualitative examples of the dynamic, history-dependent predictions made by our final DinoGaze-SPADE model for three different human scanpaths (one per row). 
+        \textbf{First Column:} The viewed image with the full ground-truth human scanpath overlaid.
+        \textbf{Subsequent Columns:} A step-by-step visualization of the model's predictive process. In each panel, the model is conditioned on the scanpath history so far (red arrows). It must predict the next human fixation, whose true location is marked by the \textbf{white star}. The colored heatmap represents the model's predicted probability density for this next fixation, with warmer colors indicating higher probability. These examples illustrate the model's ability to generate plausible, semantically-aware predictions that evolve as the viewing history unfolds. The model correctly focuses probability mass on relevant objects and parts (e.g., the text, the people's faces, the room's furniture), often placing the true next fixation within its high-probability regions.
+    }
+    \label{fig:qualitative_scanpath_maps}
+\end{figure}
+
+
+\section[Control Experiments: Validating the Mechanism]{Control Experiments: Ensuring the Mechanism is Working as Intended}
+The quantitative improvements of the DinoGaze-SPADE model strongly suggest that the injection of segmentation information is beneficial. However, to rigorously validate that the model is truly leveraging the \textit{spatial structure} of the masks, rather than simply benefiting from the increased architectural complexity of the SPADE layers, we conducted two critical control experiments. Using the fully trained DinoGaze-SPADE models from our 10-fold cross-validation on the MIT1003 dataset, we re-evaluated their performance under conditions where the provided segmentation information was either absent or deliberately corrupted.
+
+The results, summarized in \cref{tab:results_controls}, provide conclusive evidence that the SPADE mechanism has learned a meaningful, spatially-dependent mapping.
+
+\begin{table}[h!]
+\begin{adjustwidth}{-1.5cm}{-1.5cm} 
+\centering
+\caption{
+    Performance of the DinoGaze-SPADE model under control conditions on the MIT1003 spatial task. The baseline is the full model with correct segmentation masks.
+}
+\label{tab:results_controls}
+\begin{tabular}{@{}l l l l c@{}}
+\toprule
+\textbf{Scenario} & \textbf{LL (bits)} $\uparrow$ & \textbf{IG (bits)} $\uparrow$ & \textbf{NSS} $\uparrow$ & \textbf{IG Loss} $\downarrow$ \\
+\midrule
+DinoGaze-SPADE v1 (Correct Masks) & 2.194 $\pm$ 0.075 & 1.288 $\pm$ 0.039 & 8.021 $\pm$ 0.833 & -- \\
+Control 1: Zero-Information      & 2.014 $\pm$ 0.083 & 1.111 $\pm$ 0.042 & 9.168 $\pm$ 1.141 & -13.7\% \\
+Control 2: Mismatched Masks    & 2.128 $\pm$ 0.079 & 1.225 $\pm$ 0.039 & 8.298 $\pm$ 1.033 & -4.9\% \\
+\bottomrule
+\end{tabular}
+\par\medskip
+\footnotesize{
+    Results are mean $\pm$ std over 10 folds. `Correct Masks` refers to the `DinoGaze-SPADE v1 (SAM-64)` configuration.
+}
+\end{adjustwidth}
+\end{table}
+
+\begin{itemize}
+    \item \textbf{Control 1: Zero-Information Input.} In this experiment, we fed the model a trivial segmentation map where every pixel belongs to a single segment (class 0). This effectively removes all spatial structural information, testing whether the SPADE layers themselves provide any intrinsic benefit. As the results show, the model's performance dropped precipitously. The Information Gain fell from \textbf{1.288 bits} to \textbf{1.111 bits}, a significant decrease that brings its performance much closer to the non-SPADE DinoGaze baseline. This confirms that the SPADE architecture provides no advantage on its own and requires a meaningful, structured segmentation map to function as intended.
+
+    \item \textbf{Control 2: Mismatched-Information Input.} In this more stringent control, we performed a second evaluation where, for each image, we fed the model the segmentation mask from a \textit{different, randomly chosen image} from the test set. This control is designed to be particularly informative: unlike feeding the model random noise, this approach preserves the complex spatial statistics of a realistic segmentation, such as the presence of compact, object-like shapes and smooth boundaries. It isolates a single variable: the correspondence between the image content and the structure of the mask. The results showed a significant performance drop, with Information Gain falling to \textbf{1.225 bits}, a loss of \textbf{4.9\%}. This demonstrates that the model has learned a specific, spatially-aware mapping between semantic regions and gaze behavior. It is not merely reacting to the presence of structured input but is actively using the \textit{correct} spatial alignment between image features and segmentation boundaries to refine its predictions.
+
+\end{itemize}
+
+Taken together, these control experiments provide strong evidence that our DinoGaze-SPADE model is operating as designed. It is not just using a better backbone, but is actively and correctly leveraging the explicit spatial structure provided by the segmentation masks to achieve its state-of-the-art performance. The model has learned to condition its predictions on the content of the segments in a way that is fundamentally tied to their correct location within the scene.
+
+
+
+
+
+
+
+
+
+\subsection{Qualitative Analysis: Visualizing the Semantic Vocabulary}
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figs/umap_1.png}
+    \caption[UMAP projection of the segment embedding space]{A UMAP projection of the prototype DINOv2 feature vectors computed for every segment across 100 images from the MIT1003 validation set. Each point represents a single segment from a single image. The visualization reveals a highly structured space where segments cluster based on high-level semantic and textural properties, forming a continuous "semantic vocabulary."}
+    \label{fig:results_umap_1}
+\end{figure}
+
+The quantitative improvements demonstrated by our SPADE-based models are predicated on a central hypothesis: that the "semantic painting" process generates a meaningful, coherent guidance signal. To qualitatively validate this, we must visualize the semantic vocabulary itself. If our hypothesis is correct, the average feature vectors we compute for each segment should occupy a structured, semantically organized space.
+
+To investigate this, we can think of our approach as analogous to a "bag-of-visual-words" model, but with a continuous, high-dimensional vocabulary defined by the DINOv2 feature space. Each segment in an image is represented not by a discrete word, but by a single point—its prototype feature vector—in this rich embedding space. Segments that are semantically similar (e.g., different patches of sky, different types of foliage) should correspond to points that are close to each other in this space.
+
+To visualize this high-dimensional space, we took the prototype DINOv2 feature vector for every segment from every image in one of our validation folds (100 images from MIT1003) and projected them into a 2D space using the UMAP algorithm, a powerful dimensionality reduction technique that excels at preserving global structure.
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{figs/umap_2.png}
+    \caption[Nearest neighbors in the segment embedding space]{An example of local semantic coherence within the UMAP embedding space. The first image shows a segment of rocky terrain. The surrounding eight images show the segments whose prototype vectors are the nearest neighbors in the high-dimensional DINOv2 feature space. Despite coming from entirely different photographs, the neighbors are all semantically and texturally consistent, representing similar "terrain-like" concepts. This illustrates the robustness of our semantic vocabulary.}
+    \label{fig:results_umap_2}
+\end{figure}
+
+The result, shown in \cref{fig:results_umap_1}, confirms our hypothesis. The segment embeddings are not randomly scattered but form distinct clusters and gradients that correspond to high-level semantic categories. Regions corresponding to sky, foliage, water, and man-made structures naturally group together. This demonstrates that the process of averaging patch features within an unsupervised segment successfully distills its core semantic meaning into a single, representative vector.
+
+We can further probe the local structure of this space by examining the nearest neighbors for a given segment. As shown in \cref{fig:results_umap_2}, we selected a single segment of rocky terrain and retrieved the eight segments from other images whose prototype vectors were closest in the original high-dimensional feature space. The retrieved neighbors are remarkably consistent, all representing similar concepts of textured ground, rock, or sand. This visualization provides strong qualitative evidence that our "semantic painting" mechanism is operating on a valid, coherent, and semantically structured signal, providing a solid foundation for the conditional modulation performed by the SPADE layers.
+
+

@@ -1,0 +1,123 @@
+\RequirePackage{geometry}
+\RequirePackage{graphicx}
+
+\RequirePackage[osf,sc]{mathpazo}
+\linespread{1.05}
+
+\RequirePackage{fontspec}
+\newfontface\unimifont{Adobe Garamond Pro}
+
+
+\newcommand{\supervisortext}{supervisor}
+\newcommand{\cosupervisortext}{{co-supervisor}}
+\newcommand{\matrtext}{registration nr}
+
+\newcommand{\logoleft}[1]{\newcommand{\@logoleft}{#1}}
+\newcommand{\logocenter}[1]{\newcommand{\@logocenter}{#1}}
+\newcommand{\logoright}[1]{\newcommand{\@logoright}{#1}}
+\newcommand{\department}[1]{\newcommand{\@department}{#1}}
+\newcommand{\university}[1]{\newcommand{\@university}{#1}}
+\newcommand{\universitypavia}[1]{\newcommand{\@universitypavia}{#1}}
+\newcommand{\universityunimi}[1]{\newcommand{\@universityunimi}{#1}}
+\newcommand{\degree}[1]{\newcommand{\@degree}{#1}}
+\newcommand{\predegree}[1]{\newcommand{\@predegree}{#1}}
+\newcommand{\supervisor}[1]{\newcommand{\@supervisor}{#1}}
+\newcommand{\cosupervisor}[1]{\newcommand{\@cosupervisor}{#1}}
+\newcommand{\matr}[1]{\newcommand{\@matr}{#1}}
+\newcommand{\maketitlepage}{
+	\begin{titlepage}
+		% \thispagestyle{empty}
+		\newgeometry{top=2cm,left=2.2cm,right=2.2cm,bottom=2cm}
+
+		\begin{center}
+			\vspace{1cm}
+			{\large INTER-UNIVERSITY MASTER'S DEGREE PROGRAMME}
+		\end{center}
+		\begin{center}
+			\Large
+			
+			\begin{tabular}{c@{\hspace{1.5cm}}c@{\hspace{1.5cm}}c}
+				\includegraphics[height=3.5cm]{\@logoleft} &
+				
+				\includegraphics[height=3.5cm]{\@logocenter} &
+				
+				\includegraphics[height=3.5cm]{\@logoright} \\[0.7em]
+
+				\begin{tabular}[t]{@{}c@{}}
+					{\fontsize{12}{6}\selectfont \unimifont\MakeUppercase{Università degli} \\ \fontsize{12}{6}\unimifont\MakeUppercase{Studi di Milano}}
+				\end{tabular} &
+				\begin{tabular}[t]{@{}c@{}}
+					{\fontsize{12}{6}\selectfont \unimifont\MakeUppercase{Università degli Studi di} \\ \fontsize{12}{6}\unimifont\MakeUppercase{Milano - Bicocca}}
+				\end{tabular} &
+				\begin{tabular}[t]{@{}c@{}}
+					{\fontsize{12}{6}\selectfont \unimifont\MakeUppercase{Università di} \\ \fontsize{12}{6} \unimifont\MakeUppercase{Pavia}}
+				\end{tabular}
+        	\end{tabular}
+		\end{center}
+		\vspace{1cm}
+		
+		\ifdefined \@university
+			\begin{center}
+				{\huge\unimifont\MakeUppercase\@university}
+			\end{center}
+			\vspace{1ex}
+		\fi
+		
+		\begin{center}
+			% Minipage for the logo on the left
+			\begin{minipage}{2cm}%
+				\includegraphics[height=2cm,width=2cm]{../logos/logo-ai4st}%
+			\end{minipage}%
+			\hspace{1.5em}% Adjust space between logo and text
+			% Minipage for the text on the right
+			\begin{minipage}[c]{0.7\textwidth}
+				\raggedright % Left-align text
+				\ifdefined \@predegree
+					\huge{\@predegree}\\
+				\fi%
+				\ifdefined \@degree
+				\begin{center}%
+					\huge{\emph{\@degree}}\\[1.5ex] % Add extra space after the degree name
+				\end{center}%
+				\fi%
+				\ifdefined \@department
+				\begin{center}%
+					{\fontsize{14}{13}\selectfont \@department}
+				\end{center}%
+				\fi%
+			\end{minipage}
+		\end{center}
+		
+		\vspace{0.5cm} % Space before the horizontal rule
+		\hrulefill
+		
+		\vspace{1.5cm}
+		\begin{center}
+			\Huge{\textsc{\expandafter{\@title}}}
+		\end{center}
+		\vspace{18mm}
+		\begin{flushright}
+			\Large \@author
+			\vspace{1mm}
+			\ifdefined \@matr
+				\\ \item[\bfseries\footnotesize\MakeUppercase{\matrtext}] \large \@matr
+			\fi
+		\end{flushright}
+		\vspace{20mm}
+		\begin{description}
+			\large
+			\ifdefined \@supervisor
+			\item[\bfseries\footnotesize\MakeUppercase{\supervisortext}] \@supervisor
+			      \fi
+			      \ifdefined \@cosupervisor
+			\item[\bfseries\footnotesize\MakeUppercase{\cosupervisortext}] \@cosupervisor
+			      \fi
+		\end{description}
+		\vfill
+		\vspace{15mm}
+		\begin{center}
+			\large \@date
+		\end{center}
+		\restoregeometry
+	\end{titlepage}
+}

@@ -11,7 +11,7 @@
 
 @article{kummerer2023predicting,
   title={Predicting Visual Fixations},
-  author={K{"u}mmerer, Matthias and Bethge, Matthias},
+  author={Kümmerer, Matthias and Bethge, Matthias},
   journal={Annual Review of Vision Science},
   volume={9},
   pages={269--291},
@@ -21,7 +21,7 @@
 
 @article{kummerer2022deepgaze,
   title={DeepGaze III: Modeling free-viewing human scanpaths with deep learning},
-  author={K{"u}mmerer, Matthias and Bethge, Matthias and Wallis, Thomas SA},
+  author={Kümmerer, Matthias and Bethge, Matthias and Wallis, Thomas SA},
   journal={Journal of Vision},
   volume={22},
   number={5},
@@ -32,7 +32,7 @@
 
 @article{kummerer2017deepgaze2,
   title={DeepGaze II: Reading fixations from deep features trained on object recognition},
-  author={K{\"u}mmerer, Matthias and Wallis, Thomas SA and Bethge, Matthias},
+  author={Kümmerer, Matthias and Wallis, Thomas SA and Bethge, Matthias},
   journal={arXiv preprint arXiv:1610.01563},
   year={2017}
 }
@@ -41,7 +41,7 @@
 
 @article{oquab2023dinov2,
   title={DINOv2: Learning robust visual features without supervision},
-  author={Oquab, Maxime and Darcet, Timoth{\'e}e and Moutakanni, Theo and Mane, Robin and Dehghani, Mostafa and Haziza, Daniel and S{\'e}rillon, R{\'e}mi and Lizuka, Shiao and Almaz{\'a}n, Jon and Laptev, Ivan and Sivic, Josef and Misra, Ishan and Zhai, Xiaohua and Loic, Simon and Douze, Matthijs and Joulin, Armand},
+  author={Oquab, Maxime and Darcet, Timothée and Moutakanni, Theo and Mane, Robin and Dehghani, Mostafa and Haziza, Daniel and Sérillon, Rémi and Lizuka, Shiao and Almazán, Jon and Laptev, Ivan and Sivic, Josef and Misra, Ishan and Zhai, Xiaohua and Loic, Simon and Douze, Matthijs and Joulin, Armand},
   journal={arXiv preprint arXiv:2304.07193},
   year={2023}
 }
@@ -70,7 +70,7 @@
 
 @article{vacher2023measuring,
   title={Measuring uncertainty in human visual segmentation},
-  author={Vacher, Jonathan and Launay, C{\'e}line and Mamassian, Pascal and Coen-Cagli, Ruben},
+  author={Vacher, Jonathan and Launay, Céline and Mamassian, Pascal and Coen-Cagli, Ruben},
   journal={PLoS Computational Biology},
   volume={19},
   number={9},
@@ -121,9 +121,7 @@
     volume = {19},
     url = {https://doi.org/10.1371/journal.pcbi.1011512},
     pages = {1-39},
-    abstract = {The complexity of natural scenes makes it challenging to experimentally study the mechanisms behind human gaze behavior when viewing dynamic environments. Historically, eye movements were believed to be driven primarily by space-based attention towards locations with salient features. Increasing evidence suggests, however, that visual attention does not select locations with high saliency but operates on attentional units given by the objects in the scene. We present a new computational framework to investigate the importance of objects for attentional guidance. This framework is designed to simulate realistic scanpaths for dynamic real-world scenes, including saccade timing and smooth pursuit behavior. Individual model components are based on psychophysically uncovered mechanisms of visual attention and saccadic decision-making. All mechanisms are implemented in a modular fashion with a small number of well-interpretable parameters. To systematically analyze the importance of objects in guiding gaze behavior, we implemented five different models within this framework: two purely spatial models, where one is based on low-level saliency and one on high-level saliency, two object-based models, with one incorporating low-level saliency for each object and the other one not using any saliency information, and a mixed model with object-based attention and selection but space-based inhibition of return. We optimized each model’s parameters to reproduce the saccade amplitude and fixation duration distributions of human scanpaths using evolutionary algorithms. We compared model performance with respect to spatial and temporal fixation behavior, including the proportion of fixations exploring the background, as well as detecting, inspecting, and returning to objects. A model with object-based attention and inhibition, which uses saliency information to prioritize between objects for saccadic selection, leads to scanpath statistics with the highest similarity to the human data. This demonstrates that scanpath models benefit from object-based attention and selection, suggesting that object-level attentional units play an important role in guiding attentional processing.},
-    number = {10},
-
+    number = {10}
 }
 
 
@@ -149,5 +147,183 @@
       eprint={2010.11929},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2010.11929}, 
+      url={https://arxiv.org/abs/2010.11929},
+}
+
+
+@misc{kirillov2023segment,
+      title={Segment Anything}, 
+      author={Alexander Kirillov and Eric Mintun and Nikhila Ravi and Hanzi Mao and Chloe Rolland and Laura Gustafson and Tete Xiao and Spencer Whitehead and Alexander C. Berg and Wan-Yen Lo and Piotr Dollár and Ross Girshick},
+      year={2023},
+      eprint={2304.02643},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2304.02643},
+}
+
+
+@inproceedings{NIPS2012_c399862d,
+ author = {Krizhevsky, Alex and Sutskever, Ilya and Hinton, Geoffrey E},
+ booktitle = {Advances in Neural Information Processing Systems},
+ editor = {F. Pereira and C.J. Burges and L. Bottou and K.Q. Weinberger},
+ pages = {},
+ publisher = {Curran Associates, Inc.},
+ title = {ImageNet Classification with Deep Convolutional Neural Networks},
+ url = {https://proceedings.neurips.cc/paper_files/paper/2012/file/c399862d3b9d6b76c8436e924a68c45b-Paper.pdf},
+ volume = {25},
+ year = {2012}
+}
+
+@misc{tensorflow2015-whitepaper,
+title={ TensorFlow: Large-Scale Machine Learning on Heterogeneous Systems},
+url={https://www.tensorflow.org/},
+note={Software available from tensorflow.org},
+author={
+    Martín Abadi and
+    Ashish Agarwal and
+    Paul Barham and
+    Eugene Brevdo and
+    Zhifeng Chen and
+    Craig Citro and
+    Greg S. Corrado and
+    Andy Davis and
+    Jeffrey Dean and
+    Matthieu Devin and
+    Sanjay Ghemawat and
+    Ian Goodfellow and
+    Andrew Harp and
+    Geoffrey Irving and
+    Michael Isard and
+    Yangqing Jia and
+    Rafal Jozefowicz and
+    Lukasz Kaiser and
+    Manjunath Kudlur and
+    Josh Levenberg and
+    Dandelion Mané and
+    Rajat Monga and
+    Sherry Moore and
+    Derek Murray and
+    Chris Olah and
+    Mike Schuster and
+    Jonathon Shlens and
+    Benoit Steiner and
+    Ilya Sutskever and
+    Kunal Talwar and
+    Paul Tucker and
+    Vincent Vanhoucke and
+    Vijay Vasudevan and
+    Fernanda Viegas and
+    Oriol Vinyals and
+    Pete Warden and
+    Martin Wattenberg and
+    Martin Wicke and
+    Yuan Yu and
+    Xiaoqiang Zheng},
+  year={2015},
+}
+
+
+@InProceedings{jiang2015salicon,
+author = {Jiang, Ming and Huang, Shengsheng and Duan, Juanyong and Zhao, Qi},
+title = {SALICON: Saliency in Context},
+booktitle = {The IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+month = {June},
+year = {2015}
+}
+
+@InProceedings{Judd_2009,
+  author    = {Tilke Judd and Krista Ehinger and Frédó Durand and Antonio Torralba},
+  title     = {Learning to Predict Where Humans Look},
+  booktitle = {IEEE International Conference on Computer Vision (ICCV)},
+  year      = {2009}
+}
+
+@inproceedings{he2017mask,
+  title={Mask r-cnn},
+  author={He, Kaiming and Gkioxari, Georgia and Dollár, Piotr and Girshick, Ross},
+  booktitle={Proceedings of the IEEE international conference on computer vision},
+  pages={2961--2969},
+  year={2017}
+}
+
+@inproceedings{paszke2019pytorch,
+  title={PyTorch: An imperative style, high-performance deep learning library},
+  author={Paszke, Adam and Gross, Sam and Massa, Francesco and Laina, Iason and Chintala, Soumith and Chanan, Gregory and Lin, Zai and Desmaison, Alban and Antiga, Luca and Lerer, Adam and others},
+  booktitle={Advances in neural information processing systems},
+  volume={32},
+  year={2019}
+}
+
+@incollection{wertheimer1938laws,
+  title={Laws of organization in perceptual forms},
+  author={Wertheimer, Max},
+  booktitle={A source book of Gestalt psychology},
+  pages={71--88},
+  year={1938},
+  publisher={Harcourt, Brace}
+}
+
+@article{bylinskii2018saliency_metrics,
+  title={What do different evaluation metrics tell us about saliency models?},
+  author={Bylinskii, Zoya and Judd, Tilke and Oliva, Aude and Torralba, Antonio and Durand, Frédó},
+  journal={IEEE transactions on pattern analysis and machine intelligence},
+  volume={41},
+  number={3},
+  pages={740--757},
+  year={2018},
+  publisher={IEEE}
+}
+
+
+@article{treisman1980,
+  title={A feature-integration theory of attention},
+  author={Treisman, Anne M. and Gelade, Garry},
+  journal={Cognitive psychology},
+  volume={12},
+  number={1},
+  pages={97--136},
+  year={1980},
+  publisher={Elsevier}
+}
+
+@article{henderson2003,
+  title={Human gaze control during real-world scene perception},
+  author={Henderson, John M.},
+  journal={Trends in cognitive sciences},
+  volume={7},
+  number={11},
+  pages={498--504},
+  year={2003},
+  publisher={Elsevier}
+}
+
+@article{rayner1998,
+  title={Eye movements in reading and information processing: 20 years of research.},
+  author={Rayner, Keith},
+  journal={Psychological bulletin},
+  volume={124},
+  number={3},
+  pages={372--422},
+  year={1998},
+  publisher={American Psychological Association}
+}
+
+@article{ibbotson2011,
+  title={Visual perception and saccadic eye movements},
+  author={Ibbotson, Michael R and Krekelberg, Bart},
+  journal={Current Opinion in Neurobiology},
+  volume={21},
+  number={4},
+  pages={553--558},
+  year={2011},
+  publisher={Elsevier}
+}
+
+@article{posner1984,
+  title={Components of visual orienting},
+  author={Posner, Michael I and Cohen, Yair},
+  journal={Attention and performance X},
+  volume={32},
+  pages={531--556},
+  year={1984}
 }
