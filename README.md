@@ -67,6 +67,24 @@ DinoGaze-SPADE produces cleaner, more semantically focused saliency maps compare
   <em>DeepGaze III: Often highlights irrelevant high-contrast textures in the background.</em>
 </p>
 
+### Temporal Scanpath Prediction
+
+Beyond static saliency, DinoGaze-SPADE excels at **sequential scanpath prediction** — predicting where a person will look next based on their viewing history.
+
+<p align="center">
+  <img src="documents/Thesis/figs/scanpath_plot_01_i2244097646.png" alt="Scanpath Prediction Example 1" width="100%">
+  <br>
+  <em>Step-by-step scanpath prediction. Left: Full ground-truth scanpath. Right panels: Model predictions at each step (red arrows = history, white star = true next fixation, heatmap = predicted probability).</em>
+</p>
+
+<p align="center">
+  <img src="documents/Thesis/figs/scanpath_plot_04_i142662322.png" alt="Scanpath Prediction Example 2" width="100%">
+  <br>
+  <em>The model correctly focuses probability mass on semantically relevant objects (faces, people) as the viewing history evolves.</em>
+</p>
+
+The model achieves **+6.5% improvement** over DeepGaze III on the challenging MIT1003 scanpath prediction task, demonstrating that explicit segmentation information helps model the temporal dynamics of human attention.
+
 ---
 
 ## Architecture and Innovations
@@ -395,15 +413,19 @@ This repository includes multiple model variants for ablation studies:
 
 ### SPADE Models
 
-#### Version 1 (Failed - Learned Embeddings)
-- **DeepGaze-SPADE v1**: CNN + learned segment ID embeddings
-- **DinoGaze-SPADE v1**: ViT + learned segment ID embeddings
+The repository includes a progression of SPADE-based models that test different approaches to injecting segmentation information:
 
-❌ These models failed due to semantic incoherence in unsupervised segment IDs.
+#### DeepGaze-SPADE v1 (CNN + Standard SPADE with Learned Embeddings)
+Uses standard SPADE mechanism with learned, static embeddings for segment IDs. Results show minimal improvement (0.0% to 1.9% on MIT1003), confirming the semantic incoherence problem with unsupervised masks.
 
-#### Version 2 (Success - Semantic Painting)
-- **DinoGaze-SPADE v2**: ViT + semantic painting (**Final, State-of-the-Art**)
-- **DeepGaze-SPADE v3**: CNN + semantic painting (proves technique works on any backbone)
+#### DeepGaze-SPADE v2 (CNN + Semantic Painting with DenseNet Features)
+First implementation of semantic painting, using DenseNet's own features to create dynamic semantic maps. Shows modest but consistent improvement (~1.5% on MIT1003), providing proof-of-concept that semantic painting works.
+
+#### DeepGaze-SPADE v3 (CNN + Semantic Painting with DINOv2 Features - Hybrid)
+Hybrid model using DenseNet for saliency but DINOv2 features for semantic painting. Achieves substantial improvement (~7.5% on MIT1003), isolating the importance of high-quality semantic vocabulary.
+
+#### DinoGaze-SPADE v1 (ViT + Semantic Painting - **Final, State-of-the-Art**)
+Final model combining ViT backbone with semantic painting. Achieves best overall performance with +15.6% improvement on SALICON and +11.9% on MIT1003. Most importantly, shows +6.5% improvement on the challenging scanpath prediction task.
 
 ### Segmentation Options
 Each SPADE model supports multiple segmentation methods:
@@ -450,35 +472,39 @@ Without needing to know in advance what "face" or "background" means!
 
 ## Evaluation Metrics
 
-The models are evaluated using four standard metrics:
+The models are evaluated using four standard metrics grounded in information theory:
 
 ### 1. Log-Likelihood (LL) - Primary Metric
 **Higher is better** | Measured in bits
 
-The average log probability density assigned by the model to actual human fixations. This is the most principled metric for probabilistic models.
+The average log probability density assigned by the model to actual human fixations. For a set of $N$ fixations $F = \{f_1, f_2, ..., f_N\}$:
 
-```
-LL = (1/N) Σ log P(fixation_i)
-```
+$$\text{LL}(F | \text{model}) = \frac{1}{N} \sum_{i=1}^{N} \log_2 p(f_i | \text{context}_i)$$
+
+where $\text{context}_i$ includes:
+- **For spatial saliency**: just the image $I$
+- **For scanpath prediction**: the image $I$ and the preceding fixation history $\{f_1, ..., f_{i-1}\}$
+
+This is the most principled metric for probabilistic models. The base-2 logarithm means a difference of 1 bit indicates the better model finds human fixations twice as likely.
 
 ### 2. Information Gain (IG)
 **Higher is better** | Measured in bits
 
-The improvement in log-likelihood over a baseline model (center-bias Gaussian). Quantifies how much more information your model provides.
+The improvement in log-likelihood over a baseline model (center-bias Gaussian):
 
-```
-IG = LL_model - LL_baseline
-```
+$$\text{IG} = \text{LL}(F | \text{model}) - \text{LL}(F | \text{baseline})$$
+
+Quantifies how much additional information, in bits, the model provides about fixation locations beyond a simple default viewing strategy.
 
 ### 3. Normalized Scanpath Saliency (NSS)
 **Higher is better** | Measured in standard deviations
 
-For each fixation, measures how many standard deviations above the mean saliency it landed. Common in non-probabilistic model comparisons.
+For each fixation, the value of the model's predicted saliency map at that location after normalization to zero mean and unit standard deviation. The final score is the average over all test fixations.
 
 ### 4. Area Under ROC Curve (AUC)
 **Higher is better** | Range: [0, 1]
 
-Probability that the model assigns higher saliency to a fixated pixel than a random non-fixated pixel. Treats saliency prediction as binary classification.
+Probability that the model assigns higher saliency to a randomly chosen fixated pixel than a randomly chosen non-fixated pixel. Treats saliency prediction as binary classification.
 
 ---
 
@@ -509,13 +535,13 @@ Probability that the model assigns higher saliency to a fixated pixel than a ran
 If you use this code or build upon this work, please cite:
 
 ```bibtex
-@mastersthesis{morello2024decoding,
+@mastersthesis{morello2025decoding,
   title={Decoding Neural Dynamics of Visual Perceptual Segmentation},
   author={Morello, Mirko},
-  year={2024},
-  school={University of Pavia},
+  year={2025},
+  school={University of Milan, University of Milan-Bicocca, and University of Pavia},
   type={Master's Thesis},
-  note={Available at: https://github.com/YourUsername/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation}
+  note={Available at: https://github.com/MirkoMorello/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation}
 }
 ```
 
