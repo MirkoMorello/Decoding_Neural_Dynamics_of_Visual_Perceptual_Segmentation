@@ -4,6 +4,10 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.6.0-EE4C2C.svg?style=flat&logo=pytorch)](https://pytorch.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+<p align="center">
+  <img src="docs/assets/portfolio-card.png" alt="DinoGaze-SPADE portfolio card" width="100%">
+</p>
+
 > **Master of Science Thesis Project**
 > A novel deep learning architecture for computational gaze prediction that explicitly leverages visual segmentation to model human attention
 
@@ -11,7 +15,7 @@
 
 ## Overview
 
-This repository contains the complete implementation of **DinoGaze-SPADE**, a state-of-the-art probabilistic model for predicting human gaze patterns (scanpaths) on static images. The work represents a fundamental shift in how computational models understand and predict visual attention.
+This repository contains the complete implementation of **DinoGaze-SPADE**, a probabilistic model for predicting human gaze patterns (scanpaths) on static images. The project studies how Vision Transformer features and explicit segmentation guidance change saliency and scanpath prediction.
 
 ### The Core Hypothesis
 
@@ -21,11 +25,12 @@ While deep learning has revolutionized gaze prediction, existing models rely on 
 
 ### Key Achievements
 
-- **New State-of-the-Art**: DinoGaze-SPADE achieves superior performance on standard benchmarks (MIT1003, SALICON)
+- **Task-specific gains**: DinoGaze and DinoGaze-SPADE improve over DeepGaze III on SALICON, MIT1003 spatial saliency, and MIT1003 scanpath prediction
 - **Novel Architecture**: First model to successfully integrate Vision Transformers with dynamic segmentation guidance for gaze prediction
 - **Semantic Painting**: Introduces a breakthrough technique to inject unsupervised segmentation masks into neural networks
-- **15.4% Improvement**: Over previous state-of-the-art (DeepGaze III) on SALICON dataset
-- **12.8% Improvement**: On MIT1003 spatial saliency prediction
+- **15.6% Information Gain improvement**: DinoGaze-SPADE over DeepGaze III on SALICON
+- **12.8% Information Gain improvement**: DinoGaze ViT baseline over DeepGaze III on MIT1003 spatial saliency
+- **6.5% scanpath gain**: DinoGaze-SPADE on the MIT1003 sequential prediction task
 
 ---
 
@@ -173,7 +178,7 @@ This "Load-then-Freeze" strategy ensures optimal use of both large-scale pseudof
 
 ### Quantitative Performance
 
-DinoGaze-SPADE establishes new state-of-the-art performance across multiple metrics:
+DinoGaze-SPADE and the DinoGaze ViT baseline establish strong task-specific gains across multiple metrics:
 
 #### SALICON Spatial Saliency Benchmark
 
@@ -219,7 +224,7 @@ Pixi handles all dependencies including CUDA-enabled PyTorch:
 
 ```bash
 # Clone the repository
-git clone https://github.com/YourUsername/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation.git
+git clone https://github.com/MirkoMorello/Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation.git
 cd Decoding_Neural_Dynamics_of_Visual_Perceptual_Segmentation
 
 # Run the setup task (installs everything)
@@ -243,7 +248,7 @@ conda activate gaze-prediction
 pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 
 # Install other dependencies
-pip install -r requirements.txt  # If provided, or install manually
+# Install manually if you are not using Pixi.
 
 # Install xformers
 pip install xformers
