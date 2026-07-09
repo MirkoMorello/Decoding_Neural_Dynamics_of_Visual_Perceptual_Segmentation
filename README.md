@@ -8,8 +8,8 @@
   <img src="docs/assets/portfolio-card.png" alt="DinoGaze-SPADE portfolio card" width="100%">
 </p>
 
-> **Master of Science Thesis Project**
-> A novel deep learning architecture for computational gaze prediction that explicitly leverages visual segmentation to model human attention
+> **MSc thesis** — Albert Einstein College of Medicine (Laboratory of Computational Biology)
+> A deep learning architecture for gaze prediction that explicitly uses visual segmentation to model human attention.
 
 ---
 
@@ -19,18 +19,15 @@ This repository contains the complete implementation of **DinoGaze-SPADE**, a pr
 
 ### The Core Hypothesis
 
-While deep learning has revolutionized gaze prediction, existing models rely on an **implicit, feature-based** understanding of scenes. They lack an explicit representation of the scene's **compositional structure**—the objects and surfaces that are the primary units of human attention.
+Most deep gaze models rely on an **implicit, feature-based** understanding of scenes. They lack an explicit representation of the scene's **compositional structure** — the objects and surfaces that are the primary units of human attention. This thesis tests whether explicitly injecting a scene's visual segmentation into the model improves gaze prediction, and finds that it does.
 
-**This thesis demonstrates** that by explicitly injecting information about a scene's visual segmentation into the model, we can significantly improve gaze prediction accuracy.
+### Key results
 
-### Key Achievements
-
-- **Task-specific gains**: DinoGaze and DinoGaze-SPADE improve over DeepGaze III on SALICON, MIT1003 spatial saliency, and MIT1003 scanpath prediction
-- **Novel Architecture**: First model to successfully integrate Vision Transformers with dynamic segmentation guidance for gaze prediction
-- **Semantic Painting**: Introduces a breakthrough technique to inject unsupervised segmentation masks into neural networks
-- **15.6% Information Gain improvement**: DinoGaze-SPADE over DeepGaze III on SALICON
-- **12.8% Information Gain improvement**: DinoGaze ViT baseline over DeepGaze III on MIT1003 spatial saliency
-- **6.5% scanpath gain**: DinoGaze-SPADE on the MIT1003 sequential prediction task
+- Improves over DeepGaze III on SALICON, MIT1003 spatial saliency, and MIT1003 scanpath prediction.
+- **+15.6% Information Gain** vs DeepGaze III on SALICON (DinoGaze-SPADE).
+- **+12.8% Information Gain** vs DeepGaze III on MIT1003 spatial saliency (DinoGaze ViT baseline).
+- **+6.5%** on the MIT1003 sequential scanpath prediction task (DinoGaze-SPADE).
+- **Semantic painting**: injects unsupervised segmentation masks into a ViT via spatially-adaptive normalization (SPADE).
 
 ---
 
@@ -116,7 +113,7 @@ We replace the traditional CNN backbone with a **DINOv2 Vision Transformer**, wh
 
 ### 2. Semantic Painting with SPADE
 
-The breakthrough **"semantic painting"** technique solves a critical challenge: how to inject unsupervised segmentation information when segment IDs lack semantic coherence across images.
+The **"semantic painting"** technique addresses a specific challenge: how to inject unsupervised segmentation information when segment IDs lack semantic coherence across images.
 
 #### The Challenge
 
@@ -429,8 +426,8 @@ First implementation of semantic painting, using DenseNet's own features to crea
 #### DeepGaze-SPADE v3 (CNN + Semantic Painting with DINOv2 Features - Hybrid)
 Hybrid model using DenseNet for saliency but DINOv2 features for semantic painting. Achieves substantial improvement (~7.5% on MIT1003), isolating the importance of high-quality semantic vocabulary.
 
-#### DinoGaze-SPADE v1 (ViT + Semantic Painting - **Final, State-of-the-Art**)
-Final model combining ViT backbone with semantic painting. Achieves best overall performance with +15.6% improvement on SALICON and +11.9% on MIT1003. Most importantly, shows +6.5% improvement on the challenging scanpath prediction task.
+#### DinoGaze-SPADE v1 (ViT + Semantic Painting — final model)
+Final model combining a ViT backbone with semantic painting. Best overall performance: +15.6% on SALICON, +11.9% on MIT1003, and +6.5% on the scanpath prediction task.
 
 ### Segmentation Options
 Each SPADE model supports multiple segmentation methods:
